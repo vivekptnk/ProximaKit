@@ -8,7 +8,12 @@ import sys
 import subprocess
 
 def main():
-    hook_input = json.loads(sys.stdin.read())
+    try:
+        raw = sys.stdin.read()
+        hook_input = json.loads(raw)
+    except (json.JSONDecodeError, Exception):
+        return
+
     tool_name = hook_input.get("tool_name", "")
     tool_input = hook_input.get("tool_input", {})
 
@@ -29,19 +34,26 @@ def main():
     else:
         return
 
-    result = subprocess.run(
-        ["swift", "test", "--filter", test_filter],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            ["swift", "test", "--filter", test_filter],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        print("Auto-test: timed out after 120s", file=sys.stderr)
+        return
+    except Exception as e:
+        print(f"Auto-test: failed to run: {e}", file=sys.stderr)
+        return
 
     if result.returncode != 0:
         # Extract failure summary
-        lines = result.stdout.split("\n") + result.stderr.split("\n")
-        failures = [l for l in lines if "failed" in l.lower() or "error:" in l.lower()]
-        output = "\n".join(failures[:15]) if failures else result.stdout[-500:]
-        print(f"TESTS FAILED ({test_filter}):\n{output}")
+        all_lines = result.stdout.split("\n") + result.stderr.split("\n")
+        failures = [l for l in all_lines if "failed" in l.lower() or "error:" in l.lower()]
+        output = "\n".join(failures[:15]) if failures else result.stderr[-500:]
+        print(f"TESTS FAILED ({test_filter}):\n{output}", file=sys.stderr)
         sys.exit(2)
     else:
         # Count passed tests
