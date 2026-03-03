@@ -1,0 +1,73 @@
+{
+  "device": "Apple M2 (targets, not measured)",
+  "swiftVersion": "5.9",
+  "date": "2026-03-03",
+  "note": "These are TARGET baselines. Replace with actual measurements after first benchmark run.",
+  "results": {
+    "batch_dot_10K_384d": {
+      "value": 5.0,
+      "unit": "ms",
+      "threshold": 5.0
+    },
+    "hnsw_build_10K_384d": {
+      "value": 5.0,
+      "unit": "s",
+      "threshold": 5.0
+    },
+    "hnsw_build_50K_384d": {
+      "value": 30.0,
+      "unit": "s",
+      "threshold": 30.0
+    },
+    "hnsw_query_10K_p50": {
+      "value": 5.0,
+      "unit": "ms",
+      "threshold": 5.0
+    },
+    "hnsw_query_10K_p95": {
+      "value": 15.0,
+      "unit": "ms",
+      "threshold": 15.0
+    },
+    "hnsw_query_10K_p99": {
+      "value": 50.0,
+      "unit": "ms",
+      "threshold": 50.0
+    },
+    "recall_uniform_10K_ef50_at10": {
+      "value": 95.0,
+      "unit": "%",
+      "threshold": 95.0
+    },
+    "recall_clustered_10K_ef50_at10": {
+      "value": 92.0,
+      "unit": "%",
+      "threshold": 92.0
+    },
+    "save_10K_384d": {
+      "value": 500.0,
+      "unit": "ms",
+      "threshold": 500.0
+    },
+    "load_10K_384d": {
+      "value": 200.0,
+      "unit": "ms",
+      "threshold": 200.0
+    },
+    "load_and_query_10K": {
+      "value": 250.0,
+      "unit": "ms",
+      "threshold": 250.0
+    },
+    "file_size_10K_384d": {
+      "value": 20.0,
+      "unit": "MB",
+      "threshold": 20.0
+    },
+    "memory_per_vector_384d": {
+      "value": 2.0,
+      "unit": "KB",
+      "threshold": 2.0
+    }
+  }
+}
