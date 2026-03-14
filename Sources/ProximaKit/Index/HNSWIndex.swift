@@ -302,6 +302,64 @@ public actor HNSWIndex: VectorIndex {
         return true
     }
 
+    // ── Persistence ────────────────────────────────────────────────────
+
+    /// Restores an HNSW index from a persistence snapshot.
+    /// Directly sets all internal state — no re-insertion needed.
+    public init(restoring snapshot: HNSWSnapshot) {
+        self.dimension = snapshot.dimension
+        self.metric = snapshot.metricType.makeMetric()
+        self.config = snapshot.config
+        self.levelMultiplier = 1.0 / log(Double(snapshot.config.m))
+        self.layers = snapshot.layers
+        self.nodeLevels = snapshot.nodeLevels
+        self.vectors = snapshot.vectors
+        self.metadata = snapshot.metadata
+        self.nodeToUUID = snapshot.nodeToUUID
+        self.entryPointNode = snapshot.entryPointNode
+        self.maxLevel = snapshot.maxLevel
+        // Rebuild the reverse lookup.
+        self.uuidToNode = [:]
+        for (i, uuid) in snapshot.nodeToUUID.enumerated() {
+            self.uuidToNode[uuid] = i
+        }
+    }
+
+    /// Returns a snapshot of this index for binary persistence.
+    /// Compacts first if there are tombstoned nodes.
+    public func persistenceSnapshot() throws -> HNSWSnapshot {
+        guard let metricType = DistanceMetricType(metric: metric) else {
+            throw PersistenceError.unserializableMetric
+        }
+        // Compact to remove tombstones before saving.
+        if liveCount < count {
+            try compact()
+        }
+        return HNSWSnapshot(
+            dimension: dimension,
+            config: config,
+            metricType: metricType,
+            vectors: vectors,
+            metadata: metadata,
+            nodeToUUID: nodeToUUID,
+            layers: layers,
+            nodeLevels: nodeLevels,
+            entryPointNode: entryPointNode,
+            maxLevel: maxLevel
+        )
+    }
+
+    /// Saves this index to a binary file.
+    public func save(to url: URL) throws {
+        let snapshot = try persistenceSnapshot()
+        try PersistenceEngine.save(snapshot, to: url)
+    }
+
+    /// Loads an HNSW index from a binary file.
+    public static func load(from url: URL) throws -> HNSWIndex {
+        try PersistenceEngine.loadHNSW(from: url)
+    }
+
     // ── Compaction ────────────────────────────────────────────────────
 
     /// Rebuilds the index, removing all tombstoned (deleted) nodes.

@@ -67,6 +67,47 @@ public actor BruteForceIndex: VectorIndex {
         self.metric = metric
     }
 
+    /// Restores a BruteForce index from a persistence snapshot.
+    public init(restoring snapshot: BruteForceSnapshot) {
+        self.dimension = snapshot.dimension
+        self.metric = snapshot.metricType.makeMetric()
+        self.vectorData = snapshot.vectorData
+        self.ids = snapshot.ids
+        self.metadataStore = snapshot.metadataStore
+        // Rebuild the reverse lookup.
+        self.idToIndex = [:]
+        for (i, id) in ids.enumerated() {
+            idToIndex[id] = i
+        }
+    }
+
+    // ── Persistence ───────────────────────────────────────────────────
+
+    /// Returns a snapshot of this index's state for binary persistence.
+    public func persistenceSnapshot() throws -> BruteForceSnapshot {
+        guard let metricType = DistanceMetricType(metric: metric) else {
+            throw PersistenceError.unserializableMetric
+        }
+        return BruteForceSnapshot(
+            dimension: dimension,
+            metricType: metricType,
+            vectorData: vectorData,
+            ids: ids,
+            metadataStore: metadataStore
+        )
+    }
+
+    /// Saves this index to a binary file.
+    public func save(to url: URL) throws {
+        let snapshot = try persistenceSnapshot()
+        try PersistenceEngine.save(snapshot, to: url)
+    }
+
+    /// Loads a BruteForce index from a binary file.
+    public static func load(from url: URL) throws -> BruteForceIndex {
+        try PersistenceEngine.loadBruteForce(from: url)
+    }
+
     // ── VectorIndex Conformance ───────────────────────────────────────
 
     public func add(_ vector: Vector, id: UUID, metadata: Data? = nil) throws {
