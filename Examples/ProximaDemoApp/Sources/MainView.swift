@@ -175,8 +175,10 @@ struct MainView: View {
 
     // MARK: - Colors
 
+    // NLEmbedding distances are typically 0.5-0.8 range.
+    // Adjusted thresholds for Apple's built-in model quality.
     private func distanceColor(_ d: Float) -> Color {
-        d < 0.3 ? .green : d < 0.6 ? .orange : .red
+        d < 0.55 ? .green : d < 0.68 ? .orange : .red
     }
 
     private func categoryColor(_ c: String) -> Color {
