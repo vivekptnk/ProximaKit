@@ -43,16 +43,22 @@ public final class CoreMLEmbeddingProvider: @unchecked Sendable {
     /// Maximum sequence length the model accepts.
     private let maxLength: Int
 
+    /// WordPiece tokenizer (nil if no vocab provided — falls back to hash tokenizer).
+    private let tokenizer: WordPieceTokenizer?
+
     // ── Initialization ────────────────────────────────────────────────
 
     /// Loads a compiled CoreML model (.mlmodelc directory).
     ///
-    /// - Parameter url: Path to the compiled model directory.
+    /// - Parameters:
+    ///   - url: Path to the compiled model directory.
+    ///   - vocabURL: Optional path to a WordPiece vocab.txt file for proper tokenization.
     /// - Throws: `EmbeddingError.modelNotAvailable` if the model can't be loaded.
-    public init(compiledModelURL url: URL) throws {
+    public init(compiledModelURL url: URL, vocabURL: URL? = nil) throws {
         let model = try Self.loadModel(from: url)
         self.model = model
         (self.outputFeatureName, self.dimension, self.maxLength) = try Self.discoverModelShape(model)
+        self.tokenizer = try vocabURL.map { try WordPieceTokenizer(vocabURL: $0) }
     }
 
     /// Compiles and loads a .mlpackage or .mlmodel file.
@@ -62,11 +68,15 @@ public final class CoreMLEmbeddingProvider: @unchecked Sendable {
     ///
     /// - Parameter url: Path to the .mlpackage or .mlmodel file.
     /// - Throws: `EmbeddingError.modelNotAvailable` if compilation or loading fails.
-    public init(modelAt url: URL) throws {
+    /// - Parameters:
+    ///   - url: Path to the .mlpackage or .mlmodel file.
+    ///   - vocabURL: Optional path to a WordPiece vocab.txt for proper tokenization.
+    public init(modelAt url: URL, vocabURL: URL? = nil) throws {
         let compiledURL = try MLModel.compileModel(at: url)
         let model = try Self.loadModel(from: compiledURL)
         self.model = model
         (self.outputFeatureName, self.dimension, self.maxLength) = try Self.discoverModelShape(model)
+        self.tokenizer = try vocabURL.map { try WordPieceTokenizer(vocabURL: $0) }
     }
 
     // ── Embedding ─────────────────────────────────────────────────────
@@ -103,34 +113,33 @@ public final class CoreMLEmbeddingProvider: @unchecked Sendable {
         return results
     }
 
-    // ── Tokenization (Basic) ──────────────────────────────────────────
+    // ── Tokenization ────────────────────────────────────────────────────
     //
-    // This is a simplified tokenizer that maps characters to integer IDs.
-    // For production-quality embeddings, use the model's actual tokenizer
-    // (WordPiece for BERT, SentencePiece for others).
-    //
-    // For v1, this basic tokenizer produces meaningful-enough IDs for
-    // the model to generate distinct embeddings per input text.
+    // Uses WordPieceTokenizer when a vocab.txt is provided (proper BERT tokenization).
+    // Falls back to hash-based tokenization otherwise (lower quality but functional).
 
     private func tokenize(_ text: String) throws -> (MLMultiArray, MLMultiArray) {
-        // Simple character-level hash tokenization.
-        // Maps each word to an integer ID based on its hash.
-        let words = text.lowercased().split(separator: " ")
-        var tokenIDs: [Int32] = [101] // [CLS] token
+        let tokenIDs: [Int32]
+        let attentionValues: [Int32]
 
-        for word in words.prefix(maxLength - 2) {
-            // Hash the word to a token ID in vocab range [1000, 30000]
-            let hash = abs(word.hashValue) % 29000 + 1000
-            tokenIDs.append(Int32(hash))
-        }
-
-        tokenIDs.append(102) // [SEP] token
-
-        // Pad to maxLength
-        let attentionValues = [Int32](repeating: 1, count: tokenIDs.count)
-            + [Int32](repeating: 0, count: maxLength - tokenIDs.count)
-        while tokenIDs.count < maxLength {
-            tokenIDs.append(0) // [PAD]
+        if let tokenizer = tokenizer {
+            // Proper WordPiece tokenization
+            let result = tokenizer.tokenize(text, maxLength: maxLength)
+            tokenIDs = result.inputIDs
+            attentionValues = result.attentionMask
+        } else {
+            // Fallback: hash-based tokenization
+            let words = text.lowercased().split(separator: " ")
+            var ids: [Int32] = [101] // [CLS]
+            for word in words.prefix(maxLength - 2) {
+                let hash = abs(word.hashValue) % 29000 + 1000
+                ids.append(Int32(hash))
+            }
+            ids.append(102) // [SEP]
+            let realLen = ids.count
+            while ids.count < maxLength { ids.append(0) }
+            tokenIDs = ids
+            attentionValues = (0..<maxLength).map { $0 < realLen ? Int32(1) : Int32(0) }
         }
 
         let inputIDsArray = try MLMultiArray(shape: [1, NSNumber(value: maxLength)], dataType: .int32)

@@ -153,6 +153,11 @@ struct MainView: View {
                     LabeledContent("Last query", value: String(format: "%.1f ms", engine.lastQueryTimeMs))
                 }
                 LabeledContent("Notes", value: "\(engine.userNotes.count)")
+                if !engine.embeddingSource.isEmpty {
+                    Text(engine.embeddingSource)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
         .listStyle(.sidebar)
