@@ -43,6 +43,15 @@ let package = Package(
             ]
         ),
 
+        // ── Demo App ──────────────────────────────────────────────────
+        .executableTarget(
+            name: "ProximaDemo",
+            dependencies: ["ProximaKit", "ProximaEmbeddings"],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency"),
+            ]
+        ),
+
         // ── Tests ─────────────────────────────────────────────────────
         .testTarget(
             name: "ProximaKitTests",
