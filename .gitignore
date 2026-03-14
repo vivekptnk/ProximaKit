@@ -22,3 +22,12 @@ DerivedData/
 
 # ML Models (too large for git)
 Models/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Claude Code local state
+.claude/progress.md
