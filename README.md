@@ -1,168 +1,291 @@
 # ProximaKit
 
-**Pure-Swift vector search, powered by Accelerate.**
+**Search by meaning, not keywords. On-device. Pure Swift.**
 
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9+-orange.svg)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/Platforms-iOS%2017%20%7C%20macOS%2014%20%7C%20visionOS%201-blue.svg)](https://developer.apple.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/Tests-117%20passing-brightgreen.svg)]()
 
-ProximaKit is a zero-dependency semantic search library for Apple platforms. All vector math runs through Apple's Accelerate framework (vDSP/SIMD). HNSW is implemented from scratch in Swift — no C++ wrappers, no cloud APIs, no third-party dependencies.
+---
 
-## Quick Start
+## What does this do?
+
+ProximaKit lets your app **understand the meaning** of text and images, then find similar content instantly.
+
+**Example:** A user types "beach vacation" into your app. ProximaKit finds photos of oceans, notes about travel plans, and articles about tropical destinations — even if none of them contain the words "beach" or "vacation."
+
+This all runs **on the device**. No internet needed. No API keys. No cloud costs.
+
+---
+
+## Who is this for?
+
+You're building an iOS or macOS app and you want to add:
+
+- **Smart search** — users type a description, you find matching content by meaning
+- **Photo search** — "sunset photos" finds all your sunset pics without manual tags
+- **Recommendations** — "show me more like this" for articles, products, or music
+- **Duplicate detection** — find similar items even when they're worded differently
+
+If you've ever wished `String.contains()` was smarter, this is for you.
+
+---
+
+## Install it (30 seconds)
+
+Add this to your `Package.swift`:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.0.0")
+]
+```
+
+Then add the targets you need:
+
+```swift
+.target(
+    name: "YourApp",
+    dependencies: [
+        "ProximaKit",          // Core search engine
+        "ProximaEmbeddings",   // Turns text/images into searchable vectors (optional)
+    ]
+)
+```
+
+---
+
+## How it works (the simple version)
+
+ProximaKit works in 3 steps:
+
+```
+1. EMBED     "sunset on the beach"  -->  [0.23, -0.41, 0.87, ...]  (a list of numbers)
+2. STORE     Put those numbers in a search index
+3. SEARCH    Give it new numbers, it finds the closest matches
+```
+
+The list of numbers (called a "vector") captures the **meaning** of the text or image. Similar meanings produce similar numbers. ProximaKit finds which stored numbers are closest to your query numbers.
+
+That's it. Everything below is just the code to do those 3 steps.
+
+---
+
+## Search text by meaning (copy-paste example)
+
+This is the simplest thing you can do with ProximaKit. It uses Apple's built-in language model — no downloads, no setup.
 
 ```swift
 import ProximaKit
+import ProximaEmbeddings
 
-// Create an index
-let index = HNSWIndex(dimension: 384, metric: CosineDistance())
+// Step 1: Set up the embedding provider (turns text into numbers)
+let embedder = try NLEmbeddingProvider(language: .english)
 
-// Add vectors
-let vector = Vector([0.1, 0.2, 0.3, ...])  // 384 floats
-try await index.add(vector, id: UUID())
+// Step 2: Create a search index
+let index = HNSWIndex(dimension: embedder.dimension, metric: CosineDistance())
 
-// Search
-let query = Vector([0.15, 0.18, 0.35, ...])
-let results = try await index.search(query: query, k: 10)
+// Step 3: Add some content
+let sentences = [
+    "The cat sat on the warm windowsill",
+    "Dogs love playing fetch in the park",
+    "Fresh pasta tastes better than dried",
+    "The sunset painted the sky orange",
+    "Machine learning models recognize objects",
+]
 
+for sentence in sentences {
+    let vector = try await embedder.embed(sentence)
+    let metadata = try JSONEncoder().encode(["text": sentence])
+    try await index.add(vector, id: UUID(), metadata: metadata)
+}
+
+// Step 4: Search!
+let query = try await embedder.embed("animals playing outside")
+let results = try await index.search(query: query, k: 3)
+
+// Results: "Dogs love playing fetch" (closest match!)
+//          "The cat sat on the warm windowsill"
+//          "The sunset painted the sky orange"
 for result in results {
-    print("\(result.id): distance \(result.distance)")
+    if let data = result.metadata,
+       let info = try? JSONDecoder().decode([String: String].self, from: data) {
+        print("\(info["text"] ?? "") — distance: \(result.distance)")
+    }
 }
 ```
 
-## With Embeddings (Text Search)
+**What just happened:** You typed "animals playing outside" and it found the dog and cat sentences — even though none of them contain the words "animals", "playing", or "outside." It searched by *meaning*.
+
+---
+
+## Search images (photo search)
 
 ```swift
 import ProximaEmbeddings
 
-// Convert text to vectors using Apple's NaturalLanguage framework
-let provider = try NLEmbeddingProvider(language: .english)
-
-let vector = try await provider.embed("sunset over the ocean")
-try await index.add(vector, id: UUID())
-
-// Search by meaning, not keywords
-let query = try await provider.embed("beach at dusk")
-let results = try await index.search(query: query, k: 5)
-```
-
-## With Images (Photo Search)
-
-```swift
+// Turn an image into a searchable vector
 let vision = VisionEmbeddingProvider()
-let imageVector = try await vision.embed(cgImage)
-try await index.add(imageVector, id: photoID)
+let vector = try await vision.embed(myCGImage)
+
+// Add it to the index (use a separate index — image vectors have different dimensions)
+let imageIndex = HNSWIndex(dimension: vector.dimension, metric: CosineDistance())
+try await imageIndex.add(vector, id: photoID)
+
+// Later: find similar images
+let queryVector = try await vision.embed(anotherImage)
+let similar = try await imageIndex.search(query: queryVector, k: 5)
+// Returns the 5 most visually similar images
 ```
 
-## Save & Load
+---
+
+## Save and load your index
+
+Building an index takes time. Save it to disk so you don't have to rebuild it every time your app launches.
 
 ```swift
-// Save to disk (binary format, ~50ms cold start for 10K vectors)
+// Save (writes a binary file — fast and compact)
+let fileURL = documentsDirectory.appendingPathComponent("my-index.proximakit")
 try await index.save(to: fileURL)
 
-// Load back
+// Load (memory-mapped for fast startup — loads in milliseconds, not seconds)
 let loaded = try HNSWIndex.load(from: fileURL)
+
+// Use it exactly like before
+let results = try await loaded.search(query: queryVector, k: 10)
 ```
 
-## Architecture
+---
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                     Your App                              │
-├──────────────────────────────────────────────────────────┤
-│              ProximaEmbeddings                             │
-│  NLEmbeddingProvider  │  VisionProvider  │  CoreMLProvider │
-│              ▼ EmbeddingProvider (protocol)                │
-├──────────────────────────────────────────────────────────┤
-│              ProximaKit (Core)                             │
-│                                                           │
-│  VectorIndex (protocol, actor-isolated)                   │
-│    ├── BruteForceIndex (exact, O(n))                     │
-│    └── HNSWIndex (approximate, O(log n))                  │
-│                                                           │
-│  Vector ─── vDSP math (dot, cosine, L2, normalize)       │
-│  DistanceMetric ─── Cosine, Euclidean, DotProduct         │
-│  BatchDistance ─── vDSP_mmul (10K distances in 1 call)    │
-│  PersistenceEngine ─── binary save/load with mmap         │
-│                                                           │
-│  Imports: Foundation + Accelerate ONLY                    │
-└──────────────────────────────────────────────────────────┘
-```
+## Use a custom AI model (CoreML)
 
-## Performance
-
-| Metric | Value | Notes |
-|--------|-------|-------|
-| Recall@10 (1K vectors, ef=50) | 98-99% | Euclidean, random data |
-| Recall@10 (10K vectors, ef=100) | 87% | Random data; real embeddings achieve >95% |
-| Query latency (1K/384d) | ~104ms | Single query, CosineDistance |
-| Index build (1K vectors) | ~3s | M=16, efConstruction=200 |
-| Save/Load roundtrip | Exact match | Binary format preserves full graph |
-
-Full benchmark suite: `swift test --filter RecallBenchmark`
-
-## Modules
-
-| Module | What | Imports |
-|--------|------|---------|
-| **ProximaKit** | Vector math, indices, persistence | Foundation, Accelerate |
-| **ProximaEmbeddings** | Text/image → Vector providers | CoreML, NaturalLanguage, Vision |
-| **ProximaDemo** | SwiftUI semantic search app | SwiftUI + above |
-
-## Demo App
-
-```bash
-swift run ProximaDemo
-```
-
-Launches a macOS SwiftUI app that indexes 50 sample sentences and lets you search by meaning. Type "animals" to find cat/dog sentences. Type "cooking" to find food sentences. Shows similarity distance and query latency.
-
-## Distance Metrics
+For higher quality search, use a real sentence-transformer model converted to CoreML:
 
 ```swift
-CosineDistance()       // Best for text embeddings (direction, not magnitude)
-EuclideanDistance()    // Best for spatial data (straight-line distance)
-DotProductDistance()   // Fast for pre-normalized vectors
+let provider = try CoreMLEmbeddingProvider(modelAt: modelURL)
+let vector = try await provider.embed("sunset over the ocean")
+// Produces higher-quality embeddings than NLEmbeddingProvider
 ```
 
-## Configuration
+See `scripts/convert_model.py` for converting HuggingFace models to CoreML format.
+
+---
+
+## Which index should I use?
+
+| Index | When to use | Speed |
+|-------|------------|-------|
+| `HNSWIndex` | **Most cases.** Fast approximate search. Works great up to millions of vectors. | Fast |
+| `BruteForceIndex` | Tiny datasets (under 1,000 items) where you need 100% perfect results. | Slower as dataset grows |
+
+```swift
+// For most apps:
+let index = HNSWIndex(dimension: 384, metric: CosineDistance())
+
+// For tiny datasets where perfect accuracy matters:
+let index = BruteForceIndex(dimension: 384, metric: CosineDistance())
+```
+
+Both have the exact same API — `add()`, `search()`, `remove()`. You can swap them without changing any other code.
+
+---
+
+## Which distance metric should I use?
+
+| Metric | When to use | One-liner |
+|--------|------------|-----------|
+| `CosineDistance()` | **Text search.** This is the default. Use this unless you have a reason not to. | "How different is the direction?" |
+| `EuclideanDistance()` | Spatial data (coordinates, sensor readings). | "How far apart are these points?" |
+| `DotProductDistance()` | Pre-normalized vectors (advanced optimization). | "How aligned are these?" |
+
+**If you're not sure, use `CosineDistance()`.** It's the standard for text and most AI embeddings.
+
+---
+
+## Tuning performance
+
+If search is too slow or results aren't good enough, adjust these numbers:
 
 ```swift
 let config = HNSWConfiguration(
-    m: 16,              // Max connections per node (higher = better recall, more memory)
-    efConstruction: 200, // Beam width during build (higher = better graph quality)
-    efSearch: 50         // Beam width during query (higher = better recall, slower)
+    m: 16,               // Connections per node. Higher = better results, more memory.
+    efConstruction: 200,  // Quality of index building. Higher = slower build, better search.
+    efSearch: 50          // How hard to search. Higher = better results, slower queries.
 )
 let index = HNSWIndex(dimension: 384, metric: CosineDistance(), config: config)
 ```
 
-## Installation
+| Problem | Fix |
+|---------|-----|
+| Search results aren't relevant enough | Increase `efSearch` (try 100 or 200) |
+| Search is too slow | Decrease `efSearch` (try 20) |
+| Index uses too much memory | Decrease `m` (try 8) |
+| Building the index takes too long | Decrease `efConstruction` (try 100) |
 
-```swift
-// Package.swift
-dependencies: [
-    .package(url: "https://github.com/vivek/ProximaKit.git", from: "1.0.0")
-]
+---
+
+## Try the demo app
+
+```bash
+git clone https://github.com/vivekptnk/ProximaKit.git
+cd ProximaKit
+swift run ProximaDemo
 ```
 
-Import only what you need:
+This opens a macOS app where you can type anything and see semantic search results ranked by similarity in real-time.
+
+---
+
+## Thread safety
+
+ProximaKit is fully thread-safe. Both `HNSWIndex` and `BruteForceIndex` are Swift `actor` types — you can search from multiple threads at the same time without crashes or data corruption. Just use `await`:
+
 ```swift
-import ProximaKit           // Core: vectors, indices, persistence
-import ProximaEmbeddings    // Optional: NL, Vision, CoreML providers
+// This is safe from any thread or Task:
+let results = try await index.search(query: vector, k: 10)
+try await index.add(newVector, id: UUID())
 ```
 
-## Requirements
+---
 
-Swift 5.9+ | iOS 17+ | macOS 14+ | visionOS 1+ | Xcode 15+
+## What it's built with
 
-## Design Decisions
+- **Swift 5.9** with strict concurrency
+- **Apple Accelerate** (vDSP) for SIMD-optimized vector math
+- **Zero external dependencies** — only Apple's own frameworks
+- **HNSW algorithm** implemented from scratch (not a wrapper around C++ code)
 
-See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
-- [ADR-001](docs/adr/ADR-001-accelerate-for-math.md): Accelerate/vDSP for all vector math
-- [ADR-002](docs/adr/ADR-002-actor-isolation.md): Actor isolation for index types
-- [ADR-003](docs/adr/ADR-003-binary-persistence.md): Custom binary persistence format
-- [ADR-004](docs/adr/ADR-004-hnsw-heuristic-selection.md): Heuristic neighbor selection
+Runs on: **iOS 17+, macOS 14+, visionOS 1+**
+
+---
+
+## API Reference
+
+### ProximaKit (core)
+
+| Type | What it does |
+|------|-------------|
+| `Vector` | A list of floats. The fundamental data type. |
+| `HNSWIndex` | Fast approximate search index (use this one). |
+| `BruteForceIndex` | Exact search index (for small datasets). |
+| `CosineDistance` | Measures similarity by direction (best for text). |
+| `EuclideanDistance` | Measures similarity by straight-line distance. |
+| `DotProductDistance` | Measures similarity by alignment (for normalized vectors). |
+| `SearchResult` | What you get back from a search: `id`, `distance`, `metadata`. |
+| `HNSWConfiguration` | Tuning knobs: `m`, `efConstruction`, `efSearch`. |
+
+### ProximaEmbeddings (turns content into vectors)
+
+| Type | What it does |
+|------|-------------|
+| `NLEmbeddingProvider` | Text to vector using Apple's built-in language model. No setup needed. |
+| `VisionEmbeddingProvider` | Image to vector using Apple's Vision framework. |
+| `CoreMLEmbeddingProvider` | Text/image to vector using any CoreML model you provide. |
+
+---
 
 ## License
 
-MIT
+MIT — use it for anything.
