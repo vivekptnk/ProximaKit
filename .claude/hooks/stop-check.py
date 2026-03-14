@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """stop-check.py — Stop hook.
-Blocks stopping if:
-  - swift test has failures
-  - There are uncommitted changes
+Blocks stopping if there are uncommitted changes.
+Does NOT run swift test (too slow — auto-test.py catches failures during development).
 """
 
 import subprocess
 import sys
 
 def main():
-    errors = []
-
     # Check for uncommitted changes
     result = subprocess.run(
         ["git", "status", "--porcelain"],
@@ -18,32 +15,21 @@ def main():
         text=True,
     )
     uncommitted = [l for l in result.stdout.strip().split("\n") if l.strip()]
-    if uncommitted:
-        errors.append(f"UNCOMMITTED CHANGES ({len(uncommitted)} files):")
-        for f in uncommitted[:10]:
-            errors.append(f"  {f}")
-        if len(uncommitted) > 10:
-            errors.append(f"  ... and {len(uncommitted) - 10} more")
+    if not uncommitted:
+        return
 
-    # Run tests
-    result = subprocess.run(
-        ["swift", "test"],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if result.returncode != 0:
-        lines = result.stdout.split("\n") + result.stderr.split("\n")
-        failures = [l for l in lines if "failed" in l.lower() or "error:" in l.lower()]
-        errors.append("TESTS FAILING:")
-        for f in failures[:10]:
-            errors.append(f"  {f}")
+    # Write to stderr so Claude Code displays the message
+    lines = [
+        f"BLOCKED: {len(uncommitted)} uncommitted file(s). Commit before stopping.",
+        "",
+    ]
+    for f in uncommitted[:10]:
+        lines.append(f"  {f}")
+    if len(uncommitted) > 10:
+        lines.append(f"  ... and {len(uncommitted) - 10} more")
 
-    if errors:
-        print("BLOCKED: Cannot stop with issues outstanding.\n")
-        print("\n".join(errors))
-        print("\nFix the issues above, then commit your work before stopping.")
-        sys.exit(2)
+    print("\n".join(lines), file=sys.stderr)
+    sys.exit(2)
 
 
 if __name__ == "__main__":
