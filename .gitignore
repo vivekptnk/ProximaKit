@@ -3,12 +3,11 @@
 .swiftpm/
 Package.resolved
 
-# Xcode
-*.xcodeproj
-*.xcworkspace
+# Xcode (ignore generated projects except the demo app)
 xcuserdata/
 DerivedData/
 *.xcresult
+*.xcworkspace
 
 # macOS
 .DS_Store

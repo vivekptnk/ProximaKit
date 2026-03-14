@@ -1,0 +1,31 @@
+name: ProximaDemoApp
+options:
+  bundleIdPrefix: com.vivekptnk
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+packages:
+  ProximaKit:
+    url: "https://github.com/vivekptnk/ProximaKit.git"
+    from: "1.0.0"
+targets:
+  ProximaDemoApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    dependencies:
+      - package: ProximaKit
+        product: ProximaKit
+      - package: ProximaKit
+        product: ProximaEmbeddings
+    settings:
+      base:
+        SWIFT_VERSION: "5.9"
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: ProximaKit Demo
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "14.0"
