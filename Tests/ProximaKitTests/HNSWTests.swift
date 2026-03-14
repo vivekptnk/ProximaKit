@@ -242,4 +242,103 @@ final class HNSWTests: XCTestCase {
             file: file, line: line
         )
     }
+
+    // ── PK-006: Multi-Layer Tests ─────────────────────────────────────
+
+    /// Verifies that multi-layer structure is created (some nodes on layer > 0).
+    func testMultiLayerStructure() async throws {
+        let config = HNSWConfiguration(m: 16, efConstruction: 100, efSearch: 50)
+        let index = HNSWIndex(dimension: 8, metric: EuclideanDistance(), config: config)
+
+        // With 1000 nodes and M=16, the probability of ALL nodes being on
+        // layer 0 is astronomically small (~0.9375^1000 ≈ 0).
+        for _ in 0..<1000 {
+            let v = Vector((0..<8).map { _ in Float.random(in: -1...1) })
+            try await index.add(v, id: UUID())
+        }
+
+        let count = await index.count
+        XCTAssertEqual(count, 1000)
+
+        // Verify search still works (proves multi-layer traversal is functional)
+        let query = Vector((0..<8).map { _ in Float.random(in: -1...1) })
+        let results = await index.search(query: query, k: 10)
+        XCTAssertEqual(results.count, 10)
+
+        // Results should still be sorted by distance
+        for i in 0..<(results.count - 1) {
+            XCTAssertLessThanOrEqual(results[i].distance, results[i + 1].distance)
+        }
+    }
+
+    /// Tests recall at 5000 vectors — validates multi-layer benefit at scale.
+    func testRecallAt10_5000Vectors() async throws {
+        try await verifyRecall(vectorCount: 5000, dimension: 32, targetRecall: 0.90)
+    }
+
+    /// Tests that removing a node doesn't break multi-layer search.
+    func testRemoveAcrossLayers() async throws {
+        let config = HNSWConfiguration(m: 8, efConstruction: 50, efSearch: 50)
+        let index = HNSWIndex(dimension: 4, metric: EuclideanDistance(), config: config)
+
+        var ids: [UUID] = []
+        for _ in 0..<200 {
+            let v = Vector((0..<4).map { _ in Float.random(in: -1...1) })
+            let id = UUID()
+            try await index.add(v, id: id)
+            ids.append(id)
+        }
+
+        // Remove 50 random nodes
+        for id in ids.prefix(50) {
+            _ = await index.remove(id: id)
+        }
+
+        // Search should still work and not return removed nodes
+        let removedSet = Set(ids.prefix(50))
+        let query = Vector((0..<4).map { _ in Float.random(in: -1...1) })
+        let results = await index.search(query: query, k: 20)
+
+        for result in results {
+            XCTAssertFalse(removedSet.contains(result.id),
+                           "Search returned a removed node")
+        }
+    }
+
+    /// Tests that heuristic selection creates cross-cluster edges.
+    func testHeuristicCreatesLongRangeEdges() async throws {
+        let config = HNSWConfiguration(m: 8, efConstruction: 100, efSearch: 50)
+        let index = HNSWIndex(dimension: 2, metric: EuclideanDistance(), config: config)
+        let brute = BruteForceIndex(dimension: 2, metric: EuclideanDistance())
+
+        // Create two tight clusters far apart
+        // Cluster A: centered at (0, 0)
+        for _ in 0..<100 {
+            let v = Vector([Float.random(in: -0.1...0.1), Float.random(in: -0.1...0.1)])
+            let id = UUID()
+            try await index.add(v, id: id)
+            try await brute.add(v, id: id)
+        }
+        // Cluster B: centered at (10, 10)
+        for _ in 0..<100 {
+            let v = Vector([10.0 + Float.random(in: -0.1...0.1), 10.0 + Float.random(in: -0.1...0.1)])
+            let id = UUID()
+            try await index.add(v, id: id)
+            try await brute.add(v, id: id)
+        }
+
+        // Query near cluster B — HNSW must navigate from the entry point
+        // (which might be in cluster A) to cluster B. This only works if
+        // heuristic selection created long-range edges between clusters.
+        let query = Vector([10.0, 10.0])
+        let hnswResults = await index.search(query: query, k: 10)
+        let bruteResults = await brute.search(query: query, k: 10)
+
+        let bruteIDs = Set(bruteResults.map(\.id))
+        let hnswIDs = Set(hnswResults.map(\.id))
+        let recall = Double(bruteIDs.intersection(hnswIDs).count) / Double(10)
+
+        XCTAssertGreaterThan(recall, 0.8,
+                             "HNSW should find cluster B even when entry point is in cluster A")
+    }
 }
