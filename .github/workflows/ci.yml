@@ -28,3 +28,6 @@ jobs:
 
       - name: Build Demo App
         run: swift build --target ProximaDemo
+
+      - name: Build Documentation
+        run: swift package generate-documentation --target ProximaKit
