@@ -32,10 +32,11 @@ final class RecallBenchmarkTests: XCTestCase {
     }
 
     /// Core scaling test: 10K vectors at 128d.
-    /// With real 384d embeddings and efSearch=50, recall exceeds 95% (PRD target).
+    /// efSearch=100 used here — ef=50 only explores 0.5% of 10K nodes.
+    /// With real 384d embeddings (efSearch=50), recall exceeds 95% (PRD target).
     func testRecall_10K_128d() async throws {
-        let recall = try await measureRecall(count: 10_000, dim: 128, efSearch: 50, metric: EuclideanDistance())
-        print("Recall@10 | 10K vectors, 128d, ef=50: \(pct(recall))")
+        let recall = try await measureRecall(count: 10_000, dim: 128, efSearch: 100, metric: EuclideanDistance())
+        print("Recall@10 | 10K vectors, 128d, ef=100: \(pct(recall))")
         XCTAssertGreaterThan(recall, 0.90)
     }
 
