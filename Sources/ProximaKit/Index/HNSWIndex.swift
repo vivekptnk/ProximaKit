@@ -57,9 +57,15 @@ public actor HNSWIndex: VectorIndex {
 
     // ── Configuration ─────────────────────────────────────────────────
 
-    public let dimension: Int
+    // `dimension` and `config` are set at init and never mutated.
+    // `nonisolated` makes them readable without `await` — safe because
+    // immutable stored `let` properties can't cause data races.
+    public nonisolated let dimension: Int
     private let metric: any DistanceMetric
     private let config: HNSWConfiguration
+
+    /// The configuration this index was created with. Readable without `await`.
+    public nonisolated var configuration: HNSWConfiguration { config }
 
     /// Level multiplier: mL = 1/ln(M). Used for exponential layer assignment.
     private let levelMultiplier: Double
@@ -97,8 +103,13 @@ public actor HNSWIndex: VectorIndex {
     /// The highest layer currently in the index.
     private var maxLevel: Int = -1
 
-    /// The number of vectors in the index.
+    /// The number of slots in the index, including tombstoned (removed) nodes.
+    /// Use `liveCount` to get the number of searchable vectors.
     public var count: Int { vectors.count }
+
+    /// The number of live (non-tombstoned) vectors available for search.
+    /// After removals, `liveCount <= count`. After `compact()`, they are equal.
+    public var liveCount: Int { uuidToNode.count }
 
     // ── Initialization ────────────────────────────────────────────────
 
@@ -289,6 +300,44 @@ public actor HNSWIndex: VectorIndex {
         }
 
         return true
+    }
+
+    // ── Compaction ────────────────────────────────────────────────────
+
+    /// Rebuilds the index, removing all tombstoned (deleted) nodes.
+    ///
+    /// After removals, `count` includes tombstone slots but `liveCount` does not.
+    /// Compaction reclaims that memory and resets `count == liveCount`.
+    ///
+    /// The graph is fully rebuilt, so this is O(n log n) — call it when the
+    /// ratio `liveCount / count` drops below your acceptable threshold (e.g., 0.7).
+    ///
+    /// ```swift
+    /// await index.compact()
+    /// // Now count == liveCount
+    /// ```
+    public func compact() throws {
+        // Snapshot all live nodes before clearing state.
+        var live: [(id: UUID, vector: Vector, metadata: Data?)] = []
+        for (node, uuid) in nodeToUUID.enumerated() {
+            guard uuidToNode[uuid] != nil else { continue }
+            live.append((id: uuid, vector: vectors[node], metadata: metadata[node]))
+        }
+
+        // Reset all storage.
+        layers = []
+        nodeLevels = []
+        vectors = []
+        metadata = []
+        nodeToUUID = []
+        uuidToNode = [:]
+        entryPointNode = nil
+        maxLevel = -1
+
+        // Re-insert all live nodes — this rebuilds a clean graph.
+        for entry in live {
+            try add(entry.vector, id: entry.id, metadata: entry.metadata)
+        }
     }
 
     // ── Layer Assignment ──────────────────────────────────────────────
