@@ -1,121 +1,100 @@
 #!/usr/bin/env python3
 """
-Downloads the pre-exported ONNX model for all-MiniLM-L6-v2
-and converts it to CoreML.
+Converts all-MiniLM-L6-v2 to CoreML using torch.jit.trace.
+
+Tested with: coremltools==7.2, torch==2.5.0, transformers==4.36.2
+Use Python 3.11 (not 3.14).
 
 Usage:
-    python3 -m venv venv && source venv/bin/activate
-    pip install coremltools onnx numpy
+    /opt/homebrew/bin/python3.11 -m venv venv
+    source venv/bin/activate
+    pip install "coremltools==7.2" "torch==2.5.0" "transformers==4.36.2" "sentence-transformers==3.3.1" numpy
     python3 scripts/convert_model.py
 
-Output:
-    Models/MiniLM-L6-v2.mlpackage (384-dim sentence embeddings)
+Output: Models/MiniLM-L6-v2.mlpackage (384-dim sentence embeddings)
 """
 
-import os
-import sys
+import os, sys
+import numpy as np
 
 def main():
     try:
-        import numpy as np
+        import torch
         import coremltools as ct
-        import onnx
+        from transformers import AutoTokenizer, AutoModel
     except ImportError as e:
         print(f"Missing: {e}")
-        print("pip install coremltools onnx numpy")
         sys.exit(1)
 
-    output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Models")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    output_dir = os.path.join(root, "Models")
     output_path = os.path.join(output_dir, "MiniLM-L6-v2.mlpackage")
 
     if os.path.exists(output_path):
         print(f"Already exists: {output_path}")
         return
 
-    max_length = 128
+    max_len = 128
+    model_name = "sentence-transformers/all-MiniLM-L6-v2"
 
-    # Step 1: Download pre-exported ONNX from HuggingFace
-    onnx_path = download_onnx_model()
+    print(f"Loading {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    bert = AutoModel.from_pretrained(model_name).cpu().eval()
 
-    # Step 2: Convert ONNX to CoreML
-    print("Converting ONNX to CoreML...")
-    onnx_model = onnx.load(onnx_path)
-    mlmodel = ct.convert(
-        onnx_model,
+    # Wrapper: BERT + mean pooling → 384-dim embedding
+    class Wrapper(torch.nn.Module):
+        def __init__(self, bert):
+            super().__init__()
+            self.bert = bert
+        def forward(self, ids, mask):
+            out = self.bert(input_ids=ids, attention_mask=mask)
+            tok = out.last_hidden_state
+            m = mask.unsqueeze(-1).expand(tok.size()).float()
+            return torch.sum(tok * m, 1) / torch.clamp(m.sum(1), min=1e-9)
+
+    wrapper = Wrapper(bert).eval()
+
+    print("Tracing...")
+    dummy_ids = torch.randint(0, 1000, (1, max_len), dtype=torch.long)
+    dummy_mask = torch.ones(1, max_len, dtype=torch.long)
+    with torch.no_grad():
+        traced = torch.jit.trace(wrapper, (dummy_ids, dummy_mask))
+
+    print("Converting to CoreML...")
+    ml = ct.convert(
+        traced,
         inputs=[
-            ct.TensorType(name="input_ids", shape=(1, max_length), dtype=np.int32),
-            ct.TensorType(name="attention_mask", shape=(1, max_length), dtype=np.int32),
-            ct.TensorType(name="token_type_ids", shape=(1, max_length), dtype=np.int32),
+            ct.TensorType("input_ids", shape=(1, max_len), dtype=np.int32),
+            ct.TensorType("attention_mask", shape=(1, max_len), dtype=np.int32),
         ],
-        minimum_deployment_target=ct.target.macOS14,
+        outputs=[ct.TensorType("embeddings")],
         convert_to="mlprogram",
+        minimum_deployment_target=ct.target.macOS14,
     )
 
     os.makedirs(output_dir, exist_ok=True)
-    mlmodel.save(output_path)
+    ml.save(output_path)
     print(f"Saved: {output_path}")
 
-    # Step 3: Quick verification
-    verify(mlmodel, max_length)
-
-
-def download_onnx_model():
-    """Downloads the ONNX model from HuggingFace Hub."""
-    import tempfile
-    onnx_dir = os.path.join(tempfile.gettempdir(), "minilm-onnx")
-
-    # Check if already downloaded
-    onnx_path = os.path.join(onnx_dir, "model.onnx")
-    if os.path.exists(onnx_path):
-        print(f"ONNX model cached at {onnx_path}")
-        return onnx_path
-
-    print("Downloading ONNX model from HuggingFace...")
-    try:
-        from huggingface_hub import hf_hub_download
-        onnx_path = hf_hub_download(
-            repo_id="sentence-transformers/all-MiniLM-L6-v2",
-            filename="onnx/model.onnx",
-            local_dir=onnx_dir,
-        )
-        print(f"Downloaded to {onnx_path}")
-        return onnx_path
-    except ImportError:
-        # Fallback: direct URL download
-        import urllib.request
-        url = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
-        os.makedirs(onnx_dir, exist_ok=True)
-        print(f"Downloading from {url}...")
-        urllib.request.urlretrieve(url, onnx_path)
-        print(f"Downloaded to {onnx_path}")
-        return onnx_path
-
-
-def verify(mlmodel, max_length):
-    """Quick check that the model produces output."""
-    import numpy as np
-
-    print("\nVerifying...")
-    # Create dummy tokenized input
-    input_ids = np.array([[101, 2023, 2003, 1037, 3231, 6251, 1012, 102] +
-                           [0] * (max_length - 8)], dtype=np.int32)
-    attention_mask = np.array([[1] * 8 + [0] * (max_length - 8)], dtype=np.int32)
-    token_type_ids = np.zeros((1, max_length), dtype=np.int32)
-
-    result = mlmodel.predict({
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "token_type_ids": token_type_ids,
+    # Verify
+    text = "This is a test sentence."
+    tok = tokenizer(text, padding="max_length", max_length=max_len,
+                    truncation=True, return_tensors="np")
+    out = ml.predict({
+        "input_ids": tok["input_ids"].astype(np.int32),
+        "attention_mask": tok["attention_mask"].astype(np.int32),
     })
+    emb = np.array(list(out.values())[0]).flatten()
+    print(f"Output dim: {len(emb)}, norm: {np.linalg.norm(emb):.4f}")
 
-    # Find the embedding output (might have different names)
-    for key, value in result.items():
-        arr = np.array(value)
-        if arr.size > 10:  # embedding output, not a scalar
-            print(f"Output '{key}': shape={arr.shape}, norm={np.linalg.norm(arr.flatten()):.4f}")
-
-    print("Conversion successful!")
-
+    # Compare to PyTorch
+    with torch.no_grad():
+        ids = torch.tensor(tok["input_ids"], dtype=torch.long)
+        mask = torch.tensor(tok["attention_mask"], dtype=torch.long)
+        ref = wrapper(ids, mask).numpy().flatten()
+    cos = np.dot(ref, emb) / (np.linalg.norm(ref) * np.linalg.norm(emb) + 1e-9)
+    print(f"Cosine similarity vs PyTorch: {cos:.6f}")
+    print("Done!" if cos > 0.99 else f"WARNING: low similarity {cos:.4f}")
 
 if __name__ == "__main__":
     main()
