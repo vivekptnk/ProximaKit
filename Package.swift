@@ -22,6 +22,10 @@ let package = Package(
         .library(name: "ProximaEmbeddings", targets: ["ProximaEmbeddings"]),
     ],
 
+    dependencies: [
+        .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.0.0"),
+    ],
+
     targets: [
         // ── Core Library ──────────────────────────────────────────────
         // Imports: Foundation, Accelerate ONLY.

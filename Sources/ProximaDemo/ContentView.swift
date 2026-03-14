@@ -1,18 +1,24 @@
 // ContentView.swift
 // ProximaDemo
 //
-// Main UI: search bar, results list, index status.
+// Main UI: search bar, results list, settings panel, notes input.
 
 import SwiftUI
 
 struct ContentView: View {
     @State private var engine = SearchEngine()
     @State private var searchText = ""
+    @State private var showSettings = false
+    @State private var newNote = ""
 
     var body: some View {
-        NavigationStack {
+        NavigationSplitView {
+            // Sidebar: settings + notes
+            sidebar
+                .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+        } detail: {
+            // Main: search + results
             VStack(spacing: 0) {
-                // Results
                 if engine.isIndexing {
                     indexingView
                 } else if engine.results.isEmpty && !searchText.isEmpty {
@@ -24,25 +30,91 @@ struct ContentView: View {
                 }
 
                 Divider()
-
-                // Status bar
                 statusBar
             }
             .navigationTitle("ProximaKit Demo")
-            .searchable(text: $searchText, prompt: "Search for anything...")
+            .searchable(text: $searchText, prompt: "Search by meaning...")
             .onChange(of: searchText) {
-                Task {
-                    await engine.search(searchText)
-                }
+                Task { await engine.search(searchText) }
             }
             .task {
                 await engine.buildIndex()
             }
         }
-        .frame(minWidth: 500, minHeight: 400)
+        .frame(minWidth: 700, minHeight: 500)
     }
 
-    // MARK: - Subviews
+    // MARK: - Sidebar
+
+    private var sidebar: some View {
+        List {
+            // Settings section
+            Section("Search Settings") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("efSearch: \(Int(engine.efSearch))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Slider(value: $engine.efSearch, in: 10...200, step: 10)
+                    Text("Higher = better results, slower search")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.vertical, 4)
+
+                Button("Rebuild Index") {
+                    Task { await engine.buildIndex() }
+                }
+            }
+
+            // Add notes section
+            Section("Your Notes") {
+                HStack {
+                    TextField("Add a note...", text: $newNote)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            Task {
+                                await engine.addNote(newNote)
+                                newNote = ""
+                            }
+                        }
+                    Button {
+                        Task {
+                            await engine.addNote(newNote)
+                            newNote = ""
+                        }
+                    } label: {
+                        Image(systemName: "plus.circle.fill")
+                    }
+                    .disabled(newNote.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+
+                if engine.userNotes.isEmpty {
+                    Text("Add notes to include them in search results")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ForEach(engine.userNotes, id: \.self) { note in
+                        Text(note)
+                            .font(.caption)
+                            .lineLimit(2)
+                    }
+                }
+            }
+
+            // Stats section
+            Section("Index Stats") {
+                LabeledContent("Vectors", value: "\(engine.indexedCount)")
+                LabeledContent("efSearch", value: "\(Int(engine.efSearch))")
+                if engine.lastQueryTimeMs > 0 {
+                    LabeledContent("Last query", value: String(format: "%.1f ms", engine.lastQueryTimeMs))
+                }
+                LabeledContent("Notes", value: "\(engine.userNotes.count)")
+            }
+        }
+        .listStyle(.sidebar)
+    }
+
+    // MARK: - Main Content
 
     private var welcomeView: some View {
         VStack(spacing: 16) {
@@ -52,7 +124,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Text("Semantic Search")
                 .font(.title2)
-            Text("Type anything to search \(engine.indexedCount) sentences by meaning, not keywords.")
+            Text("Type anything to search \(engine.indexedCount) items by meaning.\nAdd your own notes in the sidebar.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 300)
@@ -66,7 +138,7 @@ struct ContentView: View {
             Spacer()
             ProgressView()
                 .scaleEffect(1.5)
-            Text("Indexing \(engine.indexedCount) / \(sampleSentences.count) sentences...")
+            Text("Indexing \(engine.indexedCount) / \(sampleSentences.count + engine.userNotes.count)...")
                 .foregroundStyle(.secondary)
             Spacer()
         }
@@ -101,9 +173,15 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(result.text)
                         .font(.body)
-                    Text(result.category)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 4) {
+                        Text(result.category)
+                            .font(.caption)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(categoryColor(result.category).opacity(0.1))
+                            .foregroundStyle(categoryColor(result.category))
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
                 }
             }
             .padding(.vertical, 4)
@@ -119,6 +197,8 @@ struct ContentView: View {
             if engine.lastQueryTimeMs > 0 {
                 Label(String(format: "%.1f ms", engine.lastQueryTimeMs), systemImage: "clock")
             }
+
+            Label("ef=\(Int(engine.efSearch))", systemImage: "slider.horizontal.3")
 
             if let error = engine.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle")
@@ -138,5 +218,20 @@ struct ContentView: View {
         if distance < 0.3 { return .green }
         if distance < 0.6 { return .orange }
         return .red
+    }
+
+    private func categoryColor(_ category: String) -> Color {
+        switch category {
+        case "Animals": return .brown
+        case "Food": return .orange
+        case "Technology": return .blue
+        case "Nature": return .green
+        case "Sports": return .red
+        case "Science": return .purple
+        case "Travel": return .cyan
+        case "Music": return .pink
+        case "Your Notes": return .indigo
+        default: return .gray
+        }
     }
 }

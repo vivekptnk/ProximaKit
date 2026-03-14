@@ -2,10 +2,10 @@
 
 **Search by meaning, not keywords. On-device. Pure Swift.**
 
+[![CI](https://github.com/vivekptnk/ProximaKit/actions/workflows/ci.yml/badge.svg)](https://github.com/vivekptnk/ProximaKit/actions/workflows/ci.yml)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9+-orange.svg)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/Platforms-iOS%2017%20%7C%20macOS%2014%20%7C%20visionOS%201-blue.svg)](https://developer.apple.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-117%20passing-brightgreen.svg)]()
 
 ---
 
