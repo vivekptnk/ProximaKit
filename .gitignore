@@ -29,5 +29,14 @@ __pycache__/
 venv/
 .venv/
 
-# Claude Code local state
-.claude/progress.md
+# Claude Code (internal dev tooling)
+.claude/
+
+# Internal planning & docs (kept locally, not public)
+docs/PRD.md
+docs/MODEL_GUIDE.md
+docs/BENCHMARKS.md
+CLAUDE.md
+CONTRIBUTING.md
+Benchmarks/
+scripts/
