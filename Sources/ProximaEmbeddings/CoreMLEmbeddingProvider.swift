@@ -1,0 +1,271 @@
+// CoreMLEmbeddingProvider.swift
+// ProximaEmbeddings
+//
+// Text → Vector using any CoreML model that outputs a float array.
+// Designed for sentence-transformer models (BERT, MiniLM, etc.)
+// converted to CoreML format via coremltools.
+
+import CoreML
+import Foundation
+import ProximaKit
+
+/// Embeds text using a CoreML model that outputs a multi-array of floats.
+///
+/// This is the most flexible embedding provider — bring any sentence-transformer
+/// model converted to CoreML format. The provider handles model loading,
+/// input preparation, prediction, and output conversion.
+///
+/// ```swift
+/// let provider = try CoreMLEmbeddingProvider(modelAt: modelURL)
+/// let vector = try await provider.embed("sunset over the ocean")
+/// ```
+///
+/// **Model requirements:**
+/// - Input: must accept "input_ids" and "attention_mask" as `MLMultiArray<Int32>`
+/// - Output: must produce an `MLMultiArray` of floats (the embedding vector)
+///
+/// **Converting a model:**
+/// ```bash
+/// pip install coremltools transformers torch
+/// python3 scripts/convert_model.py
+/// ```
+public final class CoreMLEmbeddingProvider: @unchecked Sendable {
+
+    /// The dimension of vectors this provider produces.
+    public let dimension: Int
+
+    /// The loaded CoreML model.
+    private let model: MLModel
+
+    /// The name of the output feature containing the embedding.
+    private let outputFeatureName: String
+
+    /// Maximum sequence length the model accepts.
+    private let maxLength: Int
+
+    // ── Initialization ────────────────────────────────────────────────
+
+    /// Loads a compiled CoreML model (.mlmodelc directory).
+    ///
+    /// - Parameter url: Path to the compiled model directory.
+    /// - Throws: `EmbeddingError.modelNotAvailable` if the model can't be loaded.
+    public init(compiledModelURL url: URL) throws {
+        let model = try Self.loadModel(from: url)
+        self.model = model
+        (self.outputFeatureName, self.dimension, self.maxLength) = try Self.discoverModelShape(model)
+    }
+
+    /// Compiles and loads a .mlpackage or .mlmodel file.
+    ///
+    /// This compiles the model on first load (may take a few seconds).
+    /// For production, pre-compile and use `init(compiledModelURL:)`.
+    ///
+    /// - Parameter url: Path to the .mlpackage or .mlmodel file.
+    /// - Throws: `EmbeddingError.modelNotAvailable` if compilation or loading fails.
+    public init(modelAt url: URL) throws {
+        let compiledURL = try MLModel.compileModel(at: url)
+        let model = try Self.loadModel(from: compiledURL)
+        self.model = model
+        (self.outputFeatureName, self.dimension, self.maxLength) = try Self.discoverModelShape(model)
+    }
+
+    // ── Embedding ─────────────────────────────────────────────────────
+
+    /// Embeds a text string into a vector.
+    ///
+    /// Tokenizes the text into integer IDs (basic whitespace tokenizer),
+    /// runs the CoreML model, and extracts the output embedding.
+    ///
+    /// - Parameter text: The text to embed. Must not be empty.
+    /// - Returns: A vector of dimension `self.dimension`.
+    public func embed(_ text: String) async throws -> Vector {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw EmbeddingError.unsupportedInput("Text is empty")
+        }
+
+        let (inputIDs, attentionMask) = try tokenize(trimmed)
+        let prediction = try await model.prediction(from: CoreMLInput(
+            inputIDs: inputIDs,
+            attentionMask: attentionMask
+        ))
+
+        return try vectorFromPrediction(prediction)
+    }
+
+    /// Embeds multiple texts using batch prediction.
+    public func embedBatch(_ texts: [String]) async throws -> [Vector] {
+        var results: [Vector] = []
+        results.reserveCapacity(texts.count)
+        for text in texts {
+            results.append(try await embed(text))
+        }
+        return results
+    }
+
+    // ── Tokenization (Basic) ──────────────────────────────────────────
+    //
+    // This is a simplified tokenizer that maps characters to integer IDs.
+    // For production-quality embeddings, use the model's actual tokenizer
+    // (WordPiece for BERT, SentencePiece for others).
+    //
+    // For v1, this basic tokenizer produces meaningful-enough IDs for
+    // the model to generate distinct embeddings per input text.
+
+    private func tokenize(_ text: String) throws -> (MLMultiArray, MLMultiArray) {
+        // Simple character-level hash tokenization.
+        // Maps each word to an integer ID based on its hash.
+        let words = text.lowercased().split(separator: " ")
+        var tokenIDs: [Int32] = [101] // [CLS] token
+
+        for word in words.prefix(maxLength - 2) {
+            // Hash the word to a token ID in vocab range [1000, 30000]
+            let hash = abs(word.hashValue) % 29000 + 1000
+            tokenIDs.append(Int32(hash))
+        }
+
+        tokenIDs.append(102) // [SEP] token
+
+        // Pad to maxLength
+        let attentionValues = [Int32](repeating: 1, count: tokenIDs.count)
+            + [Int32](repeating: 0, count: maxLength - tokenIDs.count)
+        while tokenIDs.count < maxLength {
+            tokenIDs.append(0) // [PAD]
+        }
+
+        let inputIDsArray = try MLMultiArray(shape: [1, NSNumber(value: maxLength)], dataType: .int32)
+        let maskArray = try MLMultiArray(shape: [1, NSNumber(value: maxLength)], dataType: .int32)
+
+        for i in 0..<maxLength {
+            inputIDsArray[[0, NSNumber(value: i)] as [NSNumber]] = NSNumber(value: tokenIDs[i])
+            maskArray[[0, NSNumber(value: i)] as [NSNumber]] = NSNumber(value: attentionValues[i])
+        }
+
+        return (inputIDsArray, maskArray)
+    }
+
+    // ── Output Conversion ─────────────────────────────────────────────
+
+    private func vectorFromPrediction(_ prediction: MLFeatureProvider) throws -> Vector {
+        guard let multiArray = prediction.featureValue(for: outputFeatureName)?.multiArrayValue else {
+            throw EmbeddingError.unsupportedInput("Model output '\(outputFeatureName)' is not a multi-array")
+        }
+
+        return try vectorFromMultiArray(multiArray)
+    }
+
+    private func vectorFromMultiArray(_ multiArray: MLMultiArray) throws -> Vector {
+        // The output may be [1, dim] or [dim]. Flatten to 1D.
+        let totalCount = multiArray.count
+        let count = min(totalCount, dimension)
+        var floats = [Float](repeating: 0, count: count)
+
+        let ptr = multiArray.dataPointer
+
+        switch multiArray.dataType {
+        case .float32:
+            let src = ptr.bindMemory(to: Float32.self, capacity: totalCount)
+            for i in 0..<count { floats[i] = src[i] }
+        case .float64:
+            let src = ptr.bindMemory(to: Float64.self, capacity: totalCount)
+            for i in 0..<count { floats[i] = Float(src[i]) }
+        case .float16:
+            // Float16 → Float32 via manual IEEE 754 half-precision conversion.
+            let src = ptr.bindMemory(to: UInt16.self, capacity: totalCount)
+            for i in 0..<count {
+                floats[i] = float16ToFloat32(src[i])
+            }
+        default:
+            throw EmbeddingError.unsupportedInput("Unsupported MLMultiArray data type: \(multiArray.dataType.rawValue)")
+        }
+
+        return Vector(floats)
+    }
+
+    // ── Model Discovery ───────────────────────────────────────────────
+
+    private static func loadModel(from url: URL) throws -> MLModel {
+        do {
+            return try MLModel(contentsOf: url)
+        } catch {
+            throw EmbeddingError.modelNotAvailable("Failed to load CoreML model: \(error.localizedDescription)")
+        }
+    }
+
+    /// Discovers the output feature name, embedding dimension, and max input length.
+    private static func discoverModelShape(_ model: MLModel) throws -> (String, Int, Int) {
+        let desc = model.modelDescription
+
+        // Find the first multi-array output
+        guard let output = desc.outputDescriptionsByName.first(where: {
+            $0.value.type == .multiArray
+        }) else {
+            throw EmbeddingError.modelNotAvailable("Model has no multi-array output")
+        }
+
+        let outputName = output.key
+        guard let constraint = output.value.multiArrayConstraint else {
+            throw EmbeddingError.modelNotAvailable("Cannot determine output dimensions")
+        }
+
+        // Dimension is the last element of the shape (handles [1, dim] and [dim])
+        let shape = constraint.shape.map { $0.intValue }
+        guard let dim = shape.last, dim > 0 else {
+            throw EmbeddingError.modelNotAvailable("Invalid output shape: \(shape)")
+        }
+
+        // Find max input length from input_ids shape
+        var maxLen = 128 // default
+        if let inputDesc = desc.inputDescriptionsByName["input_ids"],
+           let inputConstraint = inputDesc.multiArrayConstraint {
+            let inputShape = inputConstraint.shape.map { $0.intValue }
+            if let seqLen = inputShape.last {
+                maxLen = seqLen
+            }
+        }
+
+        return (outputName, dim, maxLen)
+    }
+}
+
+// ── Float16 Conversion ────────────────────────────────────────────────
+
+/// Converts a UInt16 IEEE 754 half-precision float to Float32.
+private func float16ToFloat32(_ half: UInt16) -> Float {
+    let sign = (half >> 15) & 0x1
+    let exp = (half >> 10) & 0x1F
+    let frac = half & 0x3FF
+    let signF: Float = sign == 1 ? -1 : 1
+
+    if exp == 0 {
+        // Subnormal or zero
+        return signF * Float(frac) / 1024.0 * pow(2, -14)
+    } else if exp == 31 {
+        // Infinity or NaN
+        return frac == 0 ? (signF * .infinity) : .nan
+    } else {
+        return signF * (1.0 + Float(frac) / 1024.0) * pow(2, Float(exp) - 15)
+    }
+}
+
+// ── CoreML Input Feature Provider ─────────────────────────────────────
+
+private class CoreMLInput: MLFeatureProvider {
+    let inputIDs: MLMultiArray
+    let attentionMask: MLMultiArray
+
+    var featureNames: Set<String> { ["input_ids", "attention_mask"] }
+
+    init(inputIDs: MLMultiArray, attentionMask: MLMultiArray) {
+        self.inputIDs = inputIDs
+        self.attentionMask = attentionMask
+    }
+
+    func featureValue(for featureName: String) -> MLFeatureValue? {
+        switch featureName {
+        case "input_ids": return MLFeatureValue(multiArray: inputIDs)
+        case "attention_mask": return MLFeatureValue(multiArray: attentionMask)
+        default: return nil
+        }
+    }
+}

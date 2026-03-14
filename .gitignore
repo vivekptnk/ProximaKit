@@ -19,3 +19,6 @@ DerivedData/
 *~
 .vscode/
 .idea/
+
+# ML Models (too large for git)
+Models/
