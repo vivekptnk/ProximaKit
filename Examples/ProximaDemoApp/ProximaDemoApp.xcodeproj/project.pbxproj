@@ -18,6 +18,7 @@
 /* Begin PBXFileReference section */
 		00D8A11D44651676C50CBFDD /* ProximaDemoApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProximaDemoApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		0AF9253AE12C903144E3D926 /* SearchEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchEngine.swift; sourceTree = "<group>"; };
+		5E7D8D01839066DB001F6E3B /* ProximaKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ProximaKit; path = ../..; sourceTree = SOURCE_ROOT; };
 		9EDBE8D0E0D5CA331847C63E /* MainView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainView.swift; sourceTree = "<group>"; };
 		B9661A24EC8151379196CA1C /* SampleData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SampleData.swift; sourceTree = "<group>"; };
 		DB00CC13A38F7E144E415224 /* ProximaDemoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProximaDemoApp.swift; sourceTree = "<group>"; };
@@ -36,6 +37,14 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		0B0E2E8F4B314EF76B87C5F7 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				5E7D8D01839066DB001F6E3B /* ProximaKit */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
 		11CD6B27A7A207361F084E13 /* Products */ = {
 			isa = PBXGroup;
 			children = (
@@ -58,6 +67,7 @@
 		DAE6692EB7A3B59E6F1F23B0 = {
 			isa = PBXGroup;
 			children = (
+				0B0E2E8F4B314EF76B87C5F7 /* Packages */,
 				AC8635638B65B4F90A0F41C5 /* Sources */,
 				11CD6B27A7A207361F084E13 /* Products */,
 			);
@@ -108,7 +118,7 @@
 			mainGroup = DAE6692EB7A3B59E6F1F23B0;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				B4E2CBE431BB78418C3DA5AA /* XCRemoteSwiftPackageReference "ProximaKit" */,
+				D790F8E9F2F109F1E38B33E9 /* XCLocalSwiftPackageReference "../..//" */,
 			);
 			preferredProjectObjectVersion = 54;
 			projectDirPath = "";
@@ -308,26 +318,20 @@
 		};
 /* End XCConfigurationList section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-		B4E2CBE431BB78418C3DA5AA /* XCRemoteSwiftPackageReference "ProximaKit" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/vivekptnk/ProximaKit.git";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 1.0.0;
-			};
+/* Begin XCLocalSwiftPackageReference section */
+		D790F8E9F2F109F1E38B33E9 /* XCLocalSwiftPackageReference "../..//" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "../..//";
 		};
-/* End XCRemoteSwiftPackageReference section */
+/* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
 		714984572209900A5C8B4AF8 /* ProximaKit */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = B4E2CBE431BB78418C3DA5AA /* XCRemoteSwiftPackageReference "ProximaKit" */;
 			productName = ProximaKit;
 		};
 		A6E94A3B60F222E53AFF9725 /* ProximaEmbeddings */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = B4E2CBE431BB78418C3DA5AA /* XCRemoteSwiftPackageReference "ProximaKit" */;
 			productName = ProximaEmbeddings;
 		};
 /* End XCSwiftPackageProductDependency section */
