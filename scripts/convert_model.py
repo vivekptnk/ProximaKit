@@ -39,8 +39,9 @@ def main():
 
     # Step 2: Convert ONNX to CoreML
     print("Converting ONNX to CoreML...")
+    onnx_model = onnx.load(onnx_path)
     mlmodel = ct.convert(
-        onnx_path,
+        onnx_model,
         inputs=[
             ct.TensorType(name="input_ids", shape=(1, max_length), dtype=np.int32),
             ct.TensorType(name="attention_mask", shape=(1, max_length), dtype=np.int32),
