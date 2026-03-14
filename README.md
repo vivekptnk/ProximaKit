@@ -2,97 +2,139 @@
 
 **Pure-Swift vector search, powered by Accelerate.**
 
-[![CI](https://github.com/vivek/ProximaKit/actions/workflows/ci.yml/badge.svg)](https://github.com/vivek/ProximaKit/actions)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9+-orange.svg)](https://swift.org)
-[![Platforms](https://img.shields.io/badge/Platforms-iOS%2017%20%7C%20macOS%2014-blue.svg)](https://developer.apple.com)
+[![Platforms](https://img.shields.io/badge/Platforms-iOS%2017%20%7C%20macOS%2014%20%7C%20visionOS%201-blue.svg)](https://developer.apple.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/Tests-117%20passing-brightgreen.svg)]()
 
-ProximaKit is a zero-dependency semantic search library for Apple platforms. All vector math runs through Apple's Accelerate framework. HNSW (Hierarchical Navigable Small World) is implemented from scratch in Swift — no C++ wrappers, no cloud APIs.
+ProximaKit is a zero-dependency semantic search library for Apple platforms. All vector math runs through Apple's Accelerate framework (vDSP/SIMD). HNSW is implemented from scratch in Swift — no C++ wrappers, no cloud APIs, no third-party dependencies.
 
 ## Quick Start
 
 ```swift
 import ProximaKit
 
-let index = HNSWIndex(dimension: 384, metric: .cosine)
-try await index.add(Vector([0.1, 0.2, ...]), id: UUID())
-let results = try await index.search(query: queryVector, k: 10)
+// Create an index
+let index = HNSWIndex(dimension: 384, metric: CosineDistance())
+
+// Add vectors
+let vector = Vector([0.1, 0.2, 0.3, ...])  // 384 floats
+try await index.add(vector, id: UUID())
+
+// Search
+let query = Vector([0.15, 0.18, 0.35, ...])
+let results = try await index.search(query: query, k: 10)
+
+for result in results {
+    print("\(result.id): distance \(result.distance)")
+}
 ```
 
-## Performance
+## With Embeddings (Text Search)
 
-| Metric | 10K/384d | Target |
-|--------|---------|--------|
-| HNSW Query p50 | ~5ms | <5ms |
-| HNSW Query p99 | ~40ms | <50ms |
-| Recall@10 (ef=50) | ~96% | >95% |
-| Index Build | ~3s | <5s |
-| Cold Start | ~90ms | <200ms |
+```swift
+import ProximaEmbeddings
 
-Full benchmark suite: `swift test --filter Benchmark`. Strategy: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+// Convert text to vectors using Apple's NaturalLanguage framework
+let provider = try NLEmbeddingProvider(language: .english)
+
+let vector = try await provider.embed("sunset over the ocean")
+try await index.add(vector, id: UUID())
+
+// Search by meaning, not keywords
+let query = try await provider.embed("beach at dusk")
+let results = try await index.search(query: query, k: 5)
+```
+
+## With Images (Photo Search)
+
+```swift
+let vision = VisionEmbeddingProvider()
+let imageVector = try await vision.embed(cgImage)
+try await index.add(imageVector, id: photoID)
+```
+
+## Save & Load
+
+```swift
+// Save to disk (binary format, ~50ms cold start for 10K vectors)
+try await index.save(to: fileURL)
+
+// Load back
+let loaded = try HNSWIndex.load(from: fileURL)
+```
 
 ## Architecture
 
 ```
-ProximaKit (core)         ProximaEmbeddings
-├── Vector (vDSP math)    ├── NLEmbeddingProvider
-├── BruteForceIndex       ├── CoreMLProvider
-├── HNSWIndex             └── VisionProvider
-├── PersistenceEngine
-└── DistanceMetric
+┌──────────────────────────────────────────────────────────┐
+│                     Your App                              │
+├──────────────────────────────────────────────────────────┤
+│              ProximaEmbeddings                             │
+│  NLEmbeddingProvider  │  VisionProvider  │  CoreMLProvider │
+│              ▼ EmbeddingProvider (protocol)                │
+├──────────────────────────────────────────────────────────┤
+│              ProximaKit (Core)                             │
+│                                                           │
+│  VectorIndex (protocol, actor-isolated)                   │
+│    ├── BruteForceIndex (exact, O(n))                     │
+│    └── HNSWIndex (approximate, O(log n))                  │
+│                                                           │
+│  Vector ─── vDSP math (dot, cosine, L2, normalize)       │
+│  DistanceMetric ─── Cosine, Euclidean, DotProduct         │
+│  BatchDistance ─── vDSP_mmul (10K distances in 1 call)    │
+│  PersistenceEngine ─── binary save/load with mmap         │
+│                                                           │
+│  Imports: Foundation + Accelerate ONLY                    │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Imports: Foundation + Accelerate (core), CoreML/NaturalLanguage/Vision (embeddings).
+## Performance
 
-Full docs: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Design decisions: [`docs/adr/`](docs/adr/)
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Recall@10 (1K vectors, ef=50) | 98-99% | Euclidean, random data |
+| Recall@10 (10K vectors, ef=100) | 87% | Random data; real embeddings achieve >95% |
+| Query latency (1K/384d) | ~104ms | Single query, CosineDistance |
+| Index build (1K vectors) | ~3s | M=16, efConstruction=200 |
+| Save/Load roundtrip | Exact match | Binary format preserves full graph |
 
-## AI-Native Development
+Full benchmark suite: `swift test --filter RecallBenchmark`
 
-This repo is built for **harness-driven development**. Rules aren't documented and hoped-for — they're enforced by hooks that block your tool calls:
+## Modules
 
-```
-Hook                        What It Enforces
-──────────────────────────────────────────────────────
-gate-main-branch.sh         No edits on main — use feature branches
-gate-module-bounds.py       No third-party imports, no boundary violations  
-validate-swift-write.py     Build check + no force unwraps + no manual loops
-auto-test.py                Auto-runs tests when test files change
-stop-check.py               Can't stop with failing tests or dirty state
-perf-guard.py               Reminds to benchmark perf-critical changes
-prompt-context.py           Injects context + suggests the right model
-```
+| Module | What | Imports |
+|--------|------|---------|
+| **ProximaKit** | Vector math, indices, persistence | Foundation, Accelerate |
+| **ProximaEmbeddings** | Text/image → Vector providers | CoreML, NaturalLanguage, Vision |
+| **ProximaDemo** | SwiftUI semantic search app | SwiftUI + above |
 
-### Model Routing
-
-Different models for different jobs. The prompt hook auto-suggests:
-
-| Model | Role | Use For |
-|-------|------|---------|
-| **Opus** | Architect | HNSW algorithm, ADRs, deep debugging, interviews |
-| **Sonnet** | Builder | Daily features, tests, reviews, bug fixes |
-| **Haiku** | Sprinter | Scaffolding, renaming, formatting, boilerplate |
-
-Full strategy: [`docs/MODEL_GUIDE.md`](docs/MODEL_GUIDE.md)
-
-## Contributing
+## Demo App
 
 ```bash
-git clone https://github.com/vivek/ProximaKit.git && cd ProximaKit
-claude                   # Sonnet for most work
-> /onboard               # Get oriented (any model)
-> /fix-issue 42          # Pick up an issue (Sonnet)
-> /review                # Self-check before PR (Sonnet)
+swift run ProximaDemo
 ```
 
-Or for deep work:
-```bash
-claude --model opus      # Switch to Opus
-> /explain HNSW          # Learn the algorithm
-> /architect "topic"     # Make a design decision
-> /interview HNSW        # Mock interview prep
+Launches a macOS SwiftUI app that indexes 50 sample sentences and lets you search by meaning. Type "animals" to find cat/dog sentences. Type "cooking" to find food sentences. Shows similarity distance and query latency.
+
+## Distance Metrics
+
+```swift
+CosineDistance()       // Best for text embeddings (direction, not magnitude)
+EuclideanDistance()    // Best for spatial data (straight-line distance)
+DotProductDistance()   // Fast for pre-normalized vectors
 ```
 
-Full guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+## Configuration
+
+```swift
+let config = HNSWConfiguration(
+    m: 16,              // Max connections per node (higher = better recall, more memory)
+    efConstruction: 200, // Beam width during build (higher = better graph quality)
+    efSearch: 50         // Beam width during query (higher = better recall, slower)
+)
+let index = HNSWIndex(dimension: 384, metric: CosineDistance(), config: config)
+```
 
 ## Installation
 
@@ -103,9 +145,23 @@ dependencies: [
 ]
 ```
 
+Import only what you need:
+```swift
+import ProximaKit           // Core: vectors, indices, persistence
+import ProximaEmbeddings    // Optional: NL, Vision, CoreML providers
+```
+
 ## Requirements
 
-Swift 5.9+ · iOS 17+ / macOS 14+ / visionOS 1+ · Xcode 15+
+Swift 5.9+ | iOS 17+ | macOS 14+ | visionOS 1+ | Xcode 15+
+
+## Design Decisions
+
+See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
+- [ADR-001](docs/adr/ADR-001-accelerate-for-math.md): Accelerate/vDSP for all vector math
+- [ADR-002](docs/adr/ADR-002-actor-isolation.md): Actor isolation for index types
+- [ADR-003](docs/adr/ADR-003-binary-persistence.md): Custom binary persistence format
+- [ADR-004](docs/adr/ADR-004-hnsw-heuristic-selection.md): Heuristic neighbor selection
 
 ## License
 
