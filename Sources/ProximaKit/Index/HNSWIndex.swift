@@ -2,8 +2,7 @@
 // ProximaKit
 //
 // Hierarchical Navigable Small World index for approximate nearest-neighbor search.
-// PK-005 implements single-layer NSW (layer 0 only).
-// PK-006 will add multi-layer support.
+// Multi-layer graph with greedy descent on upper layers and beam search on layer 0.
 //
 // Based on: "Efficient and robust approximate nearest neighbor search using
 // Hierarchical Navigable Small World graphs" (Malkov & Yashunin, 2018)
@@ -13,15 +12,20 @@ import Foundation
 
 /// Configuration for the HNSW index.
 ///
-/// - `m`: Max connections per node per layer. Higher = better recall, more memory.
-///   Default 16 is a good balance for most use cases.
-/// - `efConstruction`: Beam width during insertion. Higher = better graph quality,
-///   slower build. Default 200 gives high-quality graphs.
-/// - `efSearch`: Default beam width during queries. Can be overridden per query.
-///   Higher = better recall, slower queries. Default 50 gives >95% recall.
+/// - `m`: Max connections per node on upper layers. Layer 0 allows `2 * m`.
+/// - `efConstruction`: Beam width during insertion. Higher = better graph quality.
+/// - `efSearch`: Default beam width during queries. Tunable per query.
 public struct HNSWConfiguration: Sendable {
+    /// Max connections per node on layers 1+.
     public let m: Int
+
+    /// Max connections per node on layer 0 (2 * m per the paper).
+    public let mMax0: Int
+
+    /// Beam width during index construction.
     public let efConstruction: Int
+
+    /// Default beam width during search queries.
     public let efSearch: Int
 
     public init(m: Int = 16, efConstruction: Int = 200, efSearch: Int = 50) {
@@ -29,21 +33,23 @@ public struct HNSWConfiguration: Sendable {
         precondition(efConstruction > 0, "efConstruction must be positive")
         precondition(efSearch > 0, "efSearch must be positive")
         self.m = m
+        self.mMax0 = 2 * m
         self.efConstruction = efConstruction
         self.efSearch = efSearch
     }
 }
 
-/// Approximate nearest-neighbor index using Navigable Small World graphs.
+/// Approximate nearest-neighbor index using Hierarchical Navigable Small World graphs.
 ///
-/// Vectors are stored as nodes in a graph. Each node connects to up to `M`
-/// neighbors. Search starts at an entry point and greedily traverses the graph,
-/// always moving toward the query vector. This achieves O(log n) query time
-/// with >95% recall at default settings.
+/// The index organizes vectors into a multi-layer graph:
+/// - **Upper layers** (sparse): few nodes with long-range edges for fast navigation
+/// - **Layer 0** (dense): all nodes, where the final beam search happens
+///
+/// Search descends from the top layer greedily (ef=1) to find a good entry point
+/// for layer 0, then does a full beam search with `efSearch` candidates.
 ///
 /// ```swift
-/// let config = HNSWConfiguration(m: 16, efConstruction: 200, efSearch: 50)
-/// let index = HNSWIndex(dimension: 384, metric: CosineDistance(), config: config)
+/// let index = HNSWIndex(dimension: 384, metric: CosineDistance())
 /// try await index.add(vector, id: UUID())
 /// let results = try await index.search(query: queryVec, k: 10)
 /// ```
@@ -55,34 +61,41 @@ public actor HNSWIndex: VectorIndex {
     private let metric: any DistanceMetric
     private let config: HNSWConfiguration
 
+    /// Level multiplier: mL = 1/ln(M). Used for exponential layer assignment.
+    private let levelMultiplier: Double
+
     // ── Node Storage ──────────────────────────────────────────────────
     //
-    // Nodes are identified by an internal Int index (0, 1, 2, ...).
-    // This allows O(1) vector lookup and cache-friendly adjacency lists.
-    // The external UUID is mapped separately.
+    // Nodes are identified by internal Int indices (0, 1, 2, ...).
     //
-    // adjacency[i] = neighbor indices for node i (max M entries)
-    // vectors[i]   = the vector data for node i
-    // nodeToUUID[i] = the external UUID for node i
-    // uuidToNode    = reverse lookup
+    // layers[l][n] = neighbor indices for node n on layer l.
+    // Nodes that don't exist on layer l have an empty array at layers[l][n].
+    // This wastes trivial memory (empty Swift arrays are inline) but gives
+    // O(1) neighbor lookup on any layer — critical for search performance.
 
-    /// Adjacency lists: neighbors[i] = [Int] of neighbor node indices.
-    private var adjacency: [[Int]] = []
+    /// Per-layer adjacency lists. layers[l][n] = [neighbor indices].
+    private var layers: [[[Int]]] = []
 
-    /// Vector data for each node, indexed by node ID.
+    /// The maximum layer each node was assigned to.
+    private var nodeLevels: [Int] = []
+
+    /// Vector data for each node.
     private var vectors: [Vector] = []
 
-    /// Metadata for each node, indexed by node ID.
+    /// Metadata for each node.
     private var metadata: [Data?] = []
 
-    /// Maps internal node index → external UUID.
+    /// Internal node index → external UUID.
     private var nodeToUUID: [UUID] = []
 
-    /// Maps external UUID → internal node index.
+    /// External UUID → internal node index.
     private var uuidToNode: [UUID: Int] = [:]
 
-    /// The entry point for graph search (first node inserted).
-    private var entryPoint: Int?
+    /// The entry point node (always the node at the highest layer).
+    private var entryPointNode: Int?
+
+    /// The highest layer currently in the index.
+    private var maxLevel: Int = -1
 
     /// The number of vectors in the index.
     public var count: Int { vectors.count }
@@ -98,50 +111,105 @@ public actor HNSWIndex: VectorIndex {
         self.dimension = dimension
         self.metric = metric
         self.config = config
+        self.levelMultiplier = 1.0 / log(Double(config.m))
     }
 
-    // ── VectorIndex: Add ──────────────────────────────────────────────
+    // ── VectorIndex: Add (Algorithm 1 from paper) ─────────────────────
 
     public func add(_ vector: Vector, id: UUID, metadata: Data? = nil) throws {
         guard vector.dimension == dimension else {
             throw IndexError.dimensionMismatch(expected: dimension, got: vector.dimension)
         }
 
-        // If this UUID already exists, remove it first.
         if uuidToNode[id] != nil {
             _ = remove(id: id)
         }
 
         let newNode = vectors.count
+        let newLevel = assignLevel()
 
-        // Store the node data.
+        // Store node data.
         vectors.append(vector)
-        adjacency.append([])
         self.metadata.append(metadata)
         nodeToUUID.append(id)
         uuidToNode[id] = newNode
+        nodeLevels.append(newLevel)
 
-        // First node becomes the entry point.
-        guard let ep = entryPoint else {
-            entryPoint = newNode
+        // Ensure layers exist for this node's level.
+        ensureLayer(newLevel)
+
+        // Add empty neighbor slots for this new node on all existing layers.
+        for l in 0..<layers.count {
+            if layers[l].count <= newNode {
+                layers[l].append([])
+            }
+        }
+
+        // First node: becomes the entry point, no connections needed.
+        guard let ep = entryPointNode else {
+            entryPointNode = newNode
+            maxLevel = newLevel
             return
         }
 
-        // Find nearest neighbors using greedy search from the entry point.
-        let neighbors = searchLayer(
-            query: vector,
-            entryPoint: ep,
-            ef: config.efConstruction
-        )
+        var currentEntry = ep
 
-        // Connect to the top M nearest neighbors.
-        let topM = Array(neighbors.prefix(config.m))
-        for (neighborNode, _) in topM {
-            connect(newNode, neighborNode)
+        // Phase 1: Greedy descent on layers above the new node's level.
+        // Single-result search (ef=1) to find the closest node on each layer.
+        if maxLevel > newLevel {
+            for level in stride(from: maxLevel, through: newLevel + 1, by: -1) {
+                let nearest = searchLayer(query: vector, entryPoint: currentEntry, ef: 1, layer: level)
+                if let closest = nearest.first {
+                    currentEntry = closest.node
+                }
+            }
+        }
+
+        // Phase 2: Insert on layers min(newLevel, maxLevel) down to 0.
+        // Beam search + connect with heuristic neighbor selection.
+        let insertionTop = min(newLevel, maxLevel)
+        for level in stride(from: insertionTop, through: 0, by: -1) {
+            let candidates = searchLayer(
+                query: vector,
+                entryPoint: currentEntry,
+                ef: config.efConstruction,
+                layer: level
+            )
+
+            let maxConnections = (level == 0) ? config.mMax0 : config.m
+            let selected = selectNeighborsHeuristic(
+                target: vector,
+                candidates: candidates,
+                m: maxConnections
+            )
+
+            // Connect new node to selected neighbors on this layer.
+            for (neighbor, _) in selected {
+                layers[level][newNode].append(neighbor)
+                layers[level][neighbor].append(newNode)
+
+                // Prune neighbor if over capacity.
+                let neighborMax = (level == 0) ? config.mMax0 : config.m
+                if layers[level][neighbor].count > neighborMax {
+                    pruneConnections(node: neighbor, layer: level, maxConnections: neighborMax)
+                }
+            }
+
+            // Use closest candidate as entry for the next layer down.
+            if let closest = candidates.first {
+                currentEntry = closest.node
+            }
+        }
+
+        // If the new node has a higher level than the current max,
+        // it becomes the new entry point.
+        if newLevel > maxLevel {
+            entryPointNode = newNode
+            maxLevel = newLevel
         }
     }
 
-    // ── VectorIndex: Search ───────────────────────────────────────────
+    // ── VectorIndex: Search (Algorithm 5 from paper) ──────────────────
 
     public func search(
         query: Vector,
@@ -150,18 +218,30 @@ public actor HNSWIndex: VectorIndex {
         filter: (@Sendable (UUID) -> Bool)? = nil
     ) -> [SearchResult] {
         guard query.dimension == dimension else { return [] }
-        guard let ep = entryPoint else { return [] }
+        guard let ep = entryPointNode else { return [] }
         guard k > 0 else { return [] }
 
         let ef = max(efSearch ?? config.efSearch, k)
+        var currentEntry = ep
 
-        // Search the graph starting from the entry point.
-        let candidates = searchLayer(query: query, entryPoint: ep, ef: ef)
+        // Phase 1: Greedy descent on upper layers (ef=1).
+        // Each layer narrows down to a better starting point for the next.
+        for level in stride(from: maxLevel, through: 1, by: -1) {
+            let nearest = searchLayer(query: query, entryPoint: currentEntry, ef: 1, layer: level)
+            if let closest = nearest.first {
+                currentEntry = closest.node
+            }
+        }
 
-        // Build results, applying filter.
+        // Phase 2: Full beam search on layer 0.
+        let candidates = searchLayer(query: query, entryPoint: currentEntry, ef: ef, layer: 0)
+
+        // Build results, skipping tombstoned nodes and applying filter.
         var results: [SearchResult] = []
         for (node, distance) in candidates {
             let uuid = nodeToUUID[node]
+            // Skip tombstoned nodes (removed but slot not compacted).
+            guard uuidToNode[uuid] != nil else { continue }
             if let filter = filter, !filter(uuid) { continue }
             results.append(SearchResult(
                 id: uuid,
@@ -170,7 +250,6 @@ public actor HNSWIndex: VectorIndex {
             ))
         }
 
-        // Sort and trim to k.
         results.sort()
         if results.count > k {
             results = Array(results.prefix(k))
@@ -184,76 +263,93 @@ public actor HNSWIndex: VectorIndex {
     @discardableResult
     public func remove(id: UUID) -> Bool {
         guard let node = uuidToNode[id] else { return false }
+        let level = nodeLevels[node]
 
-        // Disconnect this node from all neighbors.
-        for neighbor in adjacency[node] {
-            adjacency[neighbor].removeAll { $0 == node }
+        // Disconnect this node on all its layers.
+        for l in 0...level where l < layers.count {
+            for neighbor in layers[l][node] {
+                layers[l][neighbor].removeAll { $0 == node }
+            }
+            layers[l][node] = []
         }
-        adjacency[node] = []
 
-        // Clear the UUID mapping.
         uuidToNode.removeValue(forKey: id)
 
-        // Note: We don't compact arrays (would invalidate all indices).
-        // The node slot becomes a "tombstone" — searchLayer skips it
-        // because it has no neighbors and won't be found by traversal.
-        // For a production implementation, you'd periodically rebuild.
-
-        // If we removed the entry point, pick a new one.
-        if entryPoint == node {
-            entryPoint = uuidToNode.values.first
+        // If we removed the entry point, find the node with the highest level.
+        if entryPointNode == node {
+            entryPointNode = nil
+            maxLevel = -1
+            for (n, nUUID) in nodeToUUID.enumerated() {
+                guard uuidToNode[nUUID] != nil else { continue }
+                if nodeLevels[n] > maxLevel {
+                    maxLevel = nodeLevels[n]
+                    entryPointNode = n
+                }
+            }
         }
 
         return true
     }
 
-    // ── Core Algorithm: Greedy Search on Single Layer ─────────────────
+    // ── Layer Assignment ──────────────────────────────────────────────
     //
-    // This is Algorithm 2 from the HNSW paper, adapted for a single layer.
+    // level = floor(-ln(random) * mL)  where mL = 1/ln(M)
     //
-    // Starting from the entry point, we greedily explore the graph:
-    // 1. Maintain a min-heap of candidates (nodes to explore next)
-    // 2. Maintain a max-heap of results (best nodes found so far, capped at ef)
-    // 3. Always explore the closest candidate first
-    // 4. Stop when the closest candidate is farther than the worst result
+    // This produces a geometric distribution:
+    //   ~93.75% of nodes at level 0  (for M=16)
+    //   ~5.86% at level 1
+    //   ~0.37% at level 2
+    //   etc.
+    // Like skip lists: most nodes are in the "ground floor" (layer 0),
+    // and each upper layer has ~1/M as many nodes.
+
+    private func assignLevel() -> Int {
+        let random = Double.random(in: Double.leastNonzeroMagnitude...1.0)
+        return Int(floor(-log(random) * levelMultiplier))
+    }
+
+    /// Ensures the layers array has capacity through the given level.
+    private func ensureLayer(_ level: Int) {
+        while layers.count <= level {
+            layers.append(Array(repeating: [], count: vectors.count))
+        }
+    }
+
+    // ── Core: Beam Search on a Single Layer (Algorithm 2) ─────────────
     //
-    // Returns up to `ef` (node, distance) pairs sorted by distance ascending.
+    // Unchanged from PK-005 except it now takes a `layer` parameter
+    // to index into the correct adjacency list.
 
     private func searchLayer(
         query: Vector,
         entryPoint: Int,
-        ef: Int
+        ef: Int,
+        layer: Int
     ) -> [(node: Int, distance: Float)] {
         let epDist = metric.distance(query, vectors[entryPoint])
 
-        // Candidates: min-heap (explore closest first)
         var candidates = Heap<(node: Int, distance: Float)>(comparator: { $0.distance < $1.distance })
         candidates.push((entryPoint, epDist))
 
-        // Results: max-heap (evict the farthest when full)
         var results = Heap<(node: Int, distance: Float)>(comparator: { $0.distance > $1.distance })
         results.push((entryPoint, epDist))
 
         var visited = Set<Int>([entryPoint])
 
         while !candidates.isEmpty {
-            // Pop the closest unexplored candidate.
             let nearest = candidates.pop()!
 
-            // If the closest candidate is farther than our worst result,
-            // we can't improve — stop exploring.
             if let furthest = results.peek(), nearest.distance > furthest.distance {
                 break
             }
 
-            // Explore this candidate's neighbors.
-            for neighbor in adjacency[nearest.node] {
+            // The ONLY change from PK-005: layers[layer][...] instead of adjacency[...]
+            for neighbor in layers[layer][nearest.node] {
                 guard !visited.contains(neighbor) else { continue }
                 visited.insert(neighbor)
 
                 let dist = metric.distance(query, vectors[neighbor])
 
-                // Add to results if it improves them (or results aren't full yet).
                 let shouldAdd: Bool
                 if results.count < ef {
                     shouldAdd = true
@@ -267,51 +363,94 @@ public actor HNSWIndex: VectorIndex {
                     candidates.push((neighbor, dist))
                     results.push((neighbor, dist))
                     if results.count > ef {
-                        results.pop()  // evict the farthest
+                        results.pop()
                     }
                 }
             }
         }
 
-        // Drain the max-heap into an array sorted by distance ascending.
         var output: [(node: Int, distance: Float)] = []
         output.reserveCapacity(results.count)
         while let item = results.pop() {
             output.append(item)
         }
-        output.reverse()  // max-heap pops largest first, so reverse for ascending
+        output.reverse()
         return output
     }
 
-    // ── Graph Mutation ────────────────────────────────────────────────
+    // ── Heuristic Neighbor Selection (Algorithm 4) ────────────────────
+    //
+    // Instead of keeping the M nearest neighbors (simple selection),
+    // we keep the M most *diverse* neighbors. For each candidate:
+    //   - If it's closer to the target than to any already-selected neighbor → keep it
+    //   - Otherwise → skip it (it's "covered" by an existing neighbor)
+    //
+    // This creates longer-range edges across clusters, improving recall
+    // from ~88% to ~96% on clustered data (see ADR-004).
 
-    /// Adds a bidirectional edge between two nodes.
-    /// If either node exceeds M connections, prunes to keep the M nearest.
-    private func connect(_ a: Int, _ b: Int) {
-        // Add edge a → b (if not already connected)
-        if !adjacency[a].contains(b) {
-            adjacency[a].append(b)
-        }
-        // Add edge b → a
-        if !adjacency[b].contains(a) {
-            adjacency[b].append(a)
+    private func selectNeighborsHeuristic(
+        target: Vector,
+        candidates: [(node: Int, distance: Float)],
+        m: Int
+    ) -> [(node: Int, distance: Float)] {
+        guard !candidates.isEmpty else { return [] }
+
+        let sorted = candidates.sorted { $0.distance < $1.distance }
+        var selected: [(node: Int, distance: Float)] = []
+        selected.reserveCapacity(m)
+
+        for candidate in sorted {
+            guard selected.count < m else { break }
+
+            // Check: is this candidate closer to the target than
+            // to any already-selected neighbor?
+            let candidateVector = vectors[candidate.node]
+            var isGood = true
+
+            for (selectedNode, _) in selected {
+                let distToSelected = metric.distance(candidateVector, vectors[selectedNode])
+                if distToSelected < candidate.distance {
+                    isGood = false
+                    break
+                }
+            }
+
+            if isGood {
+                selected.append(candidate)
+            }
         }
 
-        // Prune if over capacity.
-        pruneIfNeeded(a)
-        pruneIfNeeded(b)
+        // If heuristic was too strict and we have fewer than M,
+        // fill with the closest remaining candidates.
+        if selected.count < m {
+            let selectedNodes = Set(selected.map(\.node))
+            for candidate in sorted where selected.count < m {
+                if !selectedNodes.contains(candidate.node) {
+                    selected.append(candidate)
+                }
+            }
+        }
+
+        return selected
     }
 
-    /// If a node has more than M connections, keep only the M nearest.
-    /// This is "simple selection" — PK-006 will add heuristic selection.
-    private func pruneIfNeeded(_ node: Int) {
-        guard adjacency[node].count > config.m else { return }
+    // ── Connection Pruning ────────────────────────────────────────────
+
+    /// Prunes a node's connections on a given layer using heuristic selection.
+    private func pruneConnections(node: Int, layer: Int, maxConnections: Int) {
+        guard layers[layer][node].count > maxConnections else { return }
 
         let nodeVector = vectors[node]
-        // Sort neighbors by distance to this node, keep the M closest.
-        let sorted = adjacency[node].sorted { a, b in
-            metric.distance(nodeVector, vectors[a]) < metric.distance(nodeVector, vectors[b])
+        let neighbors = layers[layer][node].map { neighbor in
+            (node: neighbor, distance: metric.distance(nodeVector, vectors[neighbor]))
         }
-        adjacency[node] = Array(sorted.prefix(config.m))
+
+        let selected = selectNeighborsHeuristic(
+            target: nodeVector,
+            candidates: neighbors,
+            m: maxConnections
+        )
+
+        layers[layer][node] = selected.map(\.node)
     }
 }
