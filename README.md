@@ -1,8 +1,21 @@
 <p align="center">
-  <h1 align="center">ProximaKit</h1>
+
+```
+                                ·
+                               /|\
+                          · ─── ◆ ─── ·
+                         /·\   /|\   /·\
+                    · ──◆──── ◆───◆ ────◆── ·
+                   / / /|\ \ /|\ /|\ / |\ \ \
+                  · · · · · · · · · · · · · · ·
+
+           ╔═══════════════════════════════════════════╗
+           ║           P R O X I M A K I T             ║
+           ║     Search by meaning, not keywords.      ║
+           ╚═══════════════════════════════════════════╝
+```
+
   <p align="center">
-    <strong>Search by meaning, not keywords.</strong>
-    <br />
     Pure-Swift vector search for Apple platforms — powered by Accelerate.
   </p>
   <p align="center">
@@ -14,7 +27,7 @@
   </p>
 </p>
 
----
+<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ProximaKit finds **similar content by understanding what it means** — not by matching keywords. Type "beach vacation" and it finds photos of oceans, notes about travel, articles about tropical destinations. None of them need to contain the words "beach" or "vacation."
 
@@ -22,7 +35,60 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 
 > *HNSW implemented from scratch in Swift. Zero dependencies. Zero C++ wrappers.*
 
----
+<table>
+<tr>
+<td align="center" width="33%">
+
+```
+  ┌─────────────┐
+  │      ◆      │
+  │    ╱   ╲    │
+  │   ◆─────◆   │
+  │  ON-DEVICE   │
+  └─────────────┘
+```
+
+**No Cloud Required**<br/>
+Runs entirely on Apple Silicon.<br/>
+No server, no API key, no internet.
+
+</td>
+<td align="center" width="33%">
+
+```
+  ┌─────────────┐
+  │    ┌───┐    │
+  │    │ 0 │    │
+  │    └───┘    │
+  │  ZERO DEPS  │
+  └─────────────┘
+```
+
+**Pure Swift**<br/>
+Foundation + Accelerate only.<br/>
+No C++ wrappers. No bridging.
+
+</td>
+<td align="center" width="33%">
+
+```
+  ┌─────────────┐
+  │   L2: ·──·  │
+  │   L1: ·─·─· │
+  │   L0: ····· │
+  │  HNSW BUILT │
+  └─────────────┘
+```
+
+**From Scratch**<br/>
+Full HNSW implementation.<br/>
+Not a wrapper. Not a port.
+
+</td>
+</tr>
+</table>
+
+<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## Why ProximaKit?
 
@@ -35,7 +101,7 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 | **iOS/macOS native** | Yes | No | No |
 | **Setup time** | 30 seconds | Hours | Minutes + billing |
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Get Started (5 minutes)
 
@@ -74,9 +140,9 @@ cd ProximaKit
 swift run ProximaDemo
 ```
 
-This opens a macOS app where you can type anything and see semantic search results ranked by similarity in real-time. Try "animals", "cooking", or "outer space."
+Or open `Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj` in Xcode for the full GUI experience.
 
----
+<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## How It Works
 
@@ -108,7 +174,7 @@ You type: "beach vacation"
 
 All of this happens **on your device**, using Apple's Accelerate framework for SIMD math. No internet required.
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Search Text by Meaning
 
@@ -147,7 +213,7 @@ let results = try await index.search(query: query, k: 3)
 
 **What happened:** "animals playing outside" found the dog and cat sentences — even though none contain those exact words. It searched by *meaning*.
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Search Images
 
@@ -161,7 +227,7 @@ let queryVector = try await vision.embed(anotherImage)
 let similar = try await imageIndex.search(query: queryVector, k: 5)
 ```
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Save and Load
 
@@ -175,63 +241,105 @@ try await index.save(to: fileURL)
 let loaded = try HNSWIndex.load(from: fileURL)
 ```
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Use a Custom AI Model (CoreML)
 
 For higher quality search, bring a real sentence-transformer model:
 
 ```swift
-let provider = try CoreMLEmbeddingProvider(modelAt: modelURL)
+let provider = try CoreMLEmbeddingProvider(
+    modelAt: modelURL,
+    vocabURL: vocabURL   // WordPiece vocab for proper tokenization
+)
 let vector = try await provider.embed("sunset over the ocean")
 ```
 
 See `scripts/convert_model.py` for converting HuggingFace models to CoreML.
 
----
+<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────┐
-│           Your App (SwiftUI)              │
-└───────────┬──────────────────────────────┘
-            v
-┌───────────────────────────────────────────┐
-│          ProximaEmbeddings                 │
-│  NLEmbeddingProvider · VisionProvider      │
-│  CoreMLProvider · EmbeddingProvider protocol│
-└───────────┬───────────────────────────────┘
-            v
-┌───────────────────────────────────────────┐
-│          ProximaKit (Core)                 │
-│  Vector · DistanceMetric · BatchDistance   │
-│  HNSWIndex · BruteForceIndex              │
-│  PersistenceEngine (binary + mmap)         │
-│  (Imports: Foundation + Accelerate ONLY)   │
-└───────────────────────────────────────────┘
+                ┌─────────────────────────────────────┐
+                │         Y O U R   A P P             │
+                │            (SwiftUI)                 │
+                └──────────────┬──────────────────────┘
+                               │
+                     embed()   │   search()
+                               │
+           ┌───────────────────┼───────────────────────┐
+           │                   │    ProximaEmbeddings   │
+           │                   v                        │
+           │   ┌──────────┐  ┌──────────┐  ┌────────┐ │
+           │   │ NLEmbed  │  │ Vision   │  │ CoreML │ │
+           │   │ Provider │  │ Provider │  │Provider│ │
+           │   └─────┬────┘  └────┬─────┘  └───┬────┘ │
+           │         └────────────┼─────────────┘      │
+           │                      │                     │
+           │        EmbeddingProvider protocol          │
+           └──────────────────────┼────────────────────┘
+                                  │
+                        [Float] vectors
+                                  │
+           ┌──────────────────────┼────────────────────┐
+           │                      v     ProximaKit     │
+           │                                            │
+           │   ┌────────────────────────────────────┐  │
+           │   │  I N D E X   L A Y E R             │  │
+           │   │                                     │  │
+           │   │   HNSWIndex          BruteForce    │  │
+           │   │   ◆──◆──◆             ◆ ◆ ◆ ◆     │  │
+           │   │   │╲ │ ╱│             ◆ ◆ ◆ ◆     │  │
+           │   │   ◆──◆──◆             ◆ ◆ ◆ ◆     │  │
+           │   │   O(log n)            O(n)         │  │
+           │   └──────────────┬─────────────────────┘  │
+           │                  │                         │
+           │   ┌──────────────┴─────────────────────┐  │
+           │   │  D I S T A N C E   M E T R I C S   │  │
+           │   │  cosine · euclidean · dot product   │  │
+           │   │       (vDSP / Accelerate)           │  │
+           │   └──────────────┬─────────────────────┘  │
+           │                  │                         │
+           │   ┌──────────────┴─────────────────────┐  │
+           │   │  P E R S I S T E N C E             │  │
+           │   │  binary save · mmap load · compact  │  │
+           │   └────────────────────────────────────┘  │
+           │                                            │
+           │   Foundation + Accelerate ONLY             │
+           └────────────────────────────────────────────┘
 ```
 
 | Module | What It Does |
 |--------|-------------|
 | `ProximaKit` | Core engine: vectors, distance metrics, HNSW graph search, persistence |
 | `ProximaEmbeddings` | Converts text/images to vectors using Apple frameworks |
-| `ProximaDemo` | SwiftUI demo app with live semantic search |
+| `ProximaDemo` | Interactive demo app with live semantic search |
 
----
+<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## Performance
 
-| What | How Fast |
-|------|----------|
-| Query (1K vectors, 384d) | ~104ms |
-| Recall@10 (1K vectors) | 98-99% |
-| Recall@10 (10K vectors) | 87%+ (random data; real embeddings >95%) |
-| Index build (1K vectors) | ~3s |
-| Save/load roundtrip | Exact match (binary format preserves graph) |
-| Cold start (10K vectors) | ~50ms (memory-mapped) |
+```
+ ╔══════════════════════════════════════════════════╗
+ ║              P E R F O R M A N C E               ║
+ ╠══════════════════════════════════════════════════╣
+ ║                                                  ║
+ ║  ⚡ Query          104 ms   ████████████░░░░░░  ║
+ ║  ⚡ Cold start      50 ms   █████░░░░░░░░░░░░░  ║
+ ║  ⚡ Build          ~3.0 s   ██████████████████░  ║
+ ║                                                  ║
+ ║  ◎ Recall@10 (1K)  98-99%  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ ║
+ ║  ◎ Recall@10 (10K)   87%+  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░ ║
+ ║                                                  ║
+ ║  ✓ Save/load roundtrip: exact binary match       ║
+ ║  ✓ Memory-mapped I/O for instant startup         ║
+ ║                                                  ║
+ ╚══════════════════════════════════════════════════╝
+```
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Which Index Should I Use?
 
@@ -242,7 +350,7 @@ See `scripts/convert_model.py` for converting HuggingFace models to CoreML.
 
 Both have the exact same API. Swap them without changing any other code.
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Which Distance Metric?
 
@@ -252,7 +360,7 @@ Both have the exact same API. Swap them without changing any other code.
 | `EuclideanDistance()` | Spatial data (coordinates, sensors). | "How far apart are these?" |
 | `DotProductDistance()` | Pre-normalized vectors (advanced). | "How aligned are these?" |
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Tuning
 
@@ -271,7 +379,7 @@ let config = HNSWConfiguration(
 | Too much memory | Decrease `m` (try 8) |
 | Build takes too long | Decrease `efConstruction` (try 100) |
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Thread Safety
 
@@ -283,7 +391,7 @@ let results = try await index.search(query: vector, k: 10)
 try await index.add(newVector, id: UUID())
 ```
 
----
+<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## API Reference
 
@@ -308,8 +416,9 @@ try await index.add(newVector, id: UUID())
 | `NLEmbeddingProvider` | Text to vector. Apple's built-in model. No setup. |
 | `VisionEmbeddingProvider` | Image to vector. Apple's Vision framework. |
 | `CoreMLEmbeddingProvider` | Any CoreML model (BERT, MiniLM, etc). |
+| `WordPieceTokenizer` | BERT-compatible tokenizer for CoreML models. |
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Design Decisions
 
@@ -319,7 +428,7 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-003](docs/adr/ADR-003-binary-persistence.md): Why custom binary (not JSON)
 - [ADR-004](docs/adr/ADR-004-hnsw-heuristic-selection.md): Why heuristic neighbor selection
 
----
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Run the Tests
 
@@ -327,17 +436,13 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 swift test --skip RecallBenchmarkTests
 ```
 
-> RecallBenchmarkTests are skipped by default because they take 2+ minutes (they test with 10K+ vectors). Run them explicitly with `swift test --filter RecallBenchmark`.
-
----
-
 ## Generate Documentation
 
 ```bash
 swift package generate-documentation --target ProximaKit
 ```
 
----
+<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## License
 
