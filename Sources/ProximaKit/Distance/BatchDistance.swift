@@ -69,10 +69,118 @@ public func batchDotProducts(
     return results
 }
 
+/// Computes batch L2 (Euclidean) distances from a query to all vectors in a flat matrix.
+///
+/// Uses vDSP to compute: `distance[i] = sqrt( |query|² + |vec_i|² - 2·dot(query, vec_i) )`
+///
+/// This avoids N separate subtraction+sum-of-squares passes by exploiting
+/// the identity: `|a - b|² = |a|² + |b|² - 2·dot(a, b)`.
+///
+/// - Parameters:
+///   - query: The query vector.
+///   - matrix: A flat row-major matrix of `vectorCount × dimension` floats.
+///   - vectorCount: Number of vectors in the matrix.
+///   - dimension: Dimension of each vector.
+/// - Returns: An array of `vectorCount` Euclidean distances.
+public func batchL2Distances(
+    query: Vector,
+    matrix: [Float],
+    vectorCount: Int,
+    dimension: Int
+) -> [Float] {
+    precondition(query.dimension == dimension, "Query dimension mismatch")
+    precondition(matrix.count == vectorCount * dimension, "Matrix size mismatch")
+
+    let count = vDSP_Length(vectorCount)
+    let dim = vDSP_Length(dimension)
+
+    // Step 1: |query|² (scalar, computed once)
+    var queryNormSq: Float = 0
+    query.components.withUnsafeBufferPointer { qPtr in
+        vDSP_svesq(qPtr.baseAddress!, 1, &queryNormSq, vDSP_Length(query.dimension))
+    }
+
+    // Step 2: |vec_i|² for each vector (batch via vDSP_svesq per row)
+    var vecNormsSq = [Float](repeating: 0, count: vectorCount)
+    matrix.withUnsafeBufferPointer { matPtr in
+        for i in 0..<vectorCount {
+            vDSP_svesq(
+                matPtr.baseAddress! + i * dimension, 1,
+                &vecNormsSq[i],
+                dim
+            )
+        }
+    }
+
+    // Step 3: dot(query, vec_i) for all vectors via vDSP_mmul
+    let dots = batchDotProducts(query: query, matrix: matrix,
+                                vectorCount: vectorCount, dimension: dimension)
+
+    // Step 4: |a - b|² = |a|² + |b|² - 2·dot(a,b), then sqrt
+    // All via vDSP: vecNormsSq + queryNormSq - 2*dots
+    var results = [Float](repeating: 0, count: vectorCount)
+
+    // results = vecNormsSq + queryNormSq
+    var qNorm = queryNormSq
+    vDSP_vsadd(vecNormsSq, 1, &qNorm, &results, 1, count)
+
+    // results = results - 2*dots
+    var minusTwo: Float = -2.0
+    var scaledDots = [Float](repeating: 0, count: vectorCount)
+    dots.withUnsafeBufferPointer { dotsPtr in
+        vDSP_vsmul(dotsPtr.baseAddress!, 1, &minusTwo, &scaledDots, 1, count)
+    }
+    vDSP_vadd(results, 1, scaledDots, 1, &results, 1, count)
+
+    // Clamp negative values (floating-point rounding) and sqrt
+    for i in 0..<vectorCount {
+        results[i] = sqrt(max(results[i], 0))
+    }
+
+    return results
+}
+
+/// Computes batch magnitudes for vectors in a flat row-major matrix.
+///
+/// Uses `vDSP_svesq` per row to compute sum-of-squares, then `vvsqrtf`
+/// to batch the square roots.
+///
+/// - Parameters:
+///   - matrix: A flat row-major matrix of `vectorCount × dimension` floats.
+///   - vectorCount: Number of vectors.
+///   - dimension: Dimension of each vector.
+/// - Returns: An array of `vectorCount` magnitudes.
+func batchMagnitudes(
+    matrix: [Float],
+    vectorCount: Int,
+    dimension: Int
+) -> [Float] {
+    var sumOfSquares = [Float](repeating: 0, count: vectorCount)
+    let dim = vDSP_Length(dimension)
+
+    matrix.withUnsafeBufferPointer { matPtr in
+        for i in 0..<vectorCount {
+            vDSP_svesq(
+                matPtr.baseAddress! + i * dimension, 1,
+                &sumOfSquares[i],
+                dim
+            )
+        }
+    }
+
+    // Batch sqrt via vvsqrtf (vectorized square root)
+    var magnitudes = [Float](repeating: 0, count: vectorCount)
+    var n = Int32(vectorCount)
+    vvsqrtf(&magnitudes, sumOfSquares, &n)
+
+    return magnitudes
+}
+
 /// Computes batch distances using a given metric.
 ///
 /// For dot-product-based metrics (cosine, dot product), this uses `vDSP_mmul`
 /// for the dot product step and then applies metric-specific post-processing.
+/// For Euclidean distance, uses the optimized `batchL2Distances` path.
 ///
 /// - Parameters:
 ///   - query: The query vector.
@@ -89,16 +197,29 @@ public func batchDistances(
     let dimension = query.dimension
     let count = vectors.count
 
-    // Fast path: use matrix multiply for cosine and dot product metrics.
-    // These are both based on dot products, so we can batch them.
-    if metric is CosineDistance || metric is DotProductDistance {
-        // Flatten vectors into a contiguous matrix (row-major)
+    // Build the flat row-major matrix (shared across fast paths)
+    func flattenMatrix() -> [Float] {
         var matrix = [Float]()
         matrix.reserveCapacity(count * dimension)
         for v in vectors {
             precondition(v.dimension == dimension, "Dimension mismatch in batch")
             matrix.append(contentsOf: v.components)
         }
+        return matrix
+    }
+
+    // Fast path: Euclidean distance using batch L2
+    if metric is EuclideanDistance {
+        let matrix = flattenMatrix()
+        return batchL2Distances(
+            query: query, matrix: matrix,
+            vectorCount: count, dimension: dimension
+        )
+    }
+
+    // Fast path: use matrix multiply for cosine and dot product metrics.
+    if metric is CosineDistance || metric is DotProductDistance {
+        let matrix = flattenMatrix()
 
         // Compute all dot products in one call
         let dots = batchDotProducts(
@@ -123,18 +244,23 @@ public func batchDistances(
 
         if metric is CosineDistance {
             // CosineDistance = 1 - dot(a,b) / (|a| * |b|)
+            // Batch-compute all magnitudes via vDSP instead of per-vector calls
             let queryMag = query.magnitude
             guard queryMag > 0 else {
                 return [Float](repeating: 0, count: count)
             }
-            return dots.enumerated().map { i, dot in
-                let vecMag = vectors[i].magnitude
-                guard vecMag > 0 else { return 0 }
-                return 1.0 - dot / (queryMag * vecMag)
+            let vecMags = batchMagnitudes(
+                matrix: matrix, vectorCount: count, dimension: dimension
+            )
+            var results = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                let denominator = queryMag * vecMags[i]
+                results[i] = denominator > 0 ? 1.0 - dots[i] / denominator : 0
             }
+            return results
         }
     }
 
-    // Fallback: compute distances one at a time (for EuclideanDistance or custom metrics)
+    // Fallback: compute distances one at a time (for custom metrics)
     return vectors.map { metric.distance(query, $0) }
 }
