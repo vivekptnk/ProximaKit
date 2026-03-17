@@ -34,8 +34,6 @@ venv/
 # Internal planning & docs (kept locally, not public)
 docs/PRD.md
 docs/MODEL_GUIDE.md
-docs/BENCHMARKS.md
 CLAUDE.md
-CONTRIBUTING.md
 Benchmarks/
 scripts/

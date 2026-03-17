@@ -255,7 +255,20 @@ let provider = try CoreMLEmbeddingProvider(
 let vector = try await provider.embed("sunset over the ocean")
 ```
 
-See `scripts/convert_model.py` for converting HuggingFace models to CoreML.
+To convert a HuggingFace model to CoreML, use [coremltools](https://github.com/apple/coremltools):
+
+```bash
+pip install coremltools transformers
+python -c "
+import coremltools as ct
+from transformers import AutoModel, AutoTokenizer
+
+model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+# Export to CoreML with coremltools.convert()
+"
+```
+
+Place the exported `.mlmodelc` in `Models/` and ProximaKit will discover it automatically.
 
 <p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
