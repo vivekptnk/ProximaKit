@@ -1,10 +1,12 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import ProximaKit
 
 struct MainView: View {
     @Bindable var engine: SearchEngine
     @State private var searchText = ""
     @State private var newNote = ""
+    @State private var showImagePicker = false
 
     var body: some View {
         NavigationSplitView {
@@ -49,6 +51,14 @@ struct MainView: View {
         }
         .onChange(of: searchText) {
             Task { await engine.search(searchText) }
+        }
+        .fileImporter(
+            isPresented: $showImagePicker,
+            allowedContentTypes: [.image],
+            allowsMultipleSelection: true
+        ) { result in
+            guard let urls = try? result.get() else { return }
+            Task { await engine.addImages(urls) }
         }
     }
 
@@ -117,7 +127,13 @@ struct MainView: View {
                 .padding(.vertical, 4)
 
                 Button("Rebuild Index") {
-                    Task { await engine.buildIndex() }
+                    Task { await engine.rebuildIndex() }
+                }
+
+                if engine.loadedFromDisk {
+                    Text("Loaded from disk (instant)")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
                 }
             }
 
@@ -146,6 +162,17 @@ struct MainView: View {
                 }
             }
 
+            Section("Images") {
+                Button("Add Images...") { showImagePicker = true }
+                if engine.imageCount > 0 {
+                    Text("\(engine.imageCount) images indexed")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("Add photos to search visually")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
+            }
+
             Section("Index Stats") {
                 LabeledContent("Vectors", value: "\(engine.indexedCount)")
                 LabeledContent("efSearch", value: "\(Int(engine.efSearch))")
@@ -153,6 +180,7 @@ struct MainView: View {
                     LabeledContent("Last query", value: String(format: "%.1f ms", engine.lastQueryTimeMs))
                 }
                 LabeledContent("Notes", value: "\(engine.userNotes.count)")
+                LabeledContent("Images", value: "\(engine.imageCount)")
                 if !engine.embeddingSource.isEmpty {
                     Text(engine.embeddingSource)
                         .font(.caption2)
