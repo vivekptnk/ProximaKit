@@ -5,7 +5,7 @@
 // Designed for sentence-transformer models (BERT, MiniLM, etc.)
 // converted to CoreML format via coremltools.
 
-import CoreML
+@preconcurrency import CoreML
 import Foundation
 import ProximaKit
 
@@ -268,6 +268,10 @@ private func float16ToFloat32(_ half: UInt16) -> Float {
 
 // ── CoreML Input Feature Provider ─────────────────────────────────────
 
+/// @unchecked Sendable is safe here: all stored properties are immutable `let`
+/// references set at init. MLMultiArray is not formally Sendable, but these
+/// arrays are never mutated after construction and are consumed within
+/// the actor's serialized `embed()` call.
 private final class CoreMLInput: MLFeatureProvider, @unchecked Sendable {
     let inputIDs: MLMultiArray
     let attentionMask: MLMultiArray
