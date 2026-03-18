@@ -19,7 +19,7 @@ import ProximaKit
 /// let vector = try await provider.embed("sunset over the ocean")
 /// try await index.add(vector, id: UUID())
 /// ```
-public protocol EmbeddingProvider: Sendable {
+public protocol EmbeddingProvider: TextEmbedder {
     /// The dimension of vectors this provider produces.
     /// All vectors from a given provider have the same dimension.
     var dimension: Int { get }

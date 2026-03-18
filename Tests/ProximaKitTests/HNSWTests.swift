@@ -341,4 +341,129 @@ final class HNSWTests: XCTestCase {
         XCTAssertGreaterThan(recall, 0.8,
                              "HNSW should find cluster B even when entry point is in cluster A")
     }
+
+    // ── Auto-Compaction ─────────────────────────────────────────────────
+
+    /// Auto-compaction triggers when liveCount/count drops below the threshold.
+    func testAutoCompaction_TriggersAtThreshold() async throws {
+        // threshold=0.7 means compact when live < 70% of total
+        let config = HNSWConfiguration(m: 8, efConstruction: 50, efSearch: 20, autoCompactionThreshold: 0.7)
+        let index = HNSWIndex(dimension: 4, metric: EuclideanDistance(), config: config)
+
+        // Add 10 vectors
+        var ids: [UUID] = []
+        for _ in 0..<10 {
+            let id = UUID()
+            ids.append(id)
+            try await index.add(Vector((0..<4).map { _ in Float.random(in: -1...1) }), id: id)
+        }
+
+        let initialCount = await index.count
+        XCTAssertEqual(initialCount, 10)
+        let initialLive = await index.liveCount
+        XCTAssertEqual(initialLive, 10)
+
+        // Remove 2 → live=8, ratio=0.8 → above 0.7, no compaction
+        _ = await index.remove(id: ids[0])
+        _ = await index.remove(id: ids[1])
+        let countAfter2 = await index.count
+        let liveAfter2 = await index.liveCount
+        XCTAssertEqual(liveAfter2, 8)
+        XCTAssertEqual(countAfter2, 10, "No compaction yet — ratio is 0.8 > 0.7")
+
+        // Remove 1 more → live=7, ratio=0.7 → still at boundary, no compaction
+        _ = await index.remove(id: ids[2])
+        let countAfter3 = await index.count
+        let liveAfter3 = await index.liveCount
+        XCTAssertEqual(liveAfter3, 7)
+        XCTAssertEqual(countAfter3, 10, "No compaction — ratio is exactly 0.7, not below")
+
+        // Remove 1 more → live=6, ratio=0.6 → below 0.7, auto-compact triggers
+        _ = await index.remove(id: ids[3])
+        let countAfter4 = await index.count
+        let liveAfter4 = await index.liveCount
+        XCTAssertEqual(liveAfter4, 6)
+        XCTAssertEqual(countAfter4, 6, "Auto-compaction should have fired — count == liveCount")
+    }
+
+    /// Auto-compaction is disabled when threshold is nil.
+    func testAutoCompaction_DisabledWhenNil() async throws {
+        let config = HNSWConfiguration(m: 8, efConstruction: 50, efSearch: 20, autoCompactionThreshold: nil)
+        let index = HNSWIndex(dimension: 4, metric: EuclideanDistance(), config: config)
+
+        var ids: [UUID] = []
+        for _ in 0..<10 {
+            let id = UUID()
+            ids.append(id)
+            try await index.add(Vector((0..<4).map { _ in Float.random(in: -1...1) }), id: id)
+        }
+
+        // Remove 5 → ratio=0.5, but auto-compaction is disabled
+        for i in 0..<5 {
+            _ = await index.remove(id: ids[i])
+        }
+
+        let count = await index.count
+        let live = await index.liveCount
+        XCTAssertEqual(live, 5)
+        XCTAssertEqual(count, 10, "No compaction — threshold is nil (disabled)")
+    }
+
+    /// Manual compact() still works regardless of auto-compaction setting.
+    func testManualCompact_StillWorks() async throws {
+        let config = HNSWConfiguration(m: 8, efConstruction: 50, efSearch: 20, autoCompactionThreshold: nil)
+        let index = HNSWIndex(dimension: 4, metric: EuclideanDistance(), config: config)
+
+        var ids: [UUID] = []
+        for _ in 0..<10 {
+            let id = UUID()
+            ids.append(id)
+            try await index.add(Vector((0..<4).map { _ in Float.random(in: -1...1) }), id: id)
+        }
+
+        for i in 0..<5 {
+            _ = await index.remove(id: ids[i])
+        }
+
+        let countBeforeCompact = await index.count
+        XCTAssertEqual(countBeforeCompact, 10)
+        try await index.compact()
+        let countAfterCompact = await index.count
+        XCTAssertEqual(countAfterCompact, 5)
+        let liveAfterCompact = await index.liveCount
+        XCTAssertEqual(liveAfterCompact, 5)
+    }
+
+    /// Search still works correctly after auto-compaction.
+    func testAutoCompaction_SearchCorrectAfter() async throws {
+        let config = HNSWConfiguration(m: 8, efConstruction: 50, efSearch: 20, autoCompactionThreshold: 0.7)
+        let index = HNSWIndex(dimension: 4, metric: EuclideanDistance(), config: config)
+
+        let target = Vector([1, 0, 0, 0])
+        let targetID = UUID()
+        try await index.add(target, id: targetID)
+
+        // Add 9 more vectors far from target
+        var ids: [UUID] = []
+        for _ in 0..<9 {
+            let id = UUID()
+            ids.append(id)
+            try await index.add(Vector((0..<4).map { _ in Float.random(in: 5...10) }), id: id)
+        }
+
+        // Remove 4 distant vectors → triggers auto-compaction (live=6/10 < 0.7)
+        for i in 0..<4 {
+            _ = await index.remove(id: ids[i])
+        }
+
+        // After compaction, target should still be found
+        let results = await index.search(query: Vector([1, 0, 0, 0]), k: 1)
+        XCTAssertEqual(results.first?.id, targetID, "Target vector should be found after auto-compaction")
+    }
+
+    /// Default HNSWConfiguration has auto-compaction enabled at 0.7.
+    func testDefaultConfig_HasAutoCompaction() {
+        let config = HNSWConfiguration()
+        XCTAssertEqual(config.autoCompactionThreshold, 0.7)
+    }
 }

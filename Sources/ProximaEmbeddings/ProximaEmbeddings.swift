@@ -15,3 +15,4 @@ public enum ProximaEmbeddings {
     /// The current module version.
     public static let version = ProximaKit.version
 }
+
