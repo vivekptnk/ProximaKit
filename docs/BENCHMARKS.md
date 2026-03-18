@@ -67,6 +67,79 @@ These benchmarks use random uniform vectors. With cosine distance in high dimens
 swift test --filter RecallBenchmarkTests
 ```
 
+### Real-Embedding Recall (NLEmbedding Sentences)
+
+Real embedding vectors have meaningful geometric structure unlike random vectors. Using Apple's `NLEmbedding.sentenceEmbedding(for: .english)` (512d), HNSW achieves perfect or near-perfect recall.
+
+**Corpus:** 120 diverse English sentences across 8 categories (technology, science, food, sports, nature, history, daily life, geography). 115 successfully embedded by NLEmbedding.
+
+**Query set:** 20 novel sentences not in the corpus, testing cross-sentence semantic retrieval.
+
+| Metric | efSearch | Recall@10 | Threshold |
+|--------|----------|-----------|-----------|
+| Cosine | 50 | 100% | Pass: >95% (PRD) |
+| Euclidean | 50 | 100% | Pass: >95% |
+
+#### efSearch Sweep (115 sentences, 512d, Cosine)
+
+| efSearch | Recall@10 |
+|----------|-----------|
+| 10 | 100% |
+| 30 | 100% |
+| 50 | 100% |
+| 100 | 100% |
+| 200 | 100% |
+
+With real embeddings, even low efSearch values achieve perfect recall on this corpus size. This confirms the PRD target of >95% recall@10 is met with margin.
+
+#### Semantic Coherence
+
+Query: "Programming languages compile source code"
+
+| Rank | Distance | Result |
+|------|----------|--------|
+| 1 | 0.2673 | The compiler transforms source code into machine instructions |
+| 2 | 0.3703 | Version control systems track changes in source code |
+| 3 | 0.4129 | The database engine optimizes query execution plans |
+
+Top results are semantically relevant technology sentences, validating that HNSW preserves the embedding space's semantic structure.
+
+**Run the real-embedding benchmarks:**
+
+```bash
+swift test --filter RealEmbeddingRecallTests
+```
+
+---
+
+## Concurrency Stress Tests
+
+**What it measures:** Actor isolation correctness under concurrent read/write contention. Validates that `HNSWIndex` and `BruteForceIndex` (both Swift actors) handle mixed workloads without deadlocks, priority inversions, or data races.
+
+### Test Matrix
+
+| Test | Operations | Concurrent Tasks | Index |
+|------|-----------|-----------------|-------|
+| Concurrent adds | 200 adds | 200 | HNSW, BruteForce |
+| Add + remove | 100 adds + 30 removes | 130 | HNSW |
+| Add + search | 50 adds + 50 searches | 100 | HNSW |
+| Mixed workload | 400 adds + 50 removes + 600 searches | 1050 | HNSW, BruteForce |
+| Compact during search | 1 compact + 20 searches | 21 | HNSW |
+| Search throughput | 500 queries (50 readers × 10 queries) | 50 | HNSW |
+
+### Results
+
+- All 8 tests pass consistently
+- No data races detected (actor isolation enforced at compile time)
+- Concurrent search throughput: ~1900 QPS on 500-vector index (64d, debug build)
+- Mixed workload (1050 ops): completes in <1s
+
+**Run the concurrency tests:**
+
+```bash
+swift test --filter ConcurrencyStressTests
+```
+
 ---
 
 ## Query Latency
@@ -182,8 +255,14 @@ When vectors are removed from `HNSWIndex`, they are tombstoned (marked deleted b
 ## How to Run All Benchmarks
 
 ```bash
-# Recall benchmarks (2-5 minutes)
+# Recall benchmarks — random vectors (2-5 minutes)
 swift test --filter RecallBenchmarkTests
+
+# Recall benchmarks — real NLEmbedding sentences (~5 seconds)
+swift test --filter RealEmbeddingRecallTests
+
+# Concurrency stress tests (~5 seconds)
+swift test --filter ConcurrencyStressTests
 
 # SIMD benchmarks (~30 seconds)
 swift test --filter SIMDBenchmarkTests
