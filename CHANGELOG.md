@@ -58,7 +58,7 @@ Initial public release of ProximaKit — pure-Swift vector search for Apple plat
 
 ### Quality
 
-- 117 tests passing across unit, integration, recall, and SIMD benchmarks
+- 149 tests passing across unit, integration, recall, and SIMD benchmarks
 - Recall@10: 98–99% at 1K vectors, 87%+ at 10K vectors (Euclidean, random data)
 - Query latency: ~104ms at 1K/384d, 50ms cold start with mmap
 - GitHub Actions CI workflow
