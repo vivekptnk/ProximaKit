@@ -190,7 +190,7 @@ final class DistanceTests: XCTestCase {
 
     func testBatchDistancesMatchesIndividual() {
         // Batch should produce identical results to computing one at a time
-        let metrics: [any DistanceMetric] = [CosineDistance(), EuclideanDistance(), DotProductDistance()]
+        let metrics: [any DistanceMetric] = [CosineDistance(), EuclideanDistance(), DotProductDistance(), ManhattanDistance(), HammingDistance()]
         let query = Vector([0.5, -0.3, 0.8])
         let vectors = [
             Vector([1.0, 0.0, 0.0]),
@@ -213,5 +213,158 @@ final class DistanceTests: XCTestCase {
         let query = Vector([1.0, 2.0])
         let distances = batchDistances(query: query, vectors: [], metric: metric)
         XCTAssertTrue(distances.isEmpty)
+    }
+
+    // ── ManhattanDistance ───────────────────────────────────────────────
+
+    func testManhattanDistanceIdenticalVectors() {
+        let metric = ManhattanDistance()
+        let v = Vector([1.0, 2.0, 3.0])
+        XCTAssertEqual(metric.distance(v, v), 0.0, accuracy: 1e-6)
+    }
+
+    func testManhattanDistanceKnown() {
+        let metric = ManhattanDistance()
+        let a = Vector([0.0, 0.0])
+        let b = Vector([3.0, 4.0])
+        // |3-0| + |4-0| = 7
+        XCTAssertEqual(metric.distance(a, b), 7.0, accuracy: 1e-5)
+    }
+
+    func testManhattanDistanceSymmetric() {
+        let metric = ManhattanDistance()
+        let a = Vector([1.0, 2.0, 3.0])
+        let b = Vector([4.0, 5.0, 6.0])
+        XCTAssertEqual(metric.distance(a, b), metric.distance(b, a), accuracy: 1e-6)
+    }
+
+    func testManhattanDistanceNegativeComponents() {
+        let metric = ManhattanDistance()
+        let a = Vector([-1.0, -2.0, 3.0])
+        let b = Vector([1.0, 2.0, -3.0])
+        // |(-1)-1| + |(-2)-2| + |3-(-3)| = 2 + 4 + 6 = 12
+        XCTAssertEqual(metric.distance(a, b), 12.0, accuracy: 1e-5)
+    }
+
+    func testManhattanDistanceUnitVectors() {
+        let metric = ManhattanDistance()
+        let a = Vector([1.0, 0.0, 0.0])
+        let b = Vector([0.0, 1.0, 0.0])
+        // |1-0| + |0-1| + |0-0| = 2
+        XCTAssertEqual(metric.distance(a, b), 2.0, accuracy: 1e-6)
+    }
+
+    // ── HammingDistance ─────────────────────────────────────────────────
+
+    func testHammingDistanceIdenticalVectors() {
+        let metric = HammingDistance()
+        let v = Vector([1.0, 0.0, 1.0, 0.0])
+        XCTAssertEqual(metric.distance(v, v), 0.0, accuracy: 1e-6)
+    }
+
+    func testHammingDistanceAllDifferent() {
+        let metric = HammingDistance()
+        let a = Vector([0.0, 0.0, 0.0])
+        let b = Vector([1.0, 1.0, 1.0])
+        XCTAssertEqual(metric.distance(a, b), 3.0, accuracy: 1e-6)
+    }
+
+    func testHammingDistanceBinaryVectors() {
+        let metric = HammingDistance()
+        let a = Vector([1.0, 0.0, 1.0, 1.0, 0.0])
+        let b = Vector([1.0, 1.0, 0.0, 1.0, 0.0])
+        // Positions 1 and 2 differ → distance = 2
+        XCTAssertEqual(metric.distance(a, b), 2.0, accuracy: 1e-6)
+    }
+
+    func testHammingDistanceSymmetric() {
+        let metric = HammingDistance()
+        let a = Vector([1.0, 0.0, 1.0])
+        let b = Vector([0.0, 0.0, 1.0])
+        XCTAssertEqual(metric.distance(a, b), metric.distance(b, a), accuracy: 1e-6)
+    }
+
+    func testHammingDistanceRange() {
+        let metric = HammingDistance()
+        let a = Vector([0.0, 0.0, 0.0, 0.0])
+        let b = Vector([1.0, 1.0, 1.0, 1.0])
+        let d = metric.distance(a, b)
+        // Hamming distance is in [0, dimension]
+        XCTAssertGreaterThanOrEqual(d, 0)
+        XCTAssertLessThanOrEqual(d, Float(a.dimension))
+    }
+
+    // ── Batch Manhattan ─────────────────────────────────────────────────
+
+    func testBatchDistancesManhattan() {
+        let metric = ManhattanDistance()
+        let query = Vector([0.0, 0.0])
+        let vectors = [
+            Vector([3.0, 4.0]),   // distance = 7
+            Vector([0.0, 0.0]),   // distance = 0
+            Vector([1.0, -2.0]),  // distance = 3
+        ]
+
+        let distances = batchDistances(query: query, vectors: vectors, metric: metric)
+
+        XCTAssertEqual(distances[0], 7.0, accuracy: 1e-5)
+        XCTAssertEqual(distances[1], 0.0, accuracy: 1e-5)
+        XCTAssertEqual(distances[2], 3.0, accuracy: 1e-5)
+    }
+
+    func testBatchDistancesHamming() {
+        let metric = HammingDistance()
+        let query = Vector([1.0, 0.0, 1.0])
+        let vectors = [
+            Vector([1.0, 0.0, 1.0]),   // identical: distance 0
+            Vector([0.0, 1.0, 0.0]),   // all differ: distance 3
+            Vector([1.0, 1.0, 1.0]),   // 1 differs: distance 1
+        ]
+
+        let distances = batchDistances(query: query, vectors: vectors, metric: metric)
+
+        XCTAssertEqual(distances[0], 0.0, accuracy: 1e-5)
+        XCTAssertEqual(distances[1], 3.0, accuracy: 1e-5)
+        XCTAssertEqual(distances[2], 1.0, accuracy: 1e-5)
+    }
+
+    func testBatchManhattanMatchesIndividual() {
+        let metric = ManhattanDistance()
+        let query = Vector([0.5, -0.3, 0.8])
+        let vectors = [
+            Vector([1.0, 0.0, 0.0]),
+            Vector([0.0, 1.0, 0.0]),
+            Vector([-0.5, 0.3, -0.8]),
+        ]
+
+        let batch = batchDistances(query: query, vectors: vectors, metric: metric)
+        for (i, v) in vectors.enumerated() {
+            let individual = metric.distance(query, v)
+            XCTAssertEqual(batch[i], individual, accuracy: 1e-4,
+                           "Mismatch for Manhattan at index \(i)")
+        }
+    }
+
+    // ── DistanceMetricType Roundtrip ────────────────────────────────────
+
+    func testMetricTypeRoundtripManhattan() {
+        let metric = ManhattanDistance()
+        let type = DistanceMetricType(metric: metric)
+        XCTAssertEqual(type, .manhattan)
+        let restored = type?.makeMetric()
+        XCTAssertTrue(restored is ManhattanDistance)
+    }
+
+    func testMetricTypeRoundtripHamming() {
+        let metric = HammingDistance()
+        let type = DistanceMetricType(metric: metric)
+        XCTAssertEqual(type, .hamming)
+        let restored = type?.makeMetric()
+        XCTAssertTrue(restored is HammingDistance)
+    }
+
+    func testMetricTypeRawValues() {
+        XCTAssertEqual(DistanceMetricType.manhattan.rawValue, 3)
+        XCTAssertEqual(DistanceMetricType.hamming.rawValue, 4)
     }
 }

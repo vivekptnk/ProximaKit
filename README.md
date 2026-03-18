@@ -372,6 +372,8 @@ Both have the exact same API. Swap them without changing any other code.
 | `CosineDistance()` | **Text search.** Use this unless you have a reason not to. | "How different is the direction?" |
 | `EuclideanDistance()` | Spatial data (coordinates, sensors). | "How far apart are these?" |
 | `DotProductDistance()` | Pre-normalized vectors (advanced). | "How aligned are these?" |
+| `ManhattanDistance()` | Sparse data, grid-based problems. | "How many blocks apart?" |
+| `HammingDistance()` | Binary/quantized vectors. | "How many bits differ?" |
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
@@ -418,6 +420,8 @@ try await index.add(newVector, id: UUID())
 | `CosineDistance` | Direction-based similarity (best for text). |
 | `EuclideanDistance` | Straight-line distance. |
 | `DotProductDistance` | Alignment-based (for normalized vectors). |
+| `ManhattanDistance` | L1 / taxicab distance (sparse data). |
+| `HammingDistance` | Count of differing positions (binary vectors). |
 | `SearchResult` | Result: `id`, `distance`, `metadata`. |
 | `HNSWConfiguration` | Tuning: `m`, `efConstruction`, `efSearch`. |
 | `PersistenceEngine` | Binary save/load with memory mapping. |

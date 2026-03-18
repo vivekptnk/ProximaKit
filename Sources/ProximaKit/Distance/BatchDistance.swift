@@ -176,6 +176,47 @@ func batchMagnitudes(
     return magnitudes
 }
 
+/// Computes batch L1 (Manhattan) distances from a query to all vectors in a flat matrix.
+///
+/// Uses vDSP to compute: `distance[i] = sum(|query - vec_i|)` per row.
+///
+/// - Parameters:
+///   - query: The query vector.
+///   - matrix: A flat row-major matrix of `vectorCount × dimension` floats.
+///   - vectorCount: Number of vectors in the matrix.
+///   - dimension: Dimension of each vector.
+/// - Returns: An array of `vectorCount` Manhattan distances.
+public func batchL1Distances(
+    query: Vector,
+    matrix: [Float],
+    vectorCount: Int,
+    dimension: Int
+) -> [Float] {
+    precondition(query.dimension == dimension, "Query dimension mismatch")
+    precondition(matrix.count == vectorCount * dimension, "Matrix size mismatch")
+
+    let dim = vDSP_Length(dimension)
+    var results = [Float](repeating: 0, count: vectorCount)
+    var difference = [Float](repeating: 0, count: dimension)
+    var absDiff = [Float](repeating: 0, count: dimension)
+
+    query.components.withUnsafeBufferPointer { qPtr in
+        matrix.withUnsafeBufferPointer { matPtr in
+            for i in 0..<vectorCount {
+                let rowPtr = matPtr.baseAddress! + i * dimension
+                // difference = row - query
+                vDSP_vsub(qPtr.baseAddress!, 1, rowPtr, 1, &difference, 1, dim)
+                // absDiff = |difference|
+                vDSP_vabs(difference, 1, &absDiff, 1, dim)
+                // sum the absolute differences
+                vDSP_sve(absDiff, 1, &results[i], dim)
+            }
+        }
+    }
+
+    return results
+}
+
 /// Computes batch distances from a query to all vectors in a pre-built flat matrix.
 ///
 /// This is the fast path for callers that already store vectors in a flat row-major
@@ -244,6 +285,14 @@ public func batchDistances(
             }
             return results
         }
+    }
+
+    // Fast path: Manhattan distance using vDSP per row
+    if metric is ManhattanDistance {
+        return batchL1Distances(
+            query: query, matrix: matrix,
+            vectorCount: vectorCount, dimension: dimension
+        )
     }
 
     // Fallback: reconstruct Vectors for custom metrics

@@ -17,6 +17,8 @@ public enum DistanceMetricType: UInt32, Sendable, CaseIterable {
     case cosine = 0
     case euclidean = 1
     case dotProduct = 2
+    case manhattan = 3
+    case hamming = 4
 
     /// Creates the corresponding `DistanceMetric` instance.
     public func makeMetric() -> any DistanceMetric {
@@ -24,6 +26,8 @@ public enum DistanceMetricType: UInt32, Sendable, CaseIterable {
         case .cosine: return CosineDistance()
         case .euclidean: return EuclideanDistance()
         case .dotProduct: return DotProductDistance()
+        case .manhattan: return ManhattanDistance()
+        case .hamming: return HammingDistance()
         }
     }
 
@@ -34,6 +38,8 @@ public enum DistanceMetricType: UInt32, Sendable, CaseIterable {
         case is CosineDistance: self = .cosine
         case is EuclideanDistance: self = .euclidean
         case is DotProductDistance: self = .dotProduct
+        case is ManhattanDistance: self = .manhattan
+        case is HammingDistance: self = .hamming
         default: return nil
         }
     }
