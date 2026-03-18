@@ -20,6 +20,13 @@ import ProximaKit
 /// let vector = try await provider.embed("sunset over the ocean")
 /// ```
 ///
+/// **Thread Safety:**
+/// `CoreMLEmbeddingProvider` is an actor, so all calls to ``embed(_:)`` and
+/// ``embedBatch(_:)`` are serialized automatically. This guarantees safe
+/// concurrent access — multiple tasks can call `embed` simultaneously without
+/// risk of data races on the underlying `MLModel`. The ``dimension`` property
+/// is `nonisolated` and safe to read from any context.
+///
 /// **Model requirements:**
 /// - Input: must accept "input_ids" and "attention_mask" as `MLMultiArray<Int32>`
 /// - Output: must produce an `MLMultiArray` of floats (the embedding vector)
@@ -29,10 +36,12 @@ import ProximaKit
 /// pip install coremltools transformers torch
 /// python3 scripts/convert_model.py
 /// ```
-public final class CoreMLEmbeddingProvider: @unchecked Sendable {
+public actor CoreMLEmbeddingProvider {
 
     /// The dimension of vectors this provider produces.
-    public let dimension: Int
+    ///
+    /// This property is `nonisolated` because it is immutable after initialization.
+    public nonisolated let dimension: Int
 
     /// The loaded CoreML model.
     private let model: MLModel
@@ -259,7 +268,7 @@ private func float16ToFloat32(_ half: UInt16) -> Float {
 
 // ── CoreML Input Feature Provider ─────────────────────────────────────
 
-private class CoreMLInput: MLFeatureProvider {
+private final class CoreMLInput: MLFeatureProvider, @unchecked Sendable {
     let inputIDs: MLMultiArray
     let attentionMask: MLMultiArray
 

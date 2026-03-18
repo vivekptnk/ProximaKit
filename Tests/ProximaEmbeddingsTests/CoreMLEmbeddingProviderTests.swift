@@ -109,4 +109,44 @@ final class CoreMLEmbeddingProviderTests: XCTestCase {
             XCTFail("Unexpected error: \(error)")
         }
     }
+
+    // ── Concurrent Embedding Stress Test ─────────────────────────────
+
+    /// 20 concurrent tasks embedding simultaneously.
+    /// Validates that actor serialization prevents data races on MLModel.
+    func testConcurrentEmbedding() async throws {
+        let provider = try makeProvider()
+        let texts = [
+            "quantum computing basics",
+            "the cat sat on the mat",
+            "recipe for chocolate cake",
+            "machine learning algorithms",
+            "swift programming language",
+            "the quick brown fox",
+            "artificial intelligence",
+            "climate change effects",
+            "space exploration history",
+            "ocean current patterns",
+        ]
+        let concurrentTasks = 20
+
+        try await withThrowingTaskGroup(of: Vector.self) { group in
+            for i in 0..<concurrentTasks {
+                let text = texts[i % texts.count]
+                group.addTask {
+                    try await provider.embed(text)
+                }
+            }
+
+            var results: [Vector] = []
+            for try await vector in group {
+                XCTAssertEqual(vector.dimension, provider.dimension)
+                XCTAssertGreaterThan(vector.magnitude, 0)
+                results.append(vector)
+            }
+
+            XCTAssertEqual(results.count, concurrentTasks,
+                "All concurrent embeddings should complete without deadlock")
+        }
+    }
 }

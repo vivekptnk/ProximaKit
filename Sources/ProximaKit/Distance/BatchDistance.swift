@@ -176,6 +176,87 @@ func batchMagnitudes(
     return magnitudes
 }
 
+/// Computes batch distances from a query to all vectors in a pre-built flat matrix.
+///
+/// This is the fast path for callers that already store vectors in a flat row-major
+/// layout (e.g. ``BruteForceIndex``), avoiding the cost of constructing intermediate
+/// `Vector` objects just to flatten them again.
+///
+/// - Parameters:
+///   - query: The query vector.
+///   - matrix: A flat row-major array of `vectorCount × dimension` floats.
+///   - vectorCount: Number of vectors in the matrix.
+///   - dimension: Dimension of each vector.
+///   - metric: The distance metric to use.
+/// - Returns: An array of `vectorCount` distances.
+public func batchDistances(
+    query: Vector,
+    matrix: [Float],
+    vectorCount: Int,
+    dimension: Int,
+    metric: some DistanceMetric
+) -> [Float] {
+    guard vectorCount > 0 else { return [] }
+    precondition(query.dimension == dimension, "Query dimension mismatch")
+    precondition(matrix.count == vectorCount * dimension, "Matrix size mismatch")
+
+    // Fast path: Euclidean distance using batch L2
+    if metric is EuclideanDistance {
+        return batchL2Distances(
+            query: query, matrix: matrix,
+            vectorCount: vectorCount, dimension: dimension
+        )
+    }
+
+    // Fast path: use matrix multiply for cosine and dot product metrics.
+    if metric is CosineDistance || metric is DotProductDistance {
+        let dots = batchDotProducts(
+            query: query, matrix: matrix,
+            vectorCount: vectorCount, dimension: dimension
+        )
+
+        if metric is DotProductDistance {
+            var negated = [Float](repeating: 0, count: vectorCount)
+            var minusOne: Float = -1.0
+            dots.withUnsafeBufferPointer { dotsPtr in
+                vDSP_vsmul(
+                    dotsPtr.baseAddress!, 1,
+                    &minusOne,
+                    &negated, 1,
+                    vDSP_Length(vectorCount)
+                )
+            }
+            return negated
+        }
+
+        if metric is CosineDistance {
+            let queryMag = query.magnitude
+            guard queryMag > 0 else {
+                return [Float](repeating: 0, count: vectorCount)
+            }
+            let vecMags = batchMagnitudes(
+                matrix: matrix, vectorCount: vectorCount, dimension: dimension
+            )
+            var results = [Float](repeating: 0, count: vectorCount)
+            for i in 0..<vectorCount {
+                let denominator = queryMag * vecMags[i]
+                results[i] = denominator > 0 ? 1.0 - dots[i] / denominator : 0
+            }
+            return results
+        }
+    }
+
+    // Fallback: reconstruct Vectors for custom metrics
+    var distances = [Float]()
+    distances.reserveCapacity(vectorCount)
+    for i in 0..<vectorCount {
+        let start = i * dimension
+        let vec = Vector(Array(matrix[start..<start + dimension]))
+        distances.append(metric.distance(query, vec))
+    }
+    return distances
+}
+
 /// Computes batch distances using a given metric.
 ///
 /// For dot-product-based metrics (cosine, dot product), this uses `vDSP_mmul`
@@ -197,70 +278,16 @@ public func batchDistances(
     let dimension = query.dimension
     let count = vectors.count
 
-    // Build the flat row-major matrix (shared across fast paths)
-    func flattenMatrix() -> [Float] {
-        var matrix = [Float]()
-        matrix.reserveCapacity(count * dimension)
-        for v in vectors {
-            precondition(v.dimension == dimension, "Dimension mismatch in batch")
-            matrix.append(contentsOf: v.components)
-        }
-        return matrix
+    // Build the flat row-major matrix and delegate to the flat-array overload.
+    var matrix = [Float]()
+    matrix.reserveCapacity(count * dimension)
+    for v in vectors {
+        precondition(v.dimension == dimension, "Dimension mismatch in batch")
+        matrix.append(contentsOf: v.components)
     }
 
-    // Fast path: Euclidean distance using batch L2
-    if metric is EuclideanDistance {
-        let matrix = flattenMatrix()
-        return batchL2Distances(
-            query: query, matrix: matrix,
-            vectorCount: count, dimension: dimension
-        )
-    }
-
-    // Fast path: use matrix multiply for cosine and dot product metrics.
-    if metric is CosineDistance || metric is DotProductDistance {
-        let matrix = flattenMatrix()
-
-        // Compute all dot products in one call
-        let dots = batchDotProducts(
-            query: query, matrix: matrix,
-            vectorCount: count, dimension: dimension
-        )
-
-        if metric is DotProductDistance {
-            // DotProductDistance = -dot(a, b)
-            var negated = [Float](repeating: 0, count: count)
-            var minusOne: Float = -1.0
-            dots.withUnsafeBufferPointer { dotsPtr in
-                vDSP_vsmul(
-                    dotsPtr.baseAddress!, 1,
-                    &minusOne,
-                    &negated, 1,
-                    vDSP_Length(count)
-                )
-            }
-            return negated
-        }
-
-        if metric is CosineDistance {
-            // CosineDistance = 1 - dot(a,b) / (|a| * |b|)
-            // Batch-compute all magnitudes via vDSP instead of per-vector calls
-            let queryMag = query.magnitude
-            guard queryMag > 0 else {
-                return [Float](repeating: 0, count: count)
-            }
-            let vecMags = batchMagnitudes(
-                matrix: matrix, vectorCount: count, dimension: dimension
-            )
-            var results = [Float](repeating: 0, count: count)
-            for i in 0..<count {
-                let denominator = queryMag * vecMags[i]
-                results[i] = denominator > 0 ? 1.0 - dots[i] / denominator : 0
-            }
-            return results
-        }
-    }
-
-    // Fallback: compute distances one at a time (for custom metrics)
-    return vectors.map { metric.distance(query, $0) }
+    return batchDistances(
+        query: query, matrix: matrix,
+        vectorCount: count, dimension: dimension, metric: metric
+    )
 }

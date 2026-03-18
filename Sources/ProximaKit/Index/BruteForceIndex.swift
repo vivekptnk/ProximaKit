@@ -137,16 +137,11 @@ public actor BruteForceIndex: VectorIndex {
         guard !ids.isEmpty else { return [] }
         guard k > 0 else { return [] }
 
-        // Reconstruct Vector objects for batch distance computation.
-        // This is needed because batchDistances takes [Vector].
-        // Future optimization: work directly with the flat matrix.
-        let vectors = (0..<ids.count).map { i in
-            let start = i * dimension
-            let end = start + dimension
-            return Vector(Array(vectorData[start..<end]))
-        }
-
-        let distances = batchDistances(query: query, vectors: vectors, metric: metric)
+        // Use the flat-array overload directly — no intermediate Vector allocations.
+        let distances = batchDistances(
+            query: query, matrix: vectorData,
+            vectorCount: ids.count, dimension: dimension, metric: metric
+        )
 
         // Build results, applying filter if provided.
         var results: [SearchResult] = []

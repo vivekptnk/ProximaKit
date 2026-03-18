@@ -261,6 +261,118 @@ final class SIMDBenchmarkTests: XCTestCase {
         XCTAssertGreaterThan(speedup, 1.0, "Batch vDSP L2 should outperform naive loops")
     }
 
+    // ── Flat-Array Overload Tests ───────────────────────────────────
+
+    func testFlatArrayBatchDistancesMatchesVectorOverload() {
+        // Correctness: flat-array overload must produce identical results
+        let dim = 384
+        let count = 200
+        let queryArr = (0..<dim).map { _ in Float.random(in: -1...1) }
+        let query = Vector(queryArr)
+        let vectors = (0..<count).map { _ in
+            Vector((0..<dim).map { _ in Float.random(in: -1...1) })
+        }
+
+        // Build flat matrix
+        var matrix = [Float]()
+        matrix.reserveCapacity(count * dim)
+        for v in vectors { matrix.append(contentsOf: v.components) }
+
+        let metrics: [any DistanceMetric] = [
+            CosineDistance(), EuclideanDistance(), DotProductDistance()
+        ]
+
+        for metric in metrics {
+            let fromVectors = batchDistances(query: query, vectors: vectors, metric: metric)
+            let fromFlat = batchDistances(
+                query: query, matrix: matrix,
+                vectorCount: count, dimension: dim, metric: metric
+            )
+
+            XCTAssertEqual(fromVectors.count, fromFlat.count)
+            for i in 0..<count {
+                XCTAssertEqual(fromFlat[i], fromVectors[i], accuracy: 1e-5,
+                               "Flat-array mismatch for \(type(of: metric)) at index \(i)")
+            }
+        }
+    }
+
+    func testBenchmarkFlatVsVectorBatchDistances_1K_384d() {
+        // Benchmark: flat-array overload vs Vector-array overload
+        let dim = 384
+        let count = 1_000
+        let queryArr = (0..<dim).map { _ in Float.random(in: -1...1) }
+        let query = Vector(queryArr)
+        let vectors = (0..<count).map { _ in
+            Vector((0..<dim).map { _ in Float.random(in: -1...1) })
+        }
+
+        // Pre-build the flat matrix (simulates BruteForceIndex storage)
+        var matrix = [Float]()
+        matrix.reserveCapacity(count * dim)
+        for v in vectors { matrix.append(contentsOf: v.components) }
+
+        let metric = CosineDistance()
+        let iterations = 50
+
+        // Old path: caller passes [Vector] → batchDistances flattens internally
+        let vectorStart = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<iterations {
+            _ = batchDistances(query: query, vectors: vectors, metric: metric)
+        }
+        let vectorTime = CFAbsoluteTimeGetCurrent() - vectorStart
+
+        // New path: caller passes flat matrix directly
+        let flatStart = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<iterations {
+            _ = batchDistances(
+                query: query, matrix: matrix,
+                vectorCount: count, dimension: dim, metric: metric
+            )
+        }
+        let flatTime = CFAbsoluteTimeGetCurrent() - flatStart
+
+        let speedup = vectorTime / flatTime
+        print("\n[Benchmark] Flat-array vs Vector-array batchDistances (1K×384d, \(iterations) iters)")
+        print("  Vector-array: \(String(format: "%.3f", vectorTime * 1000))ms")
+        print("  Flat-array:   \(String(format: "%.3f", flatTime * 1000))ms")
+        print("  Speedup:      \(String(format: "%.2f", speedup))x")
+
+        // Flat path avoids flattening overhead; should be faster
+        XCTAssertGreaterThan(speedup, 1.0,
+            "Flat-array overload should outperform Vector-array overload")
+    }
+
+    func testBenchmarkBruteForceSearchOptimization_1K_384d() async throws {
+        // End-to-end: BruteForceIndex search with the optimization in place
+        let dim = 384
+        let count = 1_000
+        let index = BruteForceIndex(dimension: dim, metric: CosineDistance())
+
+        for _ in 0..<count {
+            let vec = Vector((0..<dim).map { _ in Float.random(in: -1...1) })
+            try await index.add(vec, id: UUID())
+        }
+
+        let query = Vector((0..<dim).map { _ in Float.random(in: -1...1) })
+        let iterations = 100
+
+        let start = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<iterations {
+            _ = await index.search(query: query, k: 10)
+        }
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+
+        let qps = Double(iterations) / elapsed
+        let avgMs = (elapsed / Double(iterations)) * 1000
+        print("\n[Benchmark] BruteForceIndex.search (1K×384d, k=10)")
+        print("  Avg latency: \(String(format: "%.2f", avgMs))ms")
+        print("  QPS:         \(String(format: "%.0f", qps))")
+
+        // Sanity: search should complete in reasonable time
+        XCTAssertLessThan(avgMs, 50.0, "BruteForce search on 1K vectors should be under 50ms")
+    }
+
     func testBenchmarkBatchL2_10K_384d() {
         let dim = 384
         let count = 10_000
