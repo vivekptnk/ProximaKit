@@ -366,7 +366,7 @@ final class ProductQuantizerTests: XCTestCase {
         let url = tmpDir.appendingPathComponent("test_bad_magic_\(UUID().uuidString).pqtt")
         defer { try? FileManager.default.removeItem(at: url) }
 
-        var data = Data(repeating: 0xFF, count: 24)
+        let data = Data(repeating: 0xFF, count: 24)
         try data.write(to: url)
 
         XCTAssertThrowsError(try ProductQuantizer.load(from: url))

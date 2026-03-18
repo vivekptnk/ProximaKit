@@ -110,7 +110,7 @@ final class PQBenchmarkTests: XCTestCase {
         var totalRecall: Float = 0
         var queryTimes = [Double]()
 
-        for q in 0..<numQueries {
+        for _ in 0..<numQueries {
             // Use a random training vector as query.
             let queryIdx = Int.random(in: 0..<n)
             let query = Array(vectors[queryIdx * dim..<(queryIdx + 1) * dim])
