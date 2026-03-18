@@ -202,6 +202,86 @@ final class PQBenchmarkTests: XCTestCase {
         XCTAssertGreaterThan(throughput, 100)
     }
 
+    // ── Quantized HNSW: Memory vs Recall ─────────────────────────────
+
+    func testQuantizedHNSWMemoryVsRecall() async throws {
+        let dim = 64
+        let n = 1000
+        let k = 10
+        let numQueries = 30
+
+        // Generate clustered data.
+        let numClusters = 10
+        let clusterSize = n / numClusters
+        var vectorObjs = [Vector]()
+        vectorObjs.reserveCapacity(n)
+        for _ in 0..<numClusters {
+            let center = (0..<dim).map { _ in Float.random(in: -5...5) }
+            for _ in 0..<clusterSize {
+                vectorObjs.append(Vector((0..<dim).map { d in
+                    center[d] + Float.random(in: -0.5...0.5)
+                }))
+            }
+        }
+        let ids = (0..<n).map { _ in UUID() }
+
+        let hnswConfig = HNSWConfiguration(m: 16, efConstruction: 200, efSearch: 100)
+
+        // Build full HNSW for recall comparison.
+        let fullIndex = HNSWIndex(dimension: dim, metric: EuclideanDistance(), config: hnswConfig)
+        for i in 0..<n {
+            try await fullIndex.add(vectorObjs[i], id: ids[i])
+        }
+
+        // Build brute-force ground truth.
+        let bfIndex = BruteForceIndex(dimension: dim, metric: EuclideanDistance())
+        for i in 0..<n {
+            try await bfIndex.add(vectorObjs[i], id: ids[i])
+        }
+
+        // Measure full HNSW recall.
+        var fullRecall: Float = 0
+        for q in 0..<numQueries {
+            let query = vectorObjs[q]
+            let exact = await bfIndex.search(query: query, k: k)
+            let gt = Set(exact.map(\.id))
+            let hnswRes = await fullIndex.search(query: query, k: k, efSearch: 200)
+            fullRecall += Float(gt.intersection(Set(hnswRes.map(\.id))).count) / Float(k)
+        }
+        fullRecall /= Float(numQueries)
+
+        // Test quantized index at M=16.
+        let qIndex = try await QuantizedHNSWIndex.build(
+            vectors: vectorObjs,
+            ids: ids,
+            dimension: dim,
+            hnswConfig: hnswConfig,
+            pqConfig: PQConfiguration(subspaceCount: 16, trainingIterations: 15)
+        )
+
+        var pqRecall: Float = 0
+        for q in 0..<numQueries {
+            let query = vectorObjs[q]
+            let exact = await bfIndex.search(query: query, k: k)
+            let gt = Set(exact.map(\.id))
+            let pqRes = await qIndex.search(query: query, k: k, efSearch: 200)
+            pqRecall += Float(gt.intersection(Set(pqRes.map(\.id))).count) / Float(k)
+        }
+        pqRecall /= Float(numQueries)
+
+        let ratio = await qIndex.memorySavingsRatio
+        let recallLoss = fullRecall - pqRecall
+
+        print("\n=== Quantized HNSW: Memory vs Recall ===")
+        print("Full HNSW recall@10: \(String(format: "%.1f%%", fullRecall * 100))")
+        print("PQ HNSW recall@10:   \(String(format: "%.1f%%", pqRecall * 100))")
+        print("Recall loss:         \(String(format: "%.1f%%", recallLoss * 100))")
+        print("Memory savings:      \(String(format: "%.1fx", ratio))")
+
+        // Acceptance: >=4x memory reduction
+        XCTAssertGreaterThanOrEqual(ratio, 4.0)
+    }
+
     // ── Persistence Benchmark ────────────────────────────────────────
 
     func testPersistenceFileSize() throws {

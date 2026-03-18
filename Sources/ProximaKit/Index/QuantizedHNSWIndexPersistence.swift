@@ -39,7 +39,6 @@ extension QuantizedHNSWIndex {
 
         let nodeCount = codes.count
         let M = quantizer.config.subspaceCount
-        let ds = quantizer.subspaceDimension
 
         // Header (56 bytes)
         qhAppendLE(&data, qhMagic)
@@ -109,13 +108,13 @@ extension QuantizedHNSWIndex {
         var offset = 0
 
         func readUInt32() -> UInt32 {
-            let val = fileData.qhLoadLE(UInt32.self, at: offset)
+            let val = fileData.loadLE(UInt32.self, at: offset)
             offset += 4
             return val
         }
 
         func readInt32() -> Int32 {
-            let val = fileData.qhLoadLE(Int32.self, at: offset)
+            let val = fileData.loadLE(Int32.self, at: offset)
             offset += 4
             return val
         }
@@ -252,17 +251,4 @@ private func qhAppendLE<T: FixedWidthInteger>(_ data: inout Data, _ value: T) {
     withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
 }
 
-extension Data {
-    fileprivate func qhLoadLE<T: FixedWidthInteger>(_ type: T.Type, at offset: Int) -> T {
-        self.withUnsafeBytes { buffer in
-            var value: T = 0
-            withUnsafeMutableBytes(of: &value) { dest in
-                dest.copyMemory(from: UnsafeRawBufferPointer(
-                    start: buffer.baseAddress!.advanced(by: offset),
-                    count: MemoryLayout<T>.size
-                ))
-            }
-            return T(littleEndian: value)
-        }
-    }
-}
+// Uses Data.loadLE from PersistenceEngine.swift

@@ -165,13 +165,23 @@ public struct ProductQuantizer: Sendable {
             }
 
             // Run k-means on this subspace.
-            let centroids = kmeans(
+            let effectiveK = min(K, vectorCount)
+            var centroids = kmeans(
                 data: subVectors,
                 vectorCount: vectorCount,
                 dimension: ds,
-                k: min(K, vectorCount),
+                k: effectiveK,
                 iterations: config.trainingIterations
             )
+
+            // Pad to K centroids if training set was smaller than K.
+            // Duplicate the last centroid to fill remaining slots.
+            if effectiveK < K {
+                let lastCentroid = Array(centroids[(effectiveK - 1) * ds..<effectiveK * ds])
+                for _ in effectiveK..<K {
+                    centroids.append(contentsOf: lastCentroid)
+                }
+            }
 
             codebooks.append(centroids)
         }

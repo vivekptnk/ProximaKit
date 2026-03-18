@@ -41,7 +41,7 @@ public actor QuantizedHNSWIndex {
     public nonisolated let dimension: Int
 
     /// HNSW graph configuration.
-    private let hnswConfig: HNSWConfiguration
+    let hnswConfig: HNSWConfiguration
 
     /// The trained product quantizer.
     public let quantizer: ProductQuantizer
@@ -51,23 +51,23 @@ public actor QuantizedHNSWIndex {
     // Same multi-layer adjacency list layout as HNSWIndex.
     // layers[l][n] = neighbor indices for node n on layer l.
 
-    private var layers: [[[Int]]]
-    private var nodeLevels: [Int]
-    private var entryPointNode: Int?
-    private var maxLevel: Int
+    var layers: [[[Int]]]
+    var nodeLevels: [Int]
+    var entryPointNode: Int?
+    var maxLevel: Int
 
     // ── PQ Code Storage ──────────────────────────────────────────────
     //
     // Instead of [Vector], we store M-byte PQ codes per node.
     // Flat layout: codes[i] has M UInt8 values for node i.
 
-    private var codes: [[UInt8]]
+    var codes: [[UInt8]]
 
     // ── ID & Metadata ────────────────────────────────────────────────
 
-    private var nodeToUUID: [UUID]
-    private var uuidToNode: [UUID: Int]
-    private var metadata: [Data?]
+    var nodeToUUID: [UUID]
+    var uuidToNode: [UUID: Int]
+    var metadata: [Data?]
 
     /// The number of vectors in the index.
     public var count: Int { codes.count }
@@ -95,7 +95,8 @@ public actor QuantizedHNSWIndex {
 
     // ── Initialization ───────────────────────────────────────────────
 
-    private init(
+    /// Restores a quantized index from its components (used by persistence and build).
+    public init(
         dimension: Int,
         hnswConfig: HNSWConfiguration,
         quantizer: ProductQuantizer,
