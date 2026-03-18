@@ -23,7 +23,7 @@
     <a href="https://swift.org"><img src="https://img.shields.io/badge/Swift-5.9+-F05138?logo=swift&logoColor=white" alt="Swift" /></a>
     <a href="https://developer.apple.com"><img src="https://img.shields.io/badge/Apple_Silicon-M1_M2_M3_M4-000000?logo=apple&logoColor=white" alt="Apple Silicon" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License" /></a>
-    <img src="https://img.shields.io/badge/tests-117_passing-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/tests-148_passing-brightgreen.svg" alt="Tests" />
   </p>
 </p>
 

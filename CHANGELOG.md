@@ -8,22 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added
-- SIMD-accelerated batch vector operations (`batchDotProducts`, `batchL2Distances`)
-- SIMD benchmark tests comparing vDSP vs naive loop performance
-- CONTRIBUTING.md, CHANGELOG.md, BENCHMARKS.md
-
 ---
 
 ## [1.1.0] — 2026-03-17
 
 ### Added
+- **SIMD-accelerated batch vector operations** (`batchDotProducts`, `batchL2Distances`)
+- SIMD benchmark tests comparing vDSP vs naive loop performance
 - **WordPiece tokenizer** for BERT-compatible CoreML model input
 - **Image search** in demo app via `VisionEmbeddingProvider`
 - **Index persistence** in demo app — index survives app restart
 - Xcode demo app (`Examples/ProximaDemoApp`) with SwiftUI interface
 - `efSearch` slider in demo for live tuning
 - User note and image input in demo app
+- CONTRIBUTING.md, CHANGELOG.md, BENCHMARKS.md
 
 ### Changed
 - README rewritten with ASCII architecture diagrams, feature comparison table, and performance dashboard
