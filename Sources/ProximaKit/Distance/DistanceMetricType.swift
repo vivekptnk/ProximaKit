@@ -6,7 +6,7 @@
 
 /// Identifies which distance metric an index uses, for persistence.
 ///
-/// ProximaKit's three built-in metrics are stateless — they have no constructor
+/// ProximaKit's five built-in metrics are stateless — they have no constructor
 /// parameters. This enum maps each one to a `UInt32` value for binary serialization.
 ///
 /// ```swift

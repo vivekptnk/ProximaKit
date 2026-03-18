@@ -312,6 +312,7 @@ Place the exported `.mlmodelc` in `Models/` and ProximaKit will discover it auto
            │   ┌──────────────┴─────────────────────┐  │
            │   │  D I S T A N C E   M E T R I C S   │  │
            │   │  cosine · euclidean · dot product   │  │
+           │   │  manhattan · hamming                 │  │
            │   │       (vDSP / Accelerate)           │  │
            │   └──────────────┬─────────────────────┘  │
            │                  │                         │

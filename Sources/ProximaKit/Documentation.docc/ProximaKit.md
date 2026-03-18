@@ -37,6 +37,8 @@ let results = try await index.search(query: queryVector, k: 10)
 - ``CosineDistance``
 - ``EuclideanDistance``
 - ``DotProductDistance``
+- ``ManhattanDistance``
+- ``HammingDistance``
 
 ### Index Protocol
 

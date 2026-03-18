@@ -28,14 +28,32 @@ public struct HNSWConfiguration: Sendable {
     /// Default beam width during search queries.
     public let efSearch: Int
 
-    public init(m: Int = 16, efConstruction: Int = 200, efSearch: Int = 50) {
+    /// Auto-compaction threshold as a fraction of live/total nodes.
+    ///
+    /// When `liveCount / count` drops below this value after a removal,
+    /// the index automatically compacts to reclaim tombstone slots.
+    /// Set to `nil` to disable auto-compaction (manual `compact()` only).
+    ///
+    /// Default: `0.7` (compact when fewer than 70% of slots are live).
+    public let autoCompactionThreshold: Double?
+
+    public init(
+        m: Int = 16,
+        efConstruction: Int = 200,
+        efSearch: Int = 50,
+        autoCompactionThreshold: Double? = 0.7
+    ) {
         precondition(m > 0, "M must be positive")
         precondition(efConstruction > 0, "efConstruction must be positive")
         precondition(efSearch > 0, "efSearch must be positive")
+        if let threshold = autoCompactionThreshold {
+            precondition(threshold > 0 && threshold < 1, "autoCompactionThreshold must be in (0, 1)")
+        }
         self.m = m
         self.mMax0 = 2 * m
         self.efConstruction = efConstruction
         self.efSearch = efSearch
+        self.autoCompactionThreshold = autoCompactionThreshold
     }
 }
 
@@ -297,6 +315,13 @@ public actor HNSWIndex: VectorIndex {
                     entryPointNode = n
                 }
             }
+        }
+
+        // Auto-compact if the live ratio dropped below the threshold.
+        if let threshold = config.autoCompactionThreshold,
+           count > 0,
+           Double(liveCount) / Double(count) < threshold {
+            try? compact()
         }
 
         return true
