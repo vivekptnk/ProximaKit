@@ -48,6 +48,7 @@ let results = try await index.search(query: queryVector, k: 10)
 
 - ``batchDotProducts(query:matrix:vectorCount:dimension:)``
 - ``batchDistances(query:vectors:metric:)``
+- ``batchDistances(query:matrix:vectorCount:dimension:metric:)``
 
 ### Persistence
 
