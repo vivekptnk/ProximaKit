@@ -249,3 +249,68 @@ let context = results.compactMap { result in
 - Lumen gets a clean integration path without re-inventing embedding+persistence wiring
 - Other Chakravyuha products (TinyBrain) can reuse the same pattern
 - Performance targets are achievable with current HNSW + Accelerate architecture
+
+---
+
+## Addendum — v1.4 Hybrid Retrieval Opt-In
+
+**Status:** Shipping in v1.4.0 (CHA-107)
+**Date:** 2026-04-19
+
+v1.4 adds hybrid BM25 + dense retrieval. The design deliberately leaves the
+v1.1 `VectorStore` contract frozen — consumers opt into hybrid explicitly by
+using a parallel type, `HybridVectorStore`.
+
+### What Lumen gets
+
+A drop-in shape-compatible sibling of `VectorStore`:
+
+```swift
+// Dense-only (unchanged)
+let store = try VectorStore(
+    name: notebookName,
+    embedder: embedder,
+    storageDirectory: appSupportURL
+)
+
+// Hybrid (new opt-in)
+let store = try HybridVectorStore(
+    name: notebookName,
+    embedder: embedder,
+    storageDirectory: appSupportURL
+    // fusion defaults to .rrf(k: 60)
+)
+```
+
+`addChunks`, `query`, `removeDocument`, and `save` have equivalent signatures,
+so the Lumen RAG integration is a one-line construction-site swap.
+
+### Why a sibling instead of extending `VectorStore`?
+
+- Preserves the v1.1 API (answered "Open Question 4" — no breaking changes).
+- Conditional behavior in a single actor would double the surface area for
+  bugs around persistence, dirty-flag tracking, and hybrid fusion config.
+- Lumen can A/B test hybrid vs dense by instantiating the two side-by-side
+  and mirror-writing until hybrid metrics win on Lumen's own evaluation set.
+
+### Storage on disk
+
+Each hybrid store's directory now contains both legs' binary files:
+
+```
+<storageDirectory>/<name>/
+├── index.pxkt      # dense HNSW
+├── index.pxbm      # sparse BM25
+└── hybrid.json     # document → chunk UUIDs map
+```
+
+`index.pxkt` is the same format `VectorStore` already uses — a hybrid store
+can read an existing dense-only store's `.pxkt` file. The reverse is not
+true: `VectorStore` does not know about `.pxbm` or `hybrid.json`.
+
+### Scope
+
+Everything listed under "Phase 1: VectorStore" in the original plan is still
+in effect. Hybrid retrieval is additive — it does not replace any v1.1
+behavior or commitment. See [`docs/HYBRID.md`](./HYBRID.md) for the full
+hybrid-retrieval design and fusion-strategy rationale.
