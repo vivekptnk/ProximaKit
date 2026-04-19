@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [1.4.0] — 2026-04-19
+
+Hybrid BM25 + dense retrieval and a cross-library benchmark harness (FAISS + ScaNN). The core `ProximaKit` target remains Foundation + Accelerate only — no new external dependencies.
+
 ### Added
 - **Cross-library benchmark harness (`Benchmarks/`).** Standalone SPM package
   `ProximaBench` that compares ProximaKit HNSW against FAISS HNSW and ScaNN
@@ -34,9 +40,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   slice (100K) runs nightly. Results (per-library JSON + aggregated
   `compare.md`) are uploaded as workflow artifacts.
 
+- **Hybrid retrieval (BM25 + dense).** Three new public types in the core
+  `ProximaKit` target, sibling to the existing dense-only stack:
+  - `SparseIndex` — BM25 actor (`SparseVectorIndex` protocol), Okapi scoring
+    with Lucene-style `log(1 + (N − df + 0.5) / (df + 0.5))` IDF, configurable
+    `k1` / `b`, tombstoning + auto-compaction matching `HNSWIndex`.
+  - `HybridIndex` — concurrent fan-out over a dense `VectorIndex` and a
+    `SparseVectorIndex`, with `HybridFusionStrategy` = `.rrf(k:)` (default,
+    `k = 60`) or `.weightedSum(alpha:)`.
+  - `HybridVectorStore` — sibling of `VectorStore` with the same
+    `addChunks` / `query` / `removeDocument` / `save` shape. Persists both
+    legs side-by-side (`index.pxkt` + `index.pxbm`).
+- `BM25Tokenizer` protocol with `DefaultBM25Tokenizer` — Unicode word-break
+  segmentation + lowercasing, no NaturalLanguage dependency. Bring-your-own
+  tokenizer for language-aware tokenization (e.g. Lumen's `NLTokenizer`).
+- `BM25Configuration` with `k1`, `b`, `autoCompactionThreshold` knobs.
+- `.pxbm` binary persistence for `SparseIndex` via an extension on
+  `PersistenceEngine`. Same header / offset layout conventions as
+  `.pxkt`; compacts tombstones on save.
+- `docs/HYBRID.md` — hybrid retrieval design, fusion-strategy rationale,
+  Lumen opt-in snippet.
+- 40 new tests across `SparseIndexTests`, `DefaultBM25TokenizerTests`,
+  `HybridIndexTests`, and `HybridVectorStoreTests`, including a 1K-doc BM25
+  parity check against an oracle implementation and the RRF
+  `top-k ⊇ (dense ∩ sparse)` invariant on constructed cases.
+
 ### Changed
 - `.gitignore` now tracks `Benchmarks/` sources but ignores the on-demand
   `Benchmarks/datasets/` payloads and `Benchmarks/out/` run artifacts.
+- `docs/ADR-006-lumen-integration.md` — new addendum covering the hybrid
+  opt-in path. The v1.1 `VectorStore` contract is unchanged.
+
+### Fixed
+- `SparseIndexTests.testBM25ParityAgainstOracle` no longer flakes when BM25
+  score ties straddle the top-k truncation boundary. Both the oracle and
+  `SparseIndex` are queried with `k + 50` and the assertion walks fully
+  realized score buckets until it covers the top-k window — BM25 makes no
+  tie-break guarantee, so the test now verifies only what parity actually
+  demands (score agreement across the top-k window).
 
 ---
 
