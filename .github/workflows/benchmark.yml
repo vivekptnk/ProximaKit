@@ -1,48 +1,36 @@
 name: Cross-Library Benchmark
 
 on:
-  # Smoke slice on every PR that touches ProximaKit core or the Benchmarks
-  # harness. Keeps build time honest.
   pull_request:
     branches: [main]
     paths:
       - "Sources/ProximaKit/**"
       - "Benchmarks/**"
       - ".github/workflows/benchmark.yml"
-  # Full slice nightly on main.
   schedule:
-    - cron: "0 7 * * *" # 07:00 UTC
-  workflow_dispatch: {}
+    - cron: "0 7 * * *" # 07:00 UTC nightly
+  workflow_dispatch:
+    inputs:
+      slice:
+        description: "Which slice to run"
+        type: choice
+        default: smoke
+        options: [smoke, full]
 
-# Limit concurrent runs per PR/ref so parallel pushes cancel older jobs.
 concurrency:
   group: benchmark-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  benchmark:
-    name: Benchmark (${{ matrix.slice }})
+  smoke:
+    name: Benchmark (smoke, 10K)
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.slice == 'smoke')
     runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - slice: smoke
-            size: 10000
-            queries: 200
-          - slice: full
-            size: 100000
-            queries: 1000
-    # Skip the slice that doesn't match the current event. We keep both in the
-    # matrix so workflow_dispatch can trigger either one explicitly.
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && matrix.slice == 'smoke') || (github.event_name == 'schedule' && matrix.slice == 'full') }}
-
     env:
-      BENCH_SIZE: ${{ matrix.size }}
-      BENCH_QUERIES: ${{ matrix.queries }}
-      BENCH_SLICE: ${{ matrix.slice }}
-      BENCH_OUT: out
-
+      BENCH_SIZE: "10000"
+      BENCH_QUERIES: "200"
+      BENCH_SLICE: "smoke"
+      BENCH_OUT: "out"
     steps:
       - uses: actions/checkout@v4
 
@@ -112,9 +100,6 @@ jobs:
 
       - name: ScaNN (skip if unavailable)
         run: |
-          # scann wheels are published for linux+x86_64 primarily; on macos-15
-          # (arm64) it may not install. --skip-if-unavailable writes a 'skipped'
-          # marker and exits 0 so the rest of the job still succeeds.
           python -m pip install "scann>=1.3.0" || true
           python Benchmarks/python/scann_hnsw.py \
             --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
@@ -135,7 +120,112 @@ jobs:
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-${{ matrix.slice }}-${{ github.run_id }}
+          name: benchmark-smoke-${{ github.run_id }}
+          path: |
+            out/*.json
+            out/compare.md
+          if-no-files-found: error
+          retention-days: 30
+
+  full:
+    name: Benchmark (full, 100K)
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.slice == 'full')
+    runs-on: macos-15
+    env:
+      BENCH_SIZE: "100000"
+      BENCH_QUERIES: "1000"
+      BENCH_SLICE: "full"
+      BENCH_OUT: "out"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache SIFT1M
+        id: cache-sift
+        uses: actions/cache@v4
+        with:
+          path: Benchmarks/datasets/sift-1m
+          key: sift1m-v1
+
+      - name: Download SIFT1M (if not cached)
+        if: steps.cache-sift.outputs.cache-hit != 'true'
+        run: bash Benchmarks/datasets/download_sift1m.sh
+
+      - name: Build ProximaBench (release)
+        run: swift build -c release --package-path Benchmarks
+
+      - name: Install Python baselines
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r Benchmarks/python/requirements.txt
+
+      - name: Prepare output dir
+        run: mkdir -p "$BENCH_OUT"
+
+      - name: Compute ground truth
+        run: |
+          ./Benchmarks/.build/release/ProximaBench ground-truth \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --k 10 --metric l2 \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --out     "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json"
+
+      - name: ProximaKit HNSW (ef=50)
+        run: |
+          ./Benchmarks/.build/release/ProximaBench hnsw \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json" \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --k 10 --m 16 --efc 200 --ef 50 --metric l2 \
+            --notes   "github-actions ${{ github.run_id }}" \
+            --out     "$BENCH_OUT/ProximaKit__sift-1m-${BENCH_SLICE}__hnsw__ef50.json"
+
+      - name: FAISS HNSW (ef=50)
+        run: |
+          python Benchmarks/python/faiss_hnsw.py \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json" \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --k 10 --m 16 --efc 200 --ef 50 --metric l2 \
+            --notes   "github-actions ${{ github.run_id }}" \
+            --out     "$BENCH_OUT/FAISS__sift-1m-${BENCH_SLICE}__hnsw__ef50.json"
+
+      - name: ScaNN (skip if unavailable)
+        run: |
+          python -m pip install "scann>=1.3.0" || true
+          python Benchmarks/python/scann_hnsw.py \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json" \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --k 10 --num-leaves 100 --num-leaves-to-search 10 --reorder 100 \
+            --metric cosine --skip-if-unavailable \
+            --notes   "github-actions ${{ github.run_id }}" \
+            --out     "$BENCH_OUT/ScaNN__sift-1m-${BENCH_SLICE}__scann__leaves100.json"
+
+      - name: Aggregate comparison table
+        run: |
+          python Benchmarks/python/compare.py --in "$BENCH_OUT/" --out "$BENCH_OUT/compare.md"
+          cat "$BENCH_OUT/compare.md"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-full-${{ github.run_id }}
           path: |
             out/*.json
             out/compare.md
