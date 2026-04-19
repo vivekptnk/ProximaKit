@@ -30,17 +30,12 @@ jobs:
           - slice: smoke
             size: 10000
             queries: 200
-            run_when: pull_request
           - slice: full
             size: 100000
             queries: 1000
-            run_when: schedule
     # Skip the slice that doesn't match the current event. We keep both in the
     # matrix so workflow_dispatch can trigger either one explicitly.
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && matrix.slice == 'smoke') ||
-      (github.event_name == 'schedule' && matrix.slice == 'full')
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && matrix.slice == 'smoke') || (github.event_name == 'schedule' && matrix.slice == 'full') }}
 
     env:
       BENCH_SIZE: ${{ matrix.size }}
