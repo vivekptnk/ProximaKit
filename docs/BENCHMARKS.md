@@ -289,3 +289,90 @@ swift test -c release --filter SIMDBenchmarkTests
 - **Latency numbers** depend on hardware. Apple Silicon M1 is the baseline; M2/M3/M4 will be faster.
 - **Speedup ratios** depend on dimension and batch size. Higher dimensions and larger batches favor vDSP more strongly.
 - All metrics are measured with **no other significant processes** running. Background activity will add noise.
+
+---
+
+## Cross-Library Comparison
+
+ProximaKit HNSW vs. FAISS HNSW vs. ScaNN on identical datasets and identical ground truth. Full methodology and a reproducible harness live under [`Benchmarks/`](../Benchmarks/README.md).
+
+### Design rules
+
+1. **Identical ground truth.** Every library is evaluated against the same exact k-NN ground truth, produced once by `ProximaBench ground-truth` (brute force) and loaded verbatim by every harness. No library computes recall against its own approximate neighbors.
+2. **No FAISS/ScaNN dependency in core.** The baseline libraries run in Python and write a JSON document. The Swift harness also writes JSON. The aggregator globs the output directory and builds a table.
+3. **Single-threaded search.** FAISS is pinned to 1 OMP thread; the Swift harness runs queries sequentially. Multi-threaded numbers are a separate study.
+4. **Release mode.** `swift build -c release --package-path Benchmarks` for the Swift harness.
+5. **Results are reported honestly, including when ProximaKit loses.** Credibility is reproducibility, not winning a single axis.
+
+### Datasets
+
+| Dataset | Vectors | Dimension | Metric | Source |
+|---------|---------|-----------|--------|--------|
+| `sift-1m-100k` | 100,000 | 128 | L2 | SIFT1M first 100K (INRIA TEXMEX) |
+| `ms-marco-50k` | 50,000 | 384 | Cosine | MS MARCO passages first 50K, embedded with MiniLM-L6-v2 |
+
+CI runs a 10K smoke slice of `sift-1m` on every PR that touches `Sources/ProximaKit/**`. Nightly CI runs the full 100K slice.
+
+### Metrics
+
+| Metric | What it measures |
+|--------|------------------|
+| **Build time (s)** | Wall-clock seconds to insert every base vector into the index. |
+| **p50 / p95 latency (ms)** | Per-query wall-clock latency, single-threaded. |
+| **QPS** | `1000 / mean_latency_ms`. |
+| **Recall@k** | Fraction of ground-truth top-k that the library returned. Ground truth is brute force. |
+| **Resident memory (MB)** | Process RSS immediately after build, before any queries run. Swift uses `mach_task_basic_info`; Python uses `psutil`. |
+
+### Reproducing
+
+```bash
+./Benchmarks/datasets/download_sift1m.sh
+swift build -c release --package-path Benchmarks
+mkdir -p out
+
+# Ground truth (once)
+./Benchmarks/.build/release/ProximaBench ground-truth \
+    --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+    --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+    --size 100000 --query-count 1000 --k 10 --metric l2 \
+    --dataset sift-1m-100k \
+    --out out/GroundTruth__sift-1m-100k__k10.json
+
+# ProximaKit
+./Benchmarks/.build/release/ProximaBench hnsw \
+    --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+    --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+    --gt      out/GroundTruth__sift-1m-100k__k10.json \
+    --size 100000 --query-count 1000 \
+    --dataset sift-1m-100k \
+    --k 10 --m 16 --efc 200 --ef 50 --metric l2 \
+    --out out/ProximaKit__sift-1m-100k__hnsw__ef50.json
+
+# FAISS
+python -m pip install -r Benchmarks/python/requirements.txt
+python Benchmarks/python/faiss_hnsw.py \
+    --base Benchmarks/datasets/sift-1m/sift_base.fvecs \
+    --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+    --gt   out/GroundTruth__sift-1m-100k__k10.json \
+    --size 100000 --query-count 1000 \
+    --dataset sift-1m-100k \
+    --k 10 --m 16 --efc 200 --ef 50 --metric l2 \
+    --out out/FAISS__sift-1m-100k__hnsw__ef50.json
+
+# Aggregate
+python Benchmarks/python/compare.py --in out/ --out out/compare.md
+```
+
+### Results
+
+The first published tables land with the v1.4.0 release. Until then, the CI nightly artifact under the `benchmark` workflow is the canonical source — see the latest green nightly run on `main` for current numbers.
+
+Example table shape (filled in from the CI JSON artifacts):
+
+| Library | Params | Build (s) | p50 (ms) | p95 (ms) | QPS | Recall@10 | RSS (MB) |
+|---------|--------|-----------|----------|----------|-----|-----------|----------|
+| ProximaKit | HNSW M=16 efC=200 ef=50 | _N_ | _N_ | _N_ | _N_ | _N_ | _N_ |
+| FAISS      | HNSW M=16 efC=200 ef=50 | _N_ | _N_ | _N_ | _N_ | _N_ | _N_ |
+| ScaNN      | tree-AH leaves=100 search=10 reorder=100 | _N_ | _N_ | _N_ | _N_ | _N_ | _N_ |
+
+Actual numbers are auto-generated into `out/compare.md` by `Benchmarks/python/compare.py`. See [ADR-005: Cross-Library Benchmark Methodology](adr/ADR-005-benchmark-methodology.md) for the rationale behind the JSON schema, the single-threaded rule, and the "separate SPM package" choice.

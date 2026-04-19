@@ -1,0 +1,9 @@
+# Pinned light; let pip pick a compatible scann wheel for the current Python
+# version. CI installs faiss-cpu + numpy always, and scann only on supported
+# runners.
+numpy>=1.26,<3.0
+psutil>=5.9
+faiss-cpu>=1.8.0
+# scann: optional. CI installs separately with --skip-if-unavailable fallback
+# because wheels only exist for specific (os, arch, python) triples.
+scann>=1.3.0 ; platform_system == "Linux" and platform_machine == "x86_64"

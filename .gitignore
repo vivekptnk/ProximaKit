@@ -35,5 +35,12 @@ venv/
 docs/PRD.md
 docs/MODEL_GUIDE.md
 CLAUDE.md
-Benchmarks/
 scripts/
+
+# Benchmark artifacts — datasets and harness output, NOT the harness itself.
+# The Benchmarks/ source tree is tracked (see Benchmarks/README.md); these
+# subpaths are generated on demand and too large for git.
+Benchmarks/datasets/sift-1m/
+Benchmarks/datasets/ms-marco/
+Benchmarks/datasets/*.tar.gz
+Benchmarks/out/

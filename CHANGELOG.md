@@ -8,6 +8,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Cross-library benchmark harness (`Benchmarks/`).** Standalone SPM package
+  `ProximaBench` that compares ProximaKit HNSW against FAISS HNSW and ScaNN
+  on identical datasets and identical brute-force ground truth. The core
+  `ProximaKit` target stays dependency-free — baselines run in Python and
+  all harnesses write a flat JSON schema (see `Benchmarks/JSON_SCHEMA.md`).
+  - Swift subcommands: `ground-truth` (exact k-NN via `BruteForceIndex`)
+    and `hnsw` (build + timed search + recall@k against GT).
+  - Python baselines under `Benchmarks/python/`: `faiss_hnsw.py`,
+    `scann_hnsw.py` (auto-skips on unsupported platforms), `compare.py`
+    aggregator that emits a Markdown table.
+  - Datasets: SIFT1M 100K subset + MS MARCO passages 50K (MiniLM-L6-v2
+    embeddings). Idempotent download scripts under `Benchmarks/datasets/`.
+  - Metrics: recall@10 vs exact GT, p50/p95 query latency, QPS, build time,
+    resident memory (`mach_task_basic_info` on Swift, `psutil` on Python).
+- **`docs/BENCHMARKS.md` — "Cross-Library Comparison" section** with
+  design rules, dataset table, metrics table, and end-to-end reproduction
+  steps that call the harness binaries directly.
+- **`docs/adr/ADR-005-benchmark-methodology.md`** documenting why the
+  baselines live out-of-process and why `Benchmarks/` is a separate SPM
+  package rather than a target of `Package.swift`.
+- **CI: `.github/workflows/benchmark.yml`.** Smoke slice (SIFT1M 10K) runs
+  on every PR that touches `Sources/ProximaKit/**` or the harness. Full
+  slice (100K) runs nightly. Results (per-library JSON + aggregated
+  `compare.md`) are uploaded as workflow artifacts.
+
+### Changed
+- `.gitignore` now tracks `Benchmarks/` sources but ignores the on-demand
+  `Benchmarks/datasets/` payloads and `Benchmarks/out/` run artifacts.
+
 ---
 
 ## [1.1.0] — 2026-03-17

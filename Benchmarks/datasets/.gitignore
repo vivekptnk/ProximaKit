@@ -1,0 +1,10 @@
+# Raw datasets are downloaded on demand; never checked in.
+*.fvecs
+*.ivecs
+*.bvecs
+*.tar.gz
+*.tsv
+*.gz
+sift/
+sift-1m/
+ms-marco/
