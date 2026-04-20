@@ -389,15 +389,38 @@ final class SparseIndexTests: XCTestCase {
         let reloadedCount = await reloaded.count
         XCTAssertEqual(reloadedCount, 20)
 
+        // Query a term that every doc shares. With identical doc length and
+        // identical tf this produces a 20-way score tie — useful for
+        // exercising the persistence path under tied results, but the test
+        // can't rely on a stable tie-break order because Dictionary iteration
+        // order is per-process. Compare scores element-by-element (they must
+        // agree on the sorted score sequence) and IDs as a set.
         let query = "gamma"
         let originalResults = await original.search(query: query, k: 10)
         let reloadedResults = await reloaded.search(query: query, k: 10)
 
         XCTAssertEqual(originalResults.count, reloadedResults.count)
-        for (a, b) in zip(originalResults, reloadedResults) {
-            XCTAssertEqual(a.id, b.id)
-            XCTAssertEqual(a.distance, b.distance, accuracy: 1e-5)
-            XCTAssertEqual(a.metadata, b.metadata)
+
+        let originalScores = originalResults.map(\.distance)
+        let reloadedScores = reloadedResults.map(\.distance)
+        XCTAssertEqual(originalScores.count, reloadedScores.count)
+        for (a, b) in zip(originalScores, reloadedScores) {
+            XCTAssertEqual(a, b, accuracy: 1e-5)
+        }
+
+        let originalIds = Set(originalResults.map(\.id))
+        let reloadedIds = Set(reloadedResults.map(\.id))
+        // When there's a true tie at the top-k boundary the two impls may
+        // pick different members of the tied bucket; both subsets must come
+        // from the same registered ID universe and metadata must round-trip
+        // correctly for the IDs that *do* appear in both.
+        XCTAssertTrue(originalIds.isSubset(of: Set(ids)))
+        XCTAssertTrue(reloadedIds.isSubset(of: Set(ids)))
+
+        let originalById = Dictionary(uniqueKeysWithValues: originalResults.map { ($0.id, $0.metadata) })
+        let reloadedById = Dictionary(uniqueKeysWithValues: reloadedResults.map { ($0.id, $0.metadata) })
+        for id in originalIds.intersection(reloadedIds) {
+            XCTAssertEqual(originalById[id], reloadedById[id], "metadata must round-trip for id \(id)")
         }
     }
 
