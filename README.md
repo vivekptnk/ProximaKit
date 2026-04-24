@@ -90,6 +90,14 @@ Not a wrapper. Not a port.
 
 <p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
+## Overview
+
+ProximaKit is a pure-Swift approximate nearest-neighbour library built from scratch on Apple's Accelerate framework. It provides HNSW-based semantic search that runs entirely on-device — no server, no API key, no C++ wrapper required.
+
+The library ships three targets: `ProximaKit` (core index + distance metrics + persistence), `ProximaEmbeddings` (text/image → vector converters using Apple's NaturalLanguage, Vision, and CoreML frameworks), and `ProximaDemo` (CLI) plus `ProximaDemoApp` (macOS SwiftUI app). All targets are distributed as a single Swift package.
+
+ProximaKit is the foundation of the Chakravyuha stack and is used by TinyBrain (inference) and Lumen (knowledge retrieval) as their vector-search layer.
+
 ## Why ProximaKit?
 
 | | ProximaKit | FAISS (C++) | Pinecone (Cloud) |
@@ -103,15 +111,13 @@ Not a wrapper. Not a port.
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
-## Get Started (5 minutes)
+## Requirements
 
-### What You Need
+- macOS 14+ (macOS 15 recommended)
+- Xcode 15+ / Swift 5.9+
+- Apple Silicon (M1 or newer) — Accelerate SIMD paths are Apple Silicon–optimised
 
-- A Mac with Apple Silicon (M1 or newer)
-- macOS 14 or later
-- Xcode 15 or later
-
-### Step 1: Add to Your Project
+## Installation
 
 ```swift
 // Package.swift
@@ -119,8 +125,6 @@ dependencies: [
     .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.0.0")
 ]
 ```
-
-Add the targets you need:
 
 ```swift
 .target(
@@ -132,7 +136,9 @@ Add the targets you need:
 )
 ```
 
-### Step 2: Run the Demo
+## Quick Start
+
+### Run the Demo
 
 ```bash
 git clone https://github.com/vivekptnk/ProximaKit.git
@@ -173,6 +179,34 @@ You type: "beach vacation"
 ```
 
 All of this happens **on your device**, using Apple's Accelerate framework for SIMD math. No internet required.
+
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
+
+## Demo
+
+**ProximaDemoApp** is a macOS SwiftUI app that ships with the repo. It indexes 48 sample documents at startup and lets you search by meaning in real time, tune `efSearch` with a slider, add your own notes to the live index, and persist across app launches.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│  ProximaDemoApp — semantic search over 48 sample documents              │
+│                                                                          │
+│  ┌────────────────────┐  ┌──────────────────────────────────────────┐  │
+│  │  efSearch  ─── 50  │  │  Query: "space exploration"              │  │
+│  │  ▐██████████░░░░░░ │  │  ──────────────────────────────────────  │  │
+│  │                    │  │  ●  0.41  Astronauts aboard the ISS...   │  │
+│  │  Corpus: 48 docs   │  │  ●  0.44  NASA launched a new rover...  │  │
+│  │  Dimension: 512d   │  │  ●  0.48  The moon landing changed...   │  │
+│  │  Build:  ~0.9 s    │  │  ●  0.51  Scientists study black holes  │  │
+│  │  Query:  ~104 ms   │  │  ●  0.55  The James Webb telescope...   │  │
+│  │                    │  │                                          │  │
+│  │  [  Add Note  ]    │  │  ●  dist < 0.55 — strong match          │  │
+│  │  [  Add Image ]    │  │  ●  dist < 0.68 — partial match         │  │
+│  │                    │  │  ●  dist ≥ 0.68 — weak match            │  │
+│  └────────────────────┘  └──────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Open in Xcode: `open Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj`
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
@@ -448,17 +482,38 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
-## Run the Tests
+## Building & Testing
 
 ```bash
+# Build
+swift build
+
+# Unit + integration tests (fast)
 swift test --skip RecallBenchmarkTests
-```
 
-## Generate Documentation
+# Full recall benchmarks (slow, needs Release mode)
+swift test -c release --filter RecallBenchmarkTests
 
-```bash
+# Generate DocC documentation
 swift package generate-documentation --target ProximaKit
 ```
+
+<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
+
+## Roadmap
+
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
+
+| Area | Status |
+|------|--------|
+| Additional distance metrics — Mahalanobis, Chebyshev, Bray-Curtis | Planned |
+| GPU acceleration — Metal/MPSGraph backend for batch index builds | Planned |
+| Binary quantization — INT8 scalar, product quantization (PQ) | Planned |
+| Filtered search — pre-filter by metadata predicate before ANN | Planned |
+| ADR backlog — quantization strategy, filtered search design | In progress |
+| Demo app — iOS target, CoreML model download UI, result export | Planned |
+
+Items flagged in the [documentation audit](../docs/DOCUMENTATION-AUDIT.md) (CONTRIBUTING.md polish, CHANGELOG.md, demo app README expansion) are tracked in the roadmap but are out of scope for this release.
 
 <p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
