@@ -271,9 +271,12 @@ public func batchDistances(
         }
 
         if metric is CosineDistance {
+            // Zero-magnitude semantics must match the scalar path:
+            // Vector.cosineSimilarity returns 0 for a zero vector, so
+            // CosineDistance = 1 - 0 = 1.0 (neutral), never 0 (perfect match).
             let queryMag = query.magnitude
             guard queryMag > 0 else {
-                return [Float](repeating: 0, count: vectorCount)
+                return [Float](repeating: 1.0, count: vectorCount)
             }
             let vecMags = batchMagnitudes(
                 matrix: matrix, vectorCount: vectorCount, dimension: dimension
@@ -281,7 +284,7 @@ public func batchDistances(
             var results = [Float](repeating: 0, count: vectorCount)
             for i in 0..<vectorCount {
                 let denominator = queryMag * vecMags[i]
-                results[i] = denominator > 0 ? 1.0 - dots[i] / denominator : 0
+                results[i] = denominator > 0 ? 1.0 - dots[i] / denominator : 1.0
             }
             return results
         }
