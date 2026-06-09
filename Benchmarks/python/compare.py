@@ -63,6 +63,13 @@ def _load_all(in_dir: str) -> list[dict[str, Any]]:
         if doc.get("schemaVersion") != 1:
             sys.stderr.write(f"[compare] skipping {path}: unknown schemaVersion\n")
             continue
+        # GroundTruth__*.json shares schemaVersion=1 but is not a BenchResult
+        # (no library/indexParams/recall fields). Skip anything that doesn't
+        # carry a library identifier so the workflow's GT artifact in the
+        # same out/ directory does not crash the aggregator.
+        if "library" not in doc:
+            sys.stderr.write(f"[compare] skipping {path}: not a BenchResult (no 'library' field)\n")
+            continue
         doc["_path"] = os.path.basename(path)
         out.append(doc)
     return out
