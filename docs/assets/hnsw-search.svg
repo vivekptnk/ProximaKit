@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="12">
+  <style>
+    .lbl { fill: #8b949e; }
+    .edge { stroke: #30363d; stroke-width: 1.2; fill: none; }
+    .plane { fill: #161b22; stroke: #30363d; rx: 8; }
+    .n { fill: #484f58; }
+    .hot { stroke: #58a6ff; stroke-width: 2; fill: none; stroke-dasharray: 400; stroke-dashoffset: 400;
+           animation: dash 8s linear infinite; }
+    @keyframes dash { 0%,5% { stroke-dashoffset: 400; } 60% { stroke-dashoffset: 0; } 88% { stroke-dashoffset: 0; opacity:1;} 96%,100% { stroke-dashoffset: 0; opacity:0; } }
+    .visit { fill: #58a6ff; opacity: 0; }
+    .v1 { animation: pop 8s infinite 0.6s; } .v2 { animation: pop 8s infinite 1.4s; }
+    .v3 { animation: pop 8s infinite 2.2s; } .v4 { animation: pop 8s infinite 3.0s; }
+    .v5 { animation: pop 8s infinite 3.8s; } .v6 { animation: pop 8s infinite 4.4s; }
+    @keyframes pop { 0% {opacity:0;} 8% {opacity:1;} 88% {opacity:1;} 96%,100% {opacity:0;} }
+    .target { animation: flare 8s ease-in-out infinite; transform-origin: 600px 358px; }
+    @keyframes flare { 0%,55% {opacity:0.3; transform:scale(0.7);} 64%,88% {opacity:1; transform:scale(1);} 96%,100% {opacity:0.3; transform:scale(0.7);} }
+  </style>
+
+  <text x="20" y="24" fill="#c9d1d9" font-size="14" font-weight="600">HNSW search: greedy descent, then beam search on layer 0</text>
+
+  <!-- Layer 2 (sparse) -->
+  <rect class="plane" x="60" y="44" width="640" height="80" rx="8"/>
+  <text x="76" y="66" class="lbl">layer 2 — sparse, long-range hops (ef = 1)</text>
+  <path class="edge" d="M140 96 L380 84 M380 84 L620 100"/>
+  <circle class="n" cx="140" cy="96" r="5"/><circle class="n" cx="380" cy="84" r="5"/><circle class="n" cx="620" cy="100" r="5"/>
+
+  <!-- Layer 1 -->
+  <rect class="plane" x="60" y="148" width="640" height="92" rx="8"/>
+  <text x="76" y="170" class="lbl">layer 1 — denser, shorter hops (ef = 1)</text>
+  <path class="edge" d="M120 206 L260 188 M260 188 L400 212 M400 212 L540 190 M540 190 L640 214 M260 188 L400 212"/>
+  <circle class="n" cx="120" cy="206" r="5"/><circle class="n" cx="260" cy="188" r="5"/><circle class="n" cx="400" cy="212" r="5"/><circle class="n" cx="540" cy="190" r="5"/><circle class="n" cx="640" cy="214" r="5"/>
+
+  <!-- Layer 0 (all nodes) -->
+  <rect class="plane" x="60" y="264" width="640" height="128" rx="8"/>
+  <text x="76" y="286" class="lbl">layer 0 — every vector, beam search (ef = efSearch)</text>
+  <path class="edge" d="M110 330 L190 360 M190 360 L270 322 M270 322 L350 366 M350 366 L430 330 M430 330 L510 368 M510 368 L600 358 M430 330 L600 358 M270 322 L430 330 M510 368 L660 326 M600 358 L660 326"/>
+  <circle class="n" cx="110" cy="330" r="5"/><circle class="n" cx="190" cy="360" r="5"/><circle class="n" cx="270" cy="322" r="5"/><circle class="n" cx="350" cy="366" r="5"/><circle class="n" cx="430" cy="330" r="5"/><circle class="n" cx="510" cy="368" r="5"/><circle class="n" cx="660" cy="326" r="5"/>
+
+  <!-- search path: entry top-left → descend → beam → target -->
+  <path class="hot" d="M140 96 L380 84 L260 188 L400 212 L430 330 L510 368 L600 358"/>
+  <circle class="visit v1" cx="140" cy="96" r="6"/>
+  <circle class="visit v2" cx="380" cy="84" r="6"/>
+  <circle class="visit v3" cx="260" cy="188" r="6"/>
+  <circle class="visit v4" cx="400" cy="212" r="6"/>
+  <circle class="visit v5" cx="430" cy="330" r="6"/>
+  <circle class="visit v6" cx="510" cy="368" r="6"/>
+
+  <!-- nearest neighbor -->
+  <g class="target">
+    <circle cx="600" cy="358" r="16" fill="#bc8cff" opacity="0.25"/>
+    <path fill="#e2c6ff" d="M600 346 L603 355 L612 358 L603 361 L600 370 L597 361 L588 358 L597 355 Z"/>
+  </g>
+  <text x="586" y="412" fill="#bc8cff">nearest neighbor</text>
+  <text x="96" y="86" fill="#58a6ff">entry point</text>
+</svg>

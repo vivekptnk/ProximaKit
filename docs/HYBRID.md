@@ -30,6 +30,10 @@ Hybrid retrieval fuses both ranked lists. In practice this gives:
 
 ## Architecture
 
+<p align="center">
+  <img src="assets/hybrid-fusion.svg" alt="Animated hybrid retrieval: a query fans out to the dense HNSW leg and the BM25 sparse leg, whose ranked lists are fused by RRF or weighted sum" width="720" />
+</p>
+
 ```
                     ┌─────────────────────────────────┐
                     │        HybridVectorStore         │

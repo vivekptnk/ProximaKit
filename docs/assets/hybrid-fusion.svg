@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 340" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="12">
+  <style>
+    .box { fill: #161b22; stroke: #30363d; }
+    .t { fill: #c9d1d9; } .dim { fill: #8b949e; }
+    .lane { stroke: #30363d; stroke-width: 1.5; fill: none; }
+    .bar { animation: grow 7s ease-out infinite; transform-origin: left center; }
+    @keyframes grow { 0%,12% { transform: scaleX(0);} 30% { transform: scaleX(1);} 90% { transform: scaleX(1);} 97%,100% { transform: scaleX(0);} }
+    .fbar { animation: grow2 7s ease-out infinite; transform-origin: left center; }
+    @keyframes grow2 { 0%,42% { transform: scaleX(0);} 58% { transform: scaleX(1);} 90% { transform: scaleX(1);} 97%,100% { transform: scaleX(0);} }
+  </style>
+
+  <text x="20" y="26" fill="#c9d1d9" font-size="14" font-weight="600">Hybrid retrieval: dense + BM25, fused by rank</text>
+
+  <!-- query -->
+  <rect class="box" x="20" y="56" width="150" height="40" rx="8"/>
+  <text x="38" y="80" class="t">"jaguar speed"</text>
+
+  <!-- lanes -->
+  <path class="lane" d="M170 76 C 230 76, 230 116, 290 116"/>
+  <path class="lane" d="M170 76 C 230 76, 230 226, 290 226"/>
+  <circle r="3" fill="#58a6ff"><animateMotion dur="7s" repeatCount="indefinite" keyPoints="0;0;1;1" keyTimes="0;0.02;0.12;1" calcMode="linear" path="M170 76 C 230 76, 230 116, 290 116"/><animate attributeName="opacity" dur="7s" repeatCount="indefinite" values="0;1;0;0" keyTimes="0;0.07;0.14;1"/></circle>
+  <circle r="3" fill="#3fb950"><animateMotion dur="7s" repeatCount="indefinite" keyPoints="0;0;1;1" keyTimes="0;0.02;0.12;1" calcMode="linear" path="M170 76 C 230 76, 230 226, 290 226"/><animate attributeName="opacity" dur="7s" repeatCount="indefinite" values="0;1;0;0" keyTimes="0;0.07;0.14;1"/></circle>
+
+  <!-- dense leg -->
+  <rect class="box" x="290" y="76" width="180" height="90" rx="8"/>
+  <text x="306" y="98" fill="#58a6ff">HNSW (dense)</text>
+  <text x="306" y="114" class="dim">cosine over embeddings</text>
+  <rect class="bar" x="306" y="126" width="130" height="7" rx="3" fill="#58a6ff"/>
+  <rect class="bar" x="306" y="139" width="96"  height="7" rx="3" fill="#58a6ff" opacity="0.7"/>
+  <rect class="bar" x="306" y="152" width="64"  height="7" rx="3" fill="#58a6ff" opacity="0.45"/>
+
+  <!-- sparse leg -->
+  <rect class="box" x="290" y="186" width="180" height="90" rx="8"/>
+  <text x="306" y="208" fill="#3fb950">SparseIndex (BM25)</text>
+  <text x="306" y="224" class="dim">exact keyword scoring</text>
+  <rect class="bar" x="306" y="236" width="118" height="7" rx="3" fill="#3fb950"/>
+  <rect class="bar" x="306" y="249" width="102" height="7" rx="3" fill="#3fb950" opacity="0.7"/>
+  <rect class="bar" x="306" y="262" width="58"  height="7" rx="3" fill="#3fb950" opacity="0.45"/>
+
+  <!-- fusion lanes -->
+  <path class="lane" d="M470 121 C 520 121, 520 166, 560 166"/>
+  <path class="lane" d="M470 231 C 520 231, 520 186, 560 186"/>
+  <circle r="3" fill="#58a6ff"><animateMotion dur="7s" repeatCount="indefinite" keyPoints="0;0;1;1" keyTimes="0;0.32;0.42;1" calcMode="linear" path="M470 121 C 520 121, 520 166, 560 166"/><animate attributeName="opacity" dur="7s" repeatCount="indefinite" values="0;0;1;0;0" keyTimes="0;0.32;0.37;0.44;1"/></circle>
+  <circle r="3" fill="#3fb950"><animateMotion dur="7s" repeatCount="indefinite" keyPoints="0;0;1;1" keyTimes="0;0.32;0.42;1" calcMode="linear" path="M470 231 C 520 231, 520 186, 560 186"/><animate attributeName="opacity" dur="7s" repeatCount="indefinite" values="0;0;1;0;0" keyTimes="0;0.32;0.37;0.44;1"/></circle>
+
+  <!-- fused output -->
+  <rect class="box" x="560" y="116" width="180" height="120" rx="8"/>
+  <text x="576" y="140" fill="#bc8cff">Fusion</text>
+  <text x="576" y="156" class="dim">RRF or weighted-sum</text>
+  <rect class="fbar" x="576" y="170" width="140" height="8" rx="3" fill="#bc8cff"/>
+  <rect class="fbar" x="576" y="184" width="112" height="8" rx="3" fill="#bc8cff" opacity="0.75"/>
+  <rect class="fbar" x="576" y="198" width="84"  height="8" rx="3" fill="#bc8cff" opacity="0.5"/>
+  <rect class="fbar" x="576" y="212" width="56"  height="8" rx="3" fill="#bc8cff" opacity="0.3"/>
+
+  <text x="20" y="316" class="dim">Dense recall for meaning, BM25 precision for exact terms — one ranked list. See ADR on fusion in docs/HYBRID.md.</text>
+</svg>

@@ -68,6 +68,10 @@ both paths).
 
 ## Index Layer
 
+<p align="center">
+  <img src="assets/hnsw-search.svg" alt="Animated HNSW search: greedy descent across layers, then beam search on layer 0" width="720" />
+</p>
+
 | Index | Protocol | Search | Persists as | Notes |
 |-------|----------|--------|-------------|-------|
 | `BruteForceIndex` | `VectorIndex` | Exact, O(n) batch scan | `.pxkt` | Ground truth / small corpora |

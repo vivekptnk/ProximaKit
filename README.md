@@ -160,6 +160,10 @@ Or open `Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj` in Xcode for the full
 
 ## How It Works
 
+<p align="center">
+  <img src="docs/assets/hnsw-search.svg" alt="Animated HNSW search: greedy descent across sparse upper layers, then beam search on layer 0 to the nearest neighbor" width="760" />
+</p>
+
 ```
 You type: "beach vacation"
          |
@@ -194,27 +198,11 @@ All of this happens **on your device**, using Apple's Accelerate framework for S
 
 **ProximaDemoApp** is a macOS SwiftUI app that ships with the repo. It indexes 48 sample documents at startup and lets you search by meaning in real time, tune `efSearch` with a slider, add your own notes to the live index, and persist across app launches.
 
-The animated terminal at the top of this README replays a real `swift run ProximaDemo` CLI session. The GUI app below is an illustrative ASCII mock-up of the layout (not a screenshot — build it yourself in one command):
+The animated terminal at the top of this README replays a real `swift run ProximaDemo` CLI session. The GUI app is illustrated below (mock-up, not a screenshot — build the real thing in one command):
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│  ProximaDemoApp — semantic search over 48 sample documents              │
-│                                                                          │
-│  ┌────────────────────┐  ┌──────────────────────────────────────────┐  │
-│  │  efSearch  ─── 50  │  │  Query: "space exploration"              │  │
-│  │  ▐██████████░░░░░░ │  │  ──────────────────────────────────────  │  │
-│  │                    │  │  ●  0.41  Astronauts aboard the ISS...   │  │
-│  │  Corpus: 48 docs   │  │  ●  0.44  NASA launched a new rover...  │  │
-│  │  Dimension: 512d   │  │  ●  0.48  The moon landing changed...   │  │
-│  │                    │  │  ●  0.51  Scientists study black holes  │  │
-│  │  [  Add Note  ]    │  │  ●  0.55  The James Webb telescope...   │  │
-│  │  [  Add Image ]    │  │                                          │  │
-│  │                    │  │  ●  dist < 0.55 — strong match          │  │
-│  │                    │  │  ●  dist < 0.68 — partial match         │  │
-│  │                    │  │  ●  dist ≥ 0.68 — weak match            │  │
-│  └────────────────────┘  └──────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="docs/assets/demo-app.svg" alt="Illustrative mock-up of ProximaDemoApp: sidebar with corpus stats and an efSearch slider, results panel ranking space-exploration documents by distance" width="760" />
+</p>
 
 Open in Xcode: `open Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj`
 
@@ -278,6 +266,10 @@ let hits = await hybrid.search(queryText: "error E42", queryVector: queryVector,
 Fusion defaults to Reciprocal Rank Fusion (`.rrf(k: 60)`); `.weightedSum(alpha:)` is available when you've measured your corpus. Full design in [`docs/HYBRID.md`](docs/HYBRID.md).
 
 ## Shrink the Index: INT8 Quantization
+
+<p align="center">
+  <img src="docs/assets/quantization.svg" alt="Animated comparison: a 384-dim vector at 1,536 bytes in Float32 shrinks to 388 bytes with INT8 scalar quantization and 48 bytes with product quantization" width="760" />
+</p>
 
 ~4× less vector memory, no training phase, works with any serialisable metric:
 

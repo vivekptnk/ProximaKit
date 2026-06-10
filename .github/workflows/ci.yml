@@ -90,6 +90,12 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
 
+      - name: Ensure iOS platform runtime
+        # macos-15 runner images vary: some ship without the iOS simulator
+        # runtime for the pinned Xcode and the build dies with "iOS 18.2 is
+        # not installed". Download is a no-op when already present.
+        run: sudo xcodebuild -downloadPlatform iOS
+
       - name: Build ProximaKit for iOS Simulator
         run: |
           set -o pipefail
