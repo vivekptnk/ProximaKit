@@ -1,0 +1,166 @@
+@Tutorial(time: 20) {
+    @Intro(title: "Build On-Device Semantic Search") {
+        Create a search index, fill it with vectors, query it by meaning, and
+        persist it to disk — all on-device.
+
+        You'll use ``HNSWIndex`` for fast approximate nearest-neighbor search,
+        `NLEmbeddingProvider` from the `ProximaEmbeddings` library to turn text
+        into vectors, and the built-in binary persistence to save and reload
+        your index between launches.
+
+        This tutorial assumes you've added both `ProximaKit` and
+        `ProximaEmbeddings` to your target's dependencies — see
+        <doc:GettingStarted> for installation.
+    }
+
+    @Section(title: "Create an index and add vectors") {
+        @ContentAndMedia {
+            Every search in ProximaKit runs against a vector index. In this
+            section you create an ``HNSWIndex``, hand-craft a few small vectors
+            so you can see exactly what the index stores, and run your first
+            search.
+
+            Real apps get their vectors from an embedding provider — that's the
+            next section. Starting with hand-written 3-dimensional vectors keeps
+            the mechanics visible.
+        }
+
+        @Steps {
+            @Step {
+                Create an ``HNSWIndex``. You choose the vector dimension and the
+                ``DistanceMetric`` up front; every vector you add must match that
+                dimension. ``CosineDistance`` is the right default for text
+                embeddings.
+
+                Indices are Swift actors, so they're safe to share across tasks
+                without any locking on your part.
+
+                @Code(name: "FirstIndex.swift", file: "semantic-search-01-01.swift")
+            }
+
+            @Step {
+                Define some content to index. Each entry pairs a name with a
+                ``Vector`` — just a list of `Float` components. Similar items
+                point in similar directions: `apple` and `banana` are close,
+                `bicycle` points elsewhere.
+
+                @Code(name: "FirstIndex.swift", file: "semantic-search-01-02.swift")
+            }
+
+            @Step {
+                Add each vector with ``HNSWIndex/add(_:id:metadata:)``. The
+                `UUID` identifies the vector in search results, and the optional
+                metadata is JSON-encoded `Data` you get back with every match.
+
+                `add` throws if a vector's dimension doesn't match the index,
+                and it's an actor method — hence `try await`.
+
+                @Code(name: "FirstIndex.swift", file: "semantic-search-01-03.swift")
+            }
+
+            @Step {
+                Search with ``VectorIndex/search(query:k:)``. It returns up to
+                `k` ``SearchResult`` values sorted by distance — lower means
+                more similar. Search never throws; note the `await` without
+                `try`.
+
+                Use ``SearchResult/decodeMetadata(as:)`` to recover the metadata
+                you attached at insert time. With the query vector pointing in
+                the "fruit" direction, the two fruit entries are the nearest
+                neighbors.
+
+                @Code(name: "FirstIndex.swift", file: "semantic-search-01-04.swift")
+            }
+        }
+    }
+
+    @Section(title: "Search by meaning with NLEmbeddingProvider") {
+        @ContentAndMedia {
+            Hand-written vectors show the mechanics, but the point of semantic
+            search is that an embedding model writes them for you.
+            `NLEmbeddingProvider` uses Apple's built-in NaturalLanguage
+            framework — no model download, no API key.
+
+            You'll embed a handful of notes, index them, and then find them with
+            queries that share no words with the text they match.
+        }
+
+        @Steps {
+            @Step {
+                Create the provider and size the index from it. The embedding
+                dimension depends on the language model, so always use the
+                provider's `dimension` property instead of hard-coding a number.
+
+                `NLEmbeddingProvider` lives in the `ProximaEmbeddings` library,
+                so this file needs both imports.
+
+                @Code(name: "NoteSearch.swift", file: "semantic-search-02-01.swift")
+            }
+
+            @Step {
+                Embed and index some notes. `embed(_:)` converts each string
+                into a ``Vector`` that captures its meaning; the note text rides
+                along as metadata so search results can show it back to you.
+
+                @Code(name: "NoteSearch.swift", file: "semantic-search-02-02.swift")
+            }
+
+            @Step {
+                To search, embed the query with the same provider, then search
+                the index with the resulting vector. The query and the indexed
+                content must come from the same embedding model — vectors from
+                different models aren't comparable.
+
+                @Code(name: "NoteSearch.swift", file: "semantic-search-02-03.swift")
+            }
+
+            @Step {
+                Put it together. The query "a dog chasing a ball" returns the
+                golden retriever note as its closest match — the two phrases
+                share no meaningful words. That's the embedding model recognizing
+                that dogs, retrievers, balls, and fetch belong together.
+
+                @Code(name: "NoteSearch.swift", file: "semantic-search-02-04.swift")
+            }
+        }
+    }
+
+    @Section(title: "Persist and reload") {
+        @ContentAndMedia {
+            Embedding and indexing cost time at startup, so ProximaKit ships a
+            versioned binary format that saves a full index — vectors, graph,
+            and metadata — and loads it back directly, with no re-embedding and
+            no graph rebuild.
+
+            Saving compacts the index first, so tombstones from removed vectors
+            never reach disk.
+        }
+
+        @Steps {
+            @Step {
+                Save the index with ``HNSWIndex/save(to:)``. It's an actor
+                method that throws on I/O failure, so call it with `try await`.
+
+                @Code(name: "PersistAndReload.swift", file: "semantic-search-03-01.swift")
+            }
+
+            @Step {
+                Load it back with ``HNSWIndex/load(from:)``. It's a static
+                factory — no index instance needed, and no `await` — that
+                rebuilds a ready-to-search ``HNSWIndex`` from the file, throwing
+                if the file is missing or corrupted.
+
+                @Code(name: "PersistAndReload.swift", file: "semantic-search-03-02.swift")
+            }
+
+            @Step {
+                Round-trip your index: save it, reload it, and compare counts.
+                The reloaded index contains every live vector, its metadata, and
+                the full search graph — searches against it return the same
+                results without re-adding anything.
+
+                @Code(name: "PersistAndReload.swift", file: "semantic-search-03-03.swift")
+            }
+        }
+    }
+}

@@ -61,7 +61,7 @@ for sentence in sentences {
 
 ```swift
 let query = try await embedder.embed("pets and animals")
-let results = try await index.search(query: query, k: 2)
+let results = await index.search(query: query, k: 2)
 
 for result in results {
     if let data = result.metadata,
@@ -89,6 +89,7 @@ let loaded = try HNSWIndex.load(from: fileURL)
 
 ### Next Steps
 
-- Use ``VisionEmbeddingProvider`` for image search
-- Use ``CoreMLEmbeddingProvider`` for higher quality with custom models
+- Prefer a guided, step-by-step format? Follow the interactive tutorial: <doc:SemanticSearch>
+- Use `VisionEmbeddingProvider` for image search
+- Use `CoreMLEmbeddingProvider` for higher quality with custom models
 - Adjust ``HNSWConfiguration`` to tune recall vs speed

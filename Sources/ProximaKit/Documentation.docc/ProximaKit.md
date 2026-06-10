@@ -28,6 +28,7 @@ let results = await index.search(query: queryVector, k: 10)
 
 ### Essentials
 
+- <doc:MeetProximaKit>
 - <doc:GettingStarted>
 - ``Vector``
 - ``HNSWIndex``

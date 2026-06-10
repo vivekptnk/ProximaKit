@@ -1,0 +1,20 @@
+@Tutorials(name: "ProximaKit") {
+    @Intro(title: "Meet ProximaKit") {
+        ProximaKit brings semantic search to Apple platforms — entirely on-device,
+        in pure Swift, with no server and no API keys.
+
+        These interactive tutorials walk you through the core workflow: build a
+        vector index, search it by meaning using Apple's NaturalLanguage
+        embeddings, and persist it to disk so your app never has to rebuild it.
+    }
+
+    @Chapter(name: "Semantic Search Essentials") {
+        Build a complete semantic search pipeline step by step: create an
+        ``HNSWIndex`` and add vectors to it, turn text into vectors with
+        `NLEmbeddingProvider`, and save the finished index to disk.
+
+        @Image(source: "tutorial-semantic-search-chapter.png", alt: "A constellation-style graph of vectors. A highlighted search path descends from an entry node to the nearest neighbor, which is marked in a contrasting color.")
+
+        @TutorialReference(tutorial: "doc:SemanticSearch")
+    }
+}

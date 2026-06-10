@@ -20,6 +20,8 @@ let package = Package(
     products: [
         .library(name: "ProximaKit", targets: ["ProximaKit"]),
         .library(name: "ProximaEmbeddings", targets: ["ProximaEmbeddings"]),
+        // Runnable example: on-device RAG over your notes (docs/RAG-TUTORIAL.md).
+        .executable(name: "OnDeviceRAG", targets: ["OnDeviceRAG"]),
     ],
 
     dependencies: [
@@ -51,6 +53,18 @@ let package = Package(
         .executableTarget(
             name: "ProximaDemo",
             dependencies: ["ProximaKit", "ProximaEmbeddings"],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency"),
+            ]
+        ),
+
+        // ── On-Device RAG Example ─────────────────────────────────────
+        // Lives under Examples/ so the code sits next to its tutorial
+        // (docs/RAG-TUTORIAL.md). Run with: swift run OnDeviceRAG
+        .executableTarget(
+            name: "OnDeviceRAG",
+            dependencies: ["ProximaKit", "ProximaEmbeddings"],
+            path: "Examples/OnDeviceRAG",
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency"),
             ]
