@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integrity check for the SIFT1M dataset used by .github/workflows/benchmark.yml.
+# Integrity check for the SIFT1M dataset used by .github/workflows/benchmark-core.yml (workflow_call core shared by benchmark.yml jobs).
 #
 # The upstream archive is served from a plain-FTP mirror with no published
 # checksum, so a truncated or corrupted transfer would otherwise flow silently

@@ -1,6 +1,6 @@
 # On-Device RAG: Private Answers Over Your Notes
 
-*Retrieval-augmented generation in ~100 lines of Swift — no server, no API key, no internet.*
+*Retrieval-augmented generation in ~130 lines of Swift — no server, no API key, no internet.*
 
 The runnable example lives in [`Examples/OnDeviceRAG/`](../Examples/OnDeviceRAG/). Three files:
 

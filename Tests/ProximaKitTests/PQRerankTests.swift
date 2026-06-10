@@ -142,7 +142,7 @@ final class PQRerankTests: XCTestCase {
             ids: ids,
             dimension: dim,
             hnswConfig: hnswConfig,
-            pqConfig: PQConfiguration(subspaceCount: 16, trainingIterations: 15),
+            pqConfig: PQConfiguration(subspaceCount: 16, trainingIterations: 15, seed: 0x5EED_0012),
             retainOriginals: true
         )
 

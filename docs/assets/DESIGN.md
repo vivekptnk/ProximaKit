@@ -12,8 +12,8 @@ Apple-grade discipline. Every SVG asset in this directory follows these rules.
 
 ## Typography
 - NO `<text>` elements with font-family stacks — they render with the viewer's fonts.
-  ALL labels are genuine SF outlines generated via the CoreText tool (`/tmp/outline.swift`,
-  regenerate with: `swift /tmp/outline.swift "<text>" <size> <semibold|regular> <x> <baselineY>`).
+  ALL labels are genuine SF outlines generated via the CoreText tool (`tools/outline.swift`,
+  regenerate with: `swift tools/outline.swift "<text>" <size> <semibold|regular> <x> <baselineY>`).
 - Sizes: titles 20 semibold, labels 13 regular, captions 12 regular (`#86868b`).
 
 ## Motion

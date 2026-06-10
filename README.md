@@ -156,7 +156,7 @@ Or open `Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj` in Xcode for the full
 
 ### Build a RAG App
 
-Retrieval-augmented generation over your own notes — embed, index, retrieve, and let an on-device language model answer with citations. The whole pipeline is ~100 lines of Swift, works in airplane mode, and ships as a runnable target:
+Retrieval-augmented generation over your own notes — embed, index, retrieve, and let an on-device language model answer with citations. The whole pipeline is ~130 lines of Swift, works in airplane mode, and ships as a runnable target:
 
 ```bash
 swift run OnDeviceRAG -question "How long should I steep cold brew?"
@@ -204,7 +204,7 @@ All of this happens **on your device**, using Apple's Accelerate framework for S
 
 ## Demo
 
-**ProximaDemoApp** is a macOS SwiftUI app that ships with the repo. It indexes 48 sample documents at startup and lets you search by meaning in real time, tune `efSearch` with a slider, add your own notes to the live index, and persist across app launches.
+**ProximaDemoApp** is a macOS SwiftUI app that ships with the repo. It indexes 46 sample documents at startup and lets you search by meaning in real time, tune `efSearch` with a slider, add your own notes to the live index, and persist across app launches.
 
 The app now runs on **iPhone, iPad, macOS, and visionOS** from a single SwiftUI target. Real simulator screenshots (semantic search — note zero keyword overlap between query and results):
 
@@ -305,7 +305,7 @@ let hits = await sq.search(query: queryVector, k: 10)
 
 Need to go further? `QuantizedHNSWIndex` (product quantization) compresses 32× — at the cost of a k-means training pass and an L2-only search path. The trade-offs are spelled out in [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md) vs [ADR-011](docs/adr/ADR-011-pq-codec.md).
 
-If recall matters more than the memory win, build the PQ index with `retainOriginals: true`: search then re-scores the top quantized candidates with exact distances before returning, recovering near-full-precision recall ([ADR-012](docs/adr/ADR-012-pq-reranking.md)). Be aware of the trade — retaining originals stores the Float32 vectors again, so you give up the compression story for accuracy.
+If recall matters more than the memory win, build the PQ index with `retainOriginals: true`: search then re-scores the top quantized candidates with exact distances before returning, recovering recall@10 to a CI-asserted ≥ 0.90 floor — observed 0.99–1.00 on the seeded fixtures ([ADR-012](docs/adr/ADR-012-pq-reranking.md)). Be aware of the trade — retaining originals stores the Float32 vectors again, so you give up the compression story for accuracy.
 
 
 ## Search Images

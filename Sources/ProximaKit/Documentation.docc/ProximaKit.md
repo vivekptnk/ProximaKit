@@ -71,6 +71,7 @@ let results = await index.search(query: queryVector, k: 10)
 - ``ScalarQuantizer``
 - ``ScalarQuantizedHNSWIndex``
 - ``ProductQuantizerError``
+- ``QuantizedIndexError``
 
 ### Document Stores
 
@@ -79,6 +80,10 @@ let results = await index.search(query: queryVector, k: 10)
 - ``TextEmbedder``
 - ``ChunkMetadata``
 - ``VectorStoreError``
+
+### GPU Acceleration
+
+- ``MetalBatchDistance``
 
 ### Batch Operations
 

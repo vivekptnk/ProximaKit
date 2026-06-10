@@ -71,6 +71,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   change and corpora larger than RAM. Design only; **not implemented**, and
   it makes no performance claims.
 
+- **Apple-grade visual system** for all README/docs assets: SF Pro outline
+  logo and restyled animated diagram family per `docs/assets/DESIGN.md`.
+
 ### Changed
 - **`HNSWIndex.remove(id:)` repairs dangling incoming edges in
   O(in-degree).** A maintained reverse-adjacency map replaces the previous
