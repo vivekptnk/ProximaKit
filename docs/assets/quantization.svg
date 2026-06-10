@@ -20,13 +20,13 @@
   <text x="20" y="118" class="t">INT8 (SQ)</text>
   <rect class="shrink1" x="150" y="102" width="560" height="22" rx="5" fill="#58a6ff"/>
   <text class="fade" x="306" y="118" fill="#0d1117" font-weight="600">388 B</text>
-  <text class="fade" x="346" y="118" class="dim"> ≈ 3.96× smaller · any metric · no training (ADR-007)</text>
+  <text class="fade dim" x="346" y="118"> ≈ 3.96× smaller · any metric · no training (ADR-007)</text>
 
   <!-- PQ -->
   <text x="20" y="168" class="t">PQ codes</text>
   <rect class="shrink2" x="150" y="152" width="560" height="22" rx="5" fill="#bc8cff"/>
   <text class="fade" x="180" y="168" fill="#bc8cff" font-weight="600">48 B</text>
-  <text class="fade" x="222" y="168" class="dim">≈ 32× smaller · L2 ADC · k-means codebooks (ADR-011)</text>
+  <text class="fade dim" x="222" y="168">≈ 32× smaller · L2 ADC · k-means codebooks (ADR-011)</text>
 
   <text x="20" y="222" class="dim">Both build a full-precision HNSW graph first, then store only compressed codes —</text>
   <text x="20" y="238" class="dim">graph quality stays high while vector memory collapses. Recall floors are CI-asserted.</text>
