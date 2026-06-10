@@ -1,6 +1,6 @@
 # ProximaKit Roadmap
 
-**Updated:** 2026-04-23
+**Updated:** 2026-06-09
 **Current release:** v1.4.0
 
 This document tracks planned improvements across the library, benchmarking harness, and demo experience. Items are grouped by theme, not by release, because ordering depends on dependencies and measured impact.
@@ -37,16 +37,16 @@ ProximaKit currently stores all vectors as `Float32`. The next major memory redu
 
 Store each vector component as a signed 8-bit integer with a per-vector scale factor. Reduces index memory by ~4×; query accuracy degrades by ~1–2% Recall@10 at typical efSearch values. An ADR will document the chosen dequantization point (query-time vs. compare-time) and the tradeoff against vDSP batch alignment requirements.
 
-### Product Quantization (PQ)
+### Product Quantization (PQ) — Shipped (v1.4.0)
 
 Divide each vector into `M` sub-vectors, each quantized to a `K`-centroid codebook. Memory footprint: `N × M × log₂(K)` bits vs. `N × d × 32` bits. Enables 32–128× compression at moderate recall cost.
 
-**Complexity note:** PQ requires a training phase (k-means over the vector population) and adds a codebook persistence format. An ADR is needed before starting implementation to agree on the API surface and codec versioning.
+Implemented in `ProductQuantizer` + `QuantizedHNSWIndex` (asymmetric distance computation, codebook persistence in `ProductQuantizerPersistence`). The codec format is documented in [ADR-011](adr/ADR-011-pq-codec.md).
 
 ### Status
 
-- INT8 scalar quantization: ADR draft in progress (ADR-007)
-- PQ: design phase, no ADR yet
+- PQ: **shipped** — `QuantizedHNSWIndex` with ADC and persistence; retrospective ADR accepted ([ADR-011](adr/ADR-011-pq-codec.md))
+- INT8 scalar quantization: ADR draft in progress (ADR-007), implementation not started
 
 ---
 
@@ -73,14 +73,14 @@ Building a 100K-vector HNSW index on CPU (M-series) currently takes ~30–60 s. 
 
 ## Filtered Search
 
-Support a metadata predicate in `VectorIndex.search(query:k:filter:)` that narrows the candidate set before or during ANN traversal. Two strategies:
+`VectorIndex.search(query:k:efSearch:filter:)` ships with a **post-filter** strategy across all index types (HNSW, BruteForce, QuantizedHNSW, Sparse, Hybrid, and the stores). Two strategies were considered:
 
-| Strategy | Recall | Latency | Notes |
-|----------|--------|---------|-------|
-| Post-filter | Lower (may return < k) | Fast | Simple; degrades with high selectivity |
-| Graph-aware filter | Higher | Slower build | Requires filter-aware neighbour selection in HNSW |
+| Strategy | Recall | Latency | Status |
+|----------|--------|---------|--------|
+| Post-filter | Lower (may return < k) | Fast | **Shipped** — predicate applied during candidate traversal |
+| Graph-aware filter | Higher | Slower build | Planned — requires filter-aware neighbour selection in HNSW |
 
-An ADR will evaluate both strategies against a selectivity benchmark (10%, 1%, 0.1% pass rate) before committing to the API.
+The post-filter decision and the graph-aware upgrade path (with the selectivity benchmark at 10%, 1%, 0.1% pass rates as acceptance criteria) are documented in [ADR-008](adr/ADR-008-filtered-search.md).
 
 ---
 
@@ -88,7 +88,7 @@ An ADR will evaluate both strategies against a selectivity benchmark (10%, 1%, 0
 
 - **Incremental delete:** current `remove(id:)` marks nodes as deleted (tombstone). A background compaction pass to physically remove tombstoned nodes and relink the graph is deferred; it requires an ADR on compaction policy.
 - **Hierarchical NSW variant with dynamic `M`:** vary the number of connections per layer based on layer height to improve recall at low `efSearch` values.
-- **Serialisation versioning:** add a format version byte to `.proxima` files so future changes to the binary layout are detectable and recoverable.
+- **Serialisation versioning:** a magic number (`PXKT`) and format version field are already written and validated on load (`PersistenceError.unsupportedVersion`). What remains is a format-evolution policy — migration strategy across versions — to be settled in ADR-010.
 
 ---
 
@@ -96,11 +96,12 @@ An ADR will evaluate both strategies against a selectivity benchmark (10%, 1%, 0
 
 | ADR | Topic | Status |
 |-----|-------|--------|
-| ADR-006 | Lumen integration (ProximaKit as KV-store backend) | Draft (in `docs/`) |
+| ADR-006 | Lumen integration (ProximaKit as KV-store backend) | Draft (in `docs/adr/`) |
 | ADR-007 | INT8 scalar quantization: dequantization policy + codec format | In progress |
-| ADR-008 | Filtered search: post-filter vs. graph-aware strategy | Not started |
+| ADR-008 | Filtered search: post-filter shipped; document decision + graph-aware upgrade path | Accepted (retrospective) |
 | ADR-009 | Metal backend abstraction layer | Not started |
-| ADR-010 | Serialisation versioning and format evolution | Not started |
+| ADR-010 | Serialisation format evolution policy (version field already shipped) | Accepted |
+| ADR-011 | Product quantization codec format (`PQTT` / `PQHW`, ADC, K=256) | Accepted (retrospective) |
 
 ---
 

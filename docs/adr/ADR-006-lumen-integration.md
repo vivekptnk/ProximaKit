@@ -312,5 +312,5 @@ true: `VectorStore` does not know about `.pxbm` or `hybrid.json`.
 
 Everything listed under "Phase 1: VectorStore" in the original plan is still
 in effect. Hybrid retrieval is additive — it does not replace any v1.1
-behavior or commitment. See [`docs/HYBRID.md`](./HYBRID.md) for the full
+behavior or commitment. See [`docs/HYBRID.md`](../HYBRID.md) for the full
 hybrid-retrieval design and fusion-strategy rationale.
