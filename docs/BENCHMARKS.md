@@ -163,7 +163,7 @@ DistanceMetric: CosineDistance
 
 | Dataset | Dimension | Median Latency |
 |---------|-----------|----------------|
-| 1K vectors | 384d | ~104ms |
+| 1K vectors | 384d | ~104ms (debug-build XCTest harness incl. actor hop — NOT release latency; release-mode p50/p95 come from the nightly cross-library harness) |
 
 **Cold start (mmap load):** ~50ms for a persisted 10K-vector index.
 

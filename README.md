@@ -34,6 +34,12 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 
 > *HNSW implemented from scratch in Swift. Zero dependencies. Zero C++ wrappers.*
 
+<p align="center">
+  <img src="docs/assets/demo-terminal.svg" alt="ProximaDemo live session: semantic search returns Food results for 'something spicy for dinner' and Nature results for 'cozy rainy day reading' in under 3 ms" width="760" />
+</p>
+<p align="center"><sub>Animated replay of a <a href="#demo">real <code>ProximaDemo</code> session</a> — try it: <code>swift run ProximaDemo</code></sub></p>
+
+
 ## What's Inside
 
 | Capability | Details |
@@ -202,7 +208,7 @@ All of this happens **on your device**, using Apple's Accelerate framework for S
 
 **ProximaDemoApp** is a macOS SwiftUI app that ships with the repo. It indexes 48 sample documents at startup and lets you search by meaning in real time, tune `efSearch` with a slider, add your own notes to the live index, and persist across app launches.
 
-Illustrative mock-up of the app layout (ASCII, not a screenshot — build it yourself in one command):
+The animated terminal at the top of this README replays a real `swift run ProximaDemo` CLI session. The GUI app below is an illustrative ASCII mock-up of the layout (not a screenshot — build it yourself in one command):
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -355,7 +361,7 @@ model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
 "
 ```
 
-Place the exported `.mlmodelc` in `Models/` and ProximaKit will discover it automatically.
+Pass the compiled model's URL to `CoreMLEmbeddingProvider(modelAt:vocabURL:)` — the library never scans directories. (The demo app additionally looks for models in its own `Models/` folder as a convenience.)
 
 <p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
@@ -439,8 +445,10 @@ Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full me
  ║              P E R F O R M A N C E                   ║
  ╠══════════════════════════════════════════════════════╣
  ║                                                      ║
- ║  ⚡ Query latency    ~104 ms   (1K × 384d, cosine)  ║
- ║  ⚡ Cold start        ~50 ms   (mmap, 10K vectors)  ║
+ ║  ⚡ Release-mode p50/p95 latency + QPS: published   ║
+ ║     nightly from the FAISS/ScaNN harness (CI        ║
+ ║     artifacts — never hand-copied, never stale)     ║
+ ║  ⚡ Cold start   ~50 ms load (10K-vector index)     ║
  ║                                                      ║
  ║  ◎ Recall@10, real embeddings (512d):               ║
  ║      100% measured  ·  >95% enforced in CI          ║
@@ -590,7 +598,7 @@ swift test -c release --filter RecallBenchmarkTests
 swift package generate-documentation --target ProximaKit
 ```
 
-CI runs the full suite (400+ tests), SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR — plus a benchmark smoke-slice regression gate on PRs that touch the core index.
+CI runs the full functional suite (400+ tests; benchmark classes run separately), SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR — plus a benchmark smoke-slice regression gate on PRs that touch the core index.
 
 <p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 

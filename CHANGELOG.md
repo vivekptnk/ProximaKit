@@ -34,6 +34,9 @@ Correctness fixes from a multi-agent audit (every fix reproduced before patching
 - **Persistence corruption-hardening test matrix** — 42 tests across all four
   binary codecs, covering truncated sections, out-of-range graph indices,
   invalid entry points, and bad configuration values.
+- **DocC published to GitHub Pages** on every push to `main` (`docs.yml`),
+  and **automatic GitHub Releases** with CHANGELOG-extracted notes on version
+  tags (`release.yml`).
 - **CI overhaul:** SwiftLint job (pinned 0.63.2, strict config), iOS Simulator
   build job for `ProximaKit` + `ProximaEmbeddings`, release tag/version/
   changelog consistency check, benchmark regression gate wired to
@@ -46,6 +49,15 @@ Correctness fixes from a multi-agent audit (every fix reproduced before patching
   retrospective). ADR-006 moved into `docs/adr/` with its siblings.
 
 ### Changed
+
+- **`NLEmbeddingProvider` sentence embeddings are now L2-normalized**, matching
+  the word-averaging fallback path (previously only the fallback normalized).
+  Every vector the provider returns now has unit magnitude. **Migration:**
+  indexes persisted from pre-1.5 *unnormalized* sentence vectors will rank
+  differently under `DotProductDistance`/`EuclideanDistance` when queried with
+  the new unit-length vectors — re-embed and rebuild those indexes, or pin to
+  v1.4.x until you can. (`CosineDistance` users are unaffected.)
+
 - **On-disk format v2.** `autoCompactionThreshold` now survives a save/load
   round-trip. Format v1 files still load — see
   [ADR-010](docs/adr/ADR-010-format-evolution.md) for the evolution policy.

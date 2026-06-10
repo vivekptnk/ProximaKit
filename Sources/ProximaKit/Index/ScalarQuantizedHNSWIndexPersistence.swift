@@ -37,11 +37,77 @@ private let sqHeaderSize = 64
 
 extension ScalarQuantizedHNSWIndex {
 
+    /// Live-only view of the index state for serialization.
+    ///
+    /// `remove(id:)` tombstones a slot (deletes the `uuidToNode` entry) but
+    /// leaves the UUID in `nodeToUUID`. Writing raw slots would let `load`
+    /// rebuild `uuidToNode` for EVERY slot — resurrecting deleted vectors,
+    /// over-reporting `liveCount`, and re-opening the entry-point-collapse
+    /// failure mode the identity-liveness fix closed (CHA-201 signoff
+    /// finding). The full-precision index compacts before snapshotting;
+    /// quantized indexes compact equivalently here, at save time.
+    private func compactedForSave() -> (
+        codes: [[Int8]], scales: [Float], uuids: [UUID], levels: [Int],
+        metadata: [Data?], layers: [[[Int]]], entryPoint: Int?, maxLevel: Int
+    ) {
+        // Fast path: no tombstones — serialize state as-is (byte-identical
+        // to the pre-compaction format, and no array copies).
+        if uuidToNode.count == nodeToUUID.count {
+            return (codes, scales, nodeToUUID, nodeLevels, metadata,
+                    layers, entryPointNode, maxLevel)
+        }
+
+        // Dense renumbering of live slots (identity check, not presence).
+        var oldToNew = [Int: Int]()
+        var newCodes: [[Int8]] = []
+        var newScales: [Float] = []
+        var newUUIDs: [UUID] = []
+        var newLevels: [Int] = []
+        var newMetadata: [Data?] = []
+        for (node, uuid) in nodeToUUID.enumerated() where uuidToNode[uuid] == node {
+            oldToNew[node] = newUUIDs.count
+            newCodes.append(codes[node])
+            newScales.append(scales[node])
+            newUUIDs.append(uuid)
+            newLevels.append(nodeLevels[node])
+            newMetadata.append(metadata[node])
+        }
+
+        // Remap adjacency, dropping any edge into a tombstoned slot.
+        let newMaxLevel = newLevels.max() ?? -1
+        var newLayers: [[[Int]]] = []
+        newLayers.reserveCapacity(newMaxLevel + 1)
+        for l in 0..<(newMaxLevel + 1) {
+            var layer = [[Int]](repeating: [], count: newUUIDs.count)
+            if l < layers.count {
+                for (old, new) in oldToNew where old < layers[l].count {
+                    layer[new] = layers[l][old].compactMap { oldToNew[$0] }
+                }
+            }
+            newLayers.append(layer)
+        }
+
+        // Entry point: remap if live; otherwise fall back to the
+        // highest-level live node (defensive — remove() already keeps the
+        // entry point live in memory).
+        var newEntry: Int? = entryPointNode.flatMap { oldToNew[$0] }
+        if newEntry == nil, let best = newLevels.indices.max(by: { newLevels[$0] < newLevels[$1] }) {
+            newEntry = best
+        }
+
+        return (newCodes, newScales, newUUIDs, newLevels, newMetadata,
+                newLayers, newEntry, newMaxLevel)
+    }
+
     /// Saves this scalar-quantized index to a binary file.
+    ///
+    /// Tombstoned (removed) slots are compacted out at save time, so a
+    /// loaded index contains exactly the live vectors (`count == liveCount`).
     public func save(to url: URL) throws {
         var data = Data()
 
-        let nodeCount = codes.count
+        let live = compactedForSave()
+        let nodeCount = live.codes.count
 
         // Header (64 bytes)
         sqAppendLE(&data, sqMagic)
@@ -52,9 +118,9 @@ extension ScalarQuantizedHNSWIndex {
         sqAppendLE(&data, UInt32(hnswConfig.m))
         sqAppendLE(&data, UInt32(hnswConfig.efConstruction))
         sqAppendLE(&data, UInt32(hnswConfig.efSearch))
-        sqAppendLE(&data, Int32(maxLevel))
-        sqAppendLE(&data, Int32(entryPointNode ?? -1))
-        sqAppendLE(&data, UInt32(layers.count))
+        sqAppendLE(&data, Int32(live.maxLevel))
+        sqAppendLE(&data, Int32(live.entryPoint ?? -1))
+        sqAppendLE(&data, UInt32(live.layers.count))
         // autoCompactionThreshold: Float64 bit pattern; all-zero bits = nil.
         // (A real threshold is never 0.0 — HNSWConfiguration requires (0, 1).)
         let thresholdBits = hnswConfig.autoCompactionThreshold?.bitPattern ?? 0
@@ -65,26 +131,26 @@ extension ScalarQuantizedHNSWIndex {
         assert(data.count == sqHeaderSize)
 
         // Scales: nodeCount * Float32
-        scales.withUnsafeBytes { data.append(contentsOf: $0) }
+        live.scales.withUnsafeBytes { data.append(contentsOf: $0) }
 
         // Codes: nodeCount * dimension Int8
-        for code in codes {
+        for code in live.codes {
             code.withUnsafeBytes { data.append(contentsOf: $0) }
         }
 
         // UUIDs: nodeCount * 16 bytes
-        for uuid in nodeToUUID {
+        for uuid in live.uuids {
             let (u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11, u12, u13, u14, u15) = uuid.uuid
             data.append(contentsOf: [u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11, u12, u13, u14, u15])
         }
 
         // Node levels: nodeCount * Int32
-        for level in nodeLevels {
+        for level in live.levels {
             sqAppendLE(&data, Int32(level))
         }
 
         // Graph: for each layer, for each node, write neighbor count + neighbors
-        for layer in layers {
+        for layer in live.layers {
             for neighbors in layer {
                 sqAppendLE(&data, UInt32(neighbors.count))
                 for n in neighbors {
@@ -94,7 +160,7 @@ extension ScalarQuantizedHNSWIndex {
         }
 
         // Metadata: JSON-encoded
-        let metadataPayload = try JSONEncoder().encode(metadata.map { $0.map { Array($0) } })
+        let metadataPayload = try JSONEncoder().encode(live.metadata.map { $0.map { Array($0) } })
         sqAppendLE(&data, UInt32(metadataPayload.count))
         data.append(metadataPayload)
 

@@ -340,4 +340,61 @@ final class ScalarQuantizationPersistenceTests: XCTestCase {
         XCTAssertTrue(results.isEmpty)
     }
 
+
+    /// remove -> save -> load must NOT resurrect tombstoned ids (CHA-201
+    /// final-signoff blocker): save compacts dead slots out, so the loaded
+    /// index contains exactly the live set and entry-point recovery can
+    /// never promote a resurrected isolated tombstone.
+    func testRemoveSaveLoadDoesNotResurrectTombstones() async throws {
+        var rng = SeededRandom(seed: 0x0DEAD_5107)
+        var vectors: [Vector] = []
+        var ids: [UUID] = []
+        for _ in 0..<40 {
+            vectors.append(Vector((0..<8).map { _ in Float.random(in: -1...1, using: &rng) }))
+            ids.append(UUID())
+        }
+        let index = try await ScalarQuantizedHNSWIndex.build(
+            vectors: vectors, ids: ids, dimension: 8,
+            hnswConfig: HNSWConfiguration(m: 8, efConstruction: 100, efSearch: 50,
+                                          levelSeed: 0x5107_5EED),
+            metric: .euclidean
+        )
+        let removed = Array(ids.prefix(10))
+        for id in removed {
+            let ok = await index.remove(id: id)
+            XCTAssertTrue(ok)
+        }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sq-tombstone-\(UUID().uuidString).sqhw")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await index.save(to: url)
+        let loaded = try ScalarQuantizedHNSWIndex.load(from: url)
+
+        let count = await loaded.count
+        let live = await loaded.liveCount
+        XCTAssertEqual(count, 30, "dead slots must be compacted out at save")
+        XCTAssertEqual(live, 30)
+
+        // Removed ids are gone: re-removing returns false, search never
+        // returns them, and live vectors remain reachable.
+        for id in removed {
+            let again = await loaded.remove(id: id)
+            XCTAssertFalse(again, "tombstoned id must not be resurrected by load")
+        }
+        let removedSet = Set(removed)
+        for q in [10, 20, 39] {
+            let results = await loaded.search(query: vectors[q], k: 10)
+            XCTAssertFalse(results.isEmpty)
+            XCTAssertTrue(results.allSatisfy { !removedSet.contains($0.id) })
+        }
+
+        // Entry-point stress: remove the likely entry survivors and verify
+        // search still works (no isolated-tombstone promotion).
+        for id in ids[10..<20] { await loaded.remove(id: id) }
+        let after = await loaded.search(query: vectors[25], k: 5)
+        XCTAssertFalse(after.isEmpty)
+        XCTAssertTrue(after.allSatisfy { !removedSet.contains($0.id) })
+    }
+
 }

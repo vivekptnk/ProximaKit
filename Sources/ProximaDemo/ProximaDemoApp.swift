@@ -66,10 +66,14 @@ struct ProximaDemoApp {
         // Step 4: Interactive search loop
         while true {
             print("🔍 Search: ", terminator: "")
-            guard let input = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !input.isEmpty else {
-                continue
+            // nil means EOF (piped input exhausted or terminal closed) —
+            // exit cleanly rather than spinning on the prompt forever.
+            guard let line = readLine() else {
+                print("\nBye!")
+                break
             }
+            let input = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if input.isEmpty { continue }
 
             if input.lowercased() == "quit" || input.lowercased() == "exit" {
                 print("\nBye!")

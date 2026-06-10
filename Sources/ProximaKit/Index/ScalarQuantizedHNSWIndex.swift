@@ -168,7 +168,9 @@ public actor ScalarQuantizedHNSWIndex {
     ///   - dimension: Vector dimension.
     ///   - hnswConfig: Configuration for the HNSW graph.
     ///   - metric: The distance metric to build and search with. Any
-    ///     serializable metric is supported (unlike PQ's L2-only ADC).
+    ///     serializable metric except Hamming is supported (unlike PQ's
+    ///     L2-only ADC). Hamming compares exact bit equality, which lossy
+    ///     reconstruction destroys — use `HNSWIndex` for Hamming workloads.
     /// - Returns: A `ScalarQuantizedHNSWIndex` ready for search.
     /// - Throws: `IndexError.dimensionMismatch` if a vector has the wrong dimension.
     public static func build(

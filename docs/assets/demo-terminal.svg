@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 480" font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
+  <style>
+    .t { fill: #c9d1d9; }
+    .dim { fill: #8b949e; }
+    .ok { fill: #3fb950; }
+    .warn { fill: #d29922; }
+    .prompt { fill: #58a6ff; font-weight: 600; }
+    .reveal { opacity: 0; animation: reveal 14s linear infinite; }
+    .q1 { animation-delay: 0.6s; }
+    .r1 { animation-delay: 1.6s; }
+    .q2 { animation-delay: 6.6s; }
+    .r2 { animation-delay: 7.6s; }
+    @keyframes reveal {
+      0%, 3% { opacity: 0; }
+      6% { opacity: 1; }
+      95% { opacity: 1; }
+      100% { opacity: 0; }
+    }
+    .cursor { animation: blink 1.1s steps(1) infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+  </style>
+
+  <rect fill="#0d1117" width="760" height="480" rx="10"/>
+  <path fill="#161b22" d="M0 10 A10 10 0 0 1 10 0 H750 A10 10 0 0 1 760 10 V34 H0 Z"/>
+  <circle cx="22" cy="17" r="6" fill="#ff5f57"/>
+  <circle cx="42" cy="17" r="6" fill="#febc2e"/>
+  <circle cx="62" cy="17" r="6" fill="#28c840"/>
+  <text x="380" y="21" text-anchor="middle" class="dim" font-size="12">ProximaDemo — semantic search, on-device</text>
+
+  <text x="24" y="62" class="dim">$ swift run -c release ProximaDemo</text>
+  <text x="24" y="84" class="t">Indexed <tspan class="ok">52 sentences</tspan> in <tspan class="ok">207ms</tspan>  ·  NLEmbedding 512d  ·  HNSW index</text>
+
+  <!-- Query 1: real session output -->
+  <text x="24" y="118" class="prompt">❯ search:</text>
+  <text x="118" y="118" class="t reveal q1">something spicy for dinner</text>
+
+  <g class="reveal r1">
+    <text x="40" y="144" class="t">1. <tspan class="warn">●</tspan> 0.507  The chef prepared a delicious chocolate souffle</text>
+    <text x="66" y="160" class="dim">Food</text>
+    <text x="40" y="180" class="t">2. <tspan class="warn">●</tspan> 0.576  Homemade bread fills the kitchen with a wonderful aroma</text>
+    <text x="66" y="196" class="dim">Food</text>
+    <text x="40" y="216" class="t">3. <tspan class="warn">●</tspan> 0.596  A warm bowl of soup is perfect on a cold winter day</text>
+    <text x="66" y="232" class="dim">Food</text>
+    <text x="40" y="254" class="ok">⏱ 2.9ms</text>
+  </g>
+
+  <!-- Query 2: real session output -->
+  <g class="reveal q2">
+    <text x="24" y="288" class="prompt">❯ search:</text>
+    <text x="118" y="288" class="t">cozy rainy day reading</text>
+  </g>
+
+  <g class="reveal r2">
+    <text x="40" y="314" class="t">1. <tspan class="warn">●</tspan> 0.503  Snow covered mountains glisten in the morning sunlight</text>
+    <text x="66" y="330" class="dim">Nature</text>
+    <text x="40" y="350" class="t">2. <tspan class="warn">●</tspan> 0.555  Lightning illuminated the dark storm clouds overhead</text>
+    <text x="66" y="366" class="dim">Nature</text>
+    <text x="40" y="386" class="t">3. <tspan class="warn">●</tspan> 0.567  A warm bowl of soup is perfect on a cold winter day</text>
+    <text x="66" y="402" class="dim">Food</text>
+    <text x="40" y="424" class="ok">⏱ 2.8ms</text>
+  </g>
+
+  <text x="24" y="458" class="dim">— real session output · zero keyword overlap · top 3 of 5 shown —</text>
+  <rect class="cursor" x="736" y="446" width="7" height="13" fill="#58a6ff"/>
+</svg>

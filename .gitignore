@@ -30,6 +30,7 @@ venv/
 
 # Claude Code (internal dev tooling)
 .claude/
+.harness/
 
 # Internal planning & docs (kept locally, not public)
 docs/PRD.md
