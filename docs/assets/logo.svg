@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 280" role="img" aria-label="ProximaKit — vector search constellation logo">
+  <defs>
+    <linearGradient id="wordmark" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#58a6ff"/>
+      <stop offset="55%" stop-color="#7d8df9"/>
+      <stop offset="100%" stop-color="#bc8cff"/>
+    </linearGradient>
+    <radialGradient id="starGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#bc8cff" stop-opacity="0.9"/>
+      <stop offset="60%" stop-color="#bc8cff" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#bc8cff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="queryGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#58a6ff" stop-opacity="0.9"/>
+      <stop offset="60%" stop-color="#58a6ff" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#58a6ff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <style>
+    .edge { stroke: #8b949e; stroke-opacity: 0.45; stroke-width: 1.2; fill: none; }
+    .edge-hot { stroke: url(#wordmark); stroke-width: 1.8; fill: none;
+      stroke-dasharray: 220; stroke-dashoffset: 220;
+      animation: trace 6s ease-in-out infinite; }
+    @keyframes trace {
+      0%, 8%   { stroke-dashoffset: 220; opacity: 0.9; }
+      38%      { stroke-dashoffset: 0;   opacity: 0.9; }
+      72%      { stroke-dashoffset: 0;   opacity: 0.9; }
+      92%, 100%{ stroke-dashoffset: 0;   opacity: 0; }
+    }
+    .node { fill: #8b949e; }
+    .tw { animation: twinkle 3.4s ease-in-out infinite; }
+    .t2 { animation-delay: 0.9s; } .t3 { animation-delay: 1.7s; } .t4 { animation-delay: 2.5s; }
+    @keyframes twinkle { 0%,100% { opacity: 0.45; } 50% { opacity: 1; } }
+    .proxima { animation: flare 6s ease-in-out infinite; transform-origin: 196px 96px; }
+    @keyframes flare {
+      0%, 34%  { opacity: 0.35; transform: scale(0.7); }
+      44%, 78% { opacity: 1;    transform: scale(1); }
+      94%,100% { opacity: 0.35; transform: scale(0.7); }
+    }
+    .ring { fill: none; stroke: #58a6ff; stroke-width: 1.5;
+      animation: ping 6s ease-out infinite; transform-origin: 60px 188px; }
+    @keyframes ping {
+      0%, 4%  { transform: scale(0.4); opacity: 0; }
+      10%     { opacity: 0.8; }
+      30%     { transform: scale(2.2); opacity: 0; }
+      100%    { transform: scale(2.2); opacity: 0; }
+    }
+    .tagline { fill: #8b949e; }
+  </style>
+
+  <!-- ── Constellation mark ──────────────────────────────────────── -->
+  <!-- background edges (the wider graph) -->
+  <path class="edge" d="M60 188 L118 210 M118 210 L170 232 M118 210 L150 156 M150 156 L196 96 M150 156 L226 170 M226 170 L196 96 M226 170 L268 214 M150 156 L92 120 M92 120 L196 96 M92 120 L48 70 M48 70 L130 46 M130 46 L196 96 M268 214 L290 150 M290 150 L196 96"/>
+
+  <!-- the greedy search path: query → … → Proxima (drawn-in, gradient) -->
+  <path class="edge-hot" d="M60 188 L118 210 L150 156 L196 96"/>
+
+  <!-- background nodes (stars) -->
+  <circle class="node tw"    cx="118" cy="210" r="3.2"/>
+  <circle class="node tw t2" cx="170" cy="232" r="2.4"/>
+  <circle class="node tw t3" cx="150" cy="156" r="3.4"/>
+  <circle class="node tw t4" cx="226" cy="170" r="2.8"/>
+  <circle class="node tw t2" cx="92"  cy="120" r="2.8"/>
+  <circle class="node tw t4" cx="48"  cy="70"  r="2.2"/>
+  <circle class="node tw t3" cx="130" cy="46"  r="2.6"/>
+  <circle class="node tw"    cx="268" cy="214" r="2.2"/>
+  <circle class="node tw t2" cx="290" cy="150" r="2.4"/>
+
+  <!-- query point: blue, pinging -->
+  <circle class="ring" cx="60" cy="188" r="10"/>
+  <circle cx="60" cy="188" r="14" fill="url(#queryGlow)"/>
+  <circle cx="60" cy="188" r="4.2" fill="#58a6ff"/>
+
+  <!-- traveling pulse along the search path (SMIL: renders inside <img>) -->
+  <circle r="3.4" fill="#bc8cff">
+    <animateMotion dur="6s" repeatCount="indefinite"
+      keyPoints="0;0;1;1" keyTimes="0;0.08;0.38;1" calcMode="linear"
+      path="M60 188 L118 210 L150 156 L196 96"/>
+    <animate attributeName="opacity" dur="6s" repeatCount="indefinite"
+      values="0;1;1;0;0" keyTimes="0;0.08;0.36;0.44;1"/>
+  </circle>
+
+  <!-- Proxima: the nearest neighbor, flaring when found -->
+  <g class="proxima">
+    <circle cx="196" cy="96" r="30" fill="url(#starGlow)"/>
+    <path fill="#e2c6ff" d="M196 74 L201 91 L218 96 L201 101 L196 118 L191 101 L174 96 L191 91 Z"/>
+    <circle cx="196" cy="96" r="3.6" fill="#ffffff"/>
+  </g>
+
+  <!-- ── Wordmark ────────────────────────────────────────────────── -->
+  <text x="340" y="138" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', system-ui, sans-serif"
+        font-size="64" font-weight="700" letter-spacing="-1" fill="url(#wordmark)">ProximaKit</text>
+  <text x="343" y="178" class="tagline"
+        font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif"
+        font-size="19" letter-spacing="0.4">Search by meaning, not keywords — on-device, pure Swift.</text>
+
+  <!-- orbit accent under wordmark -->
+  <path d="M343 200 H 812" stroke="#30363d" stroke-width="1"/>
+  <circle r="2.6" fill="#58a6ff">
+    <animateMotion dur="7s" repeatCount="indefinite" path="M343 200 H 812"/>
+    <animate attributeName="opacity" dur="7s" repeatCount="indefinite"
+      values="0;1;1;0" keyTimes="0;0.06;0.94;1"/>
+  </circle>
+</svg>

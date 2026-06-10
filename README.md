@@ -1,21 +1,7 @@
 <p align="center">
-
-```
-                                ·
-                               /|\
-                          · ─── ◆ ─── ·
-                         /·\   /|\   /·\
-                    · ──◆──── ◆───◆ ────◆── ·
-                   / / /|\ \ /|\ /|\ / |\ \ \
-                  · · · · · · · · · · · · · · ·
-
-           ╔═══════════════════════════════════════════╗
-           ║           P R O X I M A K I T             ║
-           ║     Search by meaning, not keywords.      ║
-           ╚═══════════════════════════════════════════╝
-```
-
-  <p align="center">
+  <img src="docs/assets/logo.svg" alt="ProximaKit — animated constellation logo: a query point pulses, a search path traces through an HNSW graph of stars, and the nearest neighbor flares" width="880" />
+</p>
+<p align="center">
     Pure-Swift vector search for Apple platforms — powered by Accelerate.
   </p>
   <p align="center">
