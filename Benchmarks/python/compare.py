@@ -4,6 +4,13 @@ Usage:
     python compare.py --in out/ --out compare.md
     python compare.py --in out/ --format markdown
     python compare.py --in out/ --format json   # machine-readable dump
+
+Regression gate (used by the PR smoke job in .github/workflows/benchmark.yml):
+    python compare.py --in out/ --min-recall 0.90 --gate-library ProximaKit
+
+With --min-recall set, the process exits non-zero if any result row for the
+gated library reports recallAt10 below the threshold, or if no rows for that
+library are present at all (a silently missing run must not pass the gate).
 """
 
 from __future__ import annotations
@@ -24,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default=None,
                    help="output path (default: stdout)")
     p.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    p.add_argument("--min-recall", type=float, default=None,
+                   help="exit non-zero if the gated library's recallAt10 falls "
+                        "below this threshold on any result row")
+    p.add_argument("--gate-library", default="ProximaKit",
+                   help="library name the --min-recall gate applies to "
+                        "(default: ProximaKit)")
     return p.parse_args()
 
 
@@ -45,6 +58,34 @@ def main() -> int:
         sys.stderr.write(f"[compare] wrote {args.out}\n")
     else:
         sys.stdout.write(body)
+
+    if args.min_recall is not None:
+        return _check_recall_gate(results, args.gate_library, args.min_recall)
+    return 0
+
+
+def _check_recall_gate(results: list[dict[str, Any]], library: str,
+                       min_recall: float) -> int:
+    """Return 0 if every row for `library` meets `min_recall`, else 1."""
+    rows = [r for r in results if r.get("library") == library]
+    if not rows:
+        sys.stderr.write(
+            f"[compare] GATE FAIL: no results for library '{library}' — "
+            "a missing run must not pass the recall gate\n"
+        )
+        return 1
+    failures = [r for r in rows if r.get("recallAt10", 0.0) < min_recall]
+    for r in failures:
+        sys.stderr.write(
+            f"[compare] GATE FAIL: {r['_path']}: {library} recall@10 "
+            f"{r.get('recallAt10', 0.0):.4f} < threshold {min_recall:.4f}\n"
+        )
+    if failures:
+        return 1
+    sys.stderr.write(
+        f"[compare] gate passed: {len(rows)} {library} row(s) >= "
+        f"recall {min_recall:.4f}\n"
+    )
     return 0
 
 
@@ -91,20 +132,24 @@ def _render_markdown(results: list[dict[str, Any]]) -> str:
         rows = sorted(groups[dataset], key=lambda r: (r["library"], r["indexParams"].get("efSearch", 0)))
         first = rows[0]
         buf.append(f"\n## {dataset}\n")
+        # Metric is rendered per-row below: a dataset group may legitimately
+        # mix metrics (e.g. ScaNN evaluated as cosine against a cosine GT,
+        # next to L2 HNSW rows), so a single group-level metric would lie.
         buf.append(
-            f"- **Size**: {first['datasetSize']:,} vectors, {first['dimension']}d, metric `{first['metric']}`\n"
+            f"- **Size**: {first['datasetSize']:,} vectors, {first['dimension']}d\n"
             f"- **k**: {first['k']}, queries: {first['queryCount']:,}\n"
             f"- **Runner**: {first['platform']['cpuModel']} / {first['platform']['os']} {first['platform']['kernel']}\n"
         )
         buf.append("\n")
-        buf.append("| Library | Params | Build (s) | p50 (ms) | p95 (ms) | QPS | Recall@k | RSS (MB) |\n")
-        buf.append("|---------|--------|-----------|----------|----------|-----|----------|----------|\n")
+        buf.append("| Library | Params | Metric | Build (s) | p50 (ms) | p95 (ms) | QPS | Recall@k | RSS (MB) |\n")
+        buf.append("|---------|--------|--------|-----------|----------|----------|-----|----------|----------|\n")
         for r in rows:
             params = _fmt_params(r["indexParams"])
             buf.append(
-                "| {lib} | {params} | {build:.2f} | {p50:.2f} | {p95:.2f} | {qps:.0f} | {recall:.3f} | {rss:.1f} |\n".format(
+                "| {lib} | {params} | {metric} | {build:.2f} | {p50:.2f} | {p95:.2f} | {qps:.0f} | {recall:.3f} | {rss:.1f} |\n".format(
                     lib=r["library"],
                     params=params,
+                    metric=r["metric"],
                     build=r["buildTimeSeconds"],
                     p50=r["searchLatencyP50Ms"],
                     p95=r["searchLatencyP95Ms"],

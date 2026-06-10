@@ -2,7 +2,8 @@
 // ProximaEmbeddings
 //
 // Text → Vector using Apple's NaturalLanguage framework.
-// Uses sentence embeddings when available, falls back to word-level averaging.
+// Uses sentence embeddings when the language has a sentence model,
+// falls back to word-level averaging otherwise.
 
 import NaturalLanguage
 import ProximaKit
@@ -18,9 +19,19 @@ import ProximaKit
 /// ```
 ///
 /// **How it works:**
-/// - iOS 17+/macOS 14+: Uses `NLEmbedding.sentenceEmbedding` for full-sentence vectors
-/// - Fallback: Splits text into words, embeds each with `NLEmbedding.wordEmbedding`,
-///   then averages the word vectors. Simple but effective for short texts.
+/// The path is chosen once at init, based on which models the OS ships for
+/// the requested language (not on the OS version — the package's minimum
+/// platforms already include sentence embeddings):
+/// - If `NLEmbedding.sentenceEmbedding(for:)` returns a model for the
+///   language, full-sentence vectors are used.
+/// - Otherwise, if only `NLEmbedding.wordEmbedding(for:)` is available, the
+///   text is split into words, each word is embedded, and the word vectors
+///   are averaged. Simple but effective for short texts.
+///
+/// **Output magnitude:** Both paths return L2-normalized (unit-length)
+/// vectors, so the provider's output is safe to use with
+/// `DotProductDistance` and yields consistent `EuclideanDistance` behavior
+/// regardless of which path the language selected.
 ///
 /// **Dimension:** Depends on the language model. English word embeddings are typically 512d.
 public struct NLEmbeddingProvider: EmbeddingProvider, Sendable {
@@ -59,10 +70,12 @@ public struct NLEmbeddingProvider: EmbeddingProvider, Sendable {
 
     /// Embeds a text string into a vector.
     ///
-    /// Uses sentence embedding if available, otherwise averages word embeddings.
+    /// Uses sentence embedding if the language has a sentence model,
+    /// otherwise averages word embeddings.
     ///
     /// - Parameter text: The text to embed. Must not be empty.
-    /// - Returns: A vector representing the text's meaning.
+    /// - Returns: An L2-normalized (unit-length) vector representing the
+    ///   text's meaning.
     public func embed(_ text: String) async throws -> Vector {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -89,7 +102,9 @@ public struct NLEmbeddingProvider: EmbeddingProvider, Sendable {
             )
         }
 
-        return Vector(vector.map { Float($0) })
+        // Normalize to unit length so both paths share the same magnitude
+        // contract (the word-averaging fallback below also normalizes).
+        return Vector(vector.map { Float($0) }).normalized()
     }
 
     // ── Word Averaging Fallback ───────────────────────────────────────

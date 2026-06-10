@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded runs on the same ref — force-pushed PR branches otherwise
+# stack redundant macOS runs (the most expensive runner class).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  XCODE_VERSION: "16.2"
+
 jobs:
   build-and-test:
     name: Build & Test
@@ -14,20 +23,106 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+        run: sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
 
+      # Cache strategy:
+      # - Caches `.build` plus `~/Library/Caches/org.swift.swiftpm` (the macOS
+      #   SwiftPM package/repository cache; `~/.cache/org.swift.swiftpm` is the
+      #   Linux XDG path and is never written on macOS runners).
+      # - Package.resolved is gitignored (not present after checkout), so the
+      #   key hashes Package.swift plus the source tree instead. actions/cache
+      #   only uploads on an exact-key miss, so including the sources keeps the
+      #   `.build` snapshot rolling forward with every code change; restore-keys
+      #   falls back to the nearest previous snapshot for incremental builds.
+      # - Keyed on the Xcode version so a runner-image toolchain roll doesn't
+      #   restore a `.build` that SwiftPM will invalidate wholesale anyway.
+      # - The `swiftpm-` key namespace is distinct from benchmark.yml's
+      #   `sift1m-` dataset cache. Keep this entry small (Debug + Release of a
+      #   ~6K LOC package) so it does not push the ~500 MB SIFT1M blob out of
+      #   the repository's 10 GiB cache quota.
+      - name: Cache Swift build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Tests/**/*.swift') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-
+
+      # Warnings-as-errors is CI-only (not in Package.swift) so consumers
+      # building with future compilers are unaffected. Verified warning-free
+      # with a clean `swift build -Xswiftc -warnings-as-errors` before adding.
       - name: Build (Debug)
-        run: swift build
+        run: swift build -Xswiftc -warnings-as-errors
 
       - name: Build (Release)
         run: swift build -c release
 
       - name: Run Tests
         run: swift test --skip RecallBenchmarkTests
-        # RecallBenchmarkTests skipped in CI (take 2+ minutes, need large datasets)
+        # RecallBenchmarkTests skipped in CI (take 2+ minutes, need large datasets).
+        # TODO(audit/tests-wave): `--skip RecallBenchmarkTests` matches the whole
+        # class, which also skips the fast functional tests that currently live
+        # there (testLiveCountAfterRemovals, testCompaction, testAutoCompaction*,
+        # testNonisolatedDimension/Configuration). Relocating those into
+        # HNSWCompactionTests is owned by the tests wave; once they move, this
+        # skip will only exclude the genuinely slow recall sweeps.
 
       - name: Build Demo App
         run: swift build --target ProximaDemo
 
       - name: Build Documentation
         run: swift package generate-documentation --target ProximaKit
+
+      - name: Check version / changelog consistency
+        run: bash .github/ci-scripts/check_version.sh
+
+  # Package.swift declares iOS 17 and visionOS 1, but `swift build` on a macOS
+  # runner only compiles for the macOS SDK. ProximaEmbeddings imports
+  # CoreML/NaturalLanguage/Vision, which have per-platform availability
+  # differences, so compile (build-only, no tests) against the iOS SDK too.
+  build-ios:
+    name: Build (iOS Simulator)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+
+      - name: Build ProximaKit for iOS Simulator
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -skipPackagePluginValidation \
+            -scheme ProximaKit \
+            -destination 'generic/platform=iOS Simulator'
+
+      - name: Build ProximaEmbeddings for iOS Simulator
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -skipPackagePluginValidation \
+            -scheme ProximaEmbeddings \
+            -destination 'generic/platform=iOS Simulator'
+
+  lint:
+    name: SwiftLint
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SwiftLint
+        # Pinned: a floating `brew install` tracks latest, and new default
+        # rules in a future SwiftLint release could break the strict gate
+        # with no code change. Bump deliberately.
+        run: |
+          curl -sSL -o /tmp/swiftlint.zip \
+            https://github.com/realm/SwiftLint/releases/download/0.63.2/portable_swiftlint.zip
+          unzip -o /tmp/swiftlint.zip -d /tmp/swiftlint
+          sudo cp /tmp/swiftlint/swiftlint /usr/local/bin/swiftlint
+          swiftlint version
+
+      - name: Lint
+        run: swiftlint lint --strict --reporter github-actions-logging

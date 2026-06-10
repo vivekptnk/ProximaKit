@@ -1,0 +1,57 @@
+# SwiftLint configuration for ProximaKit.
+#
+# Baseline philosophy: this config is a *ratchet*, not a cleanup mandate.
+# Every rule below was disabled because the existing codebase violates it
+# today and a mass-reformat would pollute history/blame (see CONTRIBUTING.md).
+# All remaining default rules are enforced strictly in CI (ci.yml `lint` job
+# runs `swiftlint lint --strict`), so new code cannot introduce new classes
+# of violations.
+#
+# TODO(audit/ci): re-enable rules from the list below one at a time as the
+# offending code is touched for other reasons (start with trailing_newline,
+# comma, colon — the mechanical ones).
+
+included:
+  - Sources
+  - Tests
+  - Benchmarks/Sources
+
+excluded:
+  - .build
+  - Benchmarks/.build
+
+disabled_rules:
+  # ── Formatting debt (mechanical, large blast radius) ──────────────
+  - trailing_whitespace        # 862 occurrences at baseline
+  - trailing_comma
+  - trailing_newline
+  - vertical_whitespace
+  - comma
+  - colon
+  - opening_brace
+  - switch_case_alignment
+  - statement_position
+  # ── Naming/size conventions the codebase intentionally departs from ──
+  - identifier_name            # math-style names: i, k, M, pq, efSearch...
+  - type_name
+  - line_length
+  - file_length
+  - type_body_length
+  - function_body_length
+  - function_parameter_count
+  - cyclomatic_complexity
+  - nesting
+  - large_tuple
+  # ── Style choices present at baseline ─────────────────────────────
+  - todo
+  - for_where
+  - void_return
+  - unused_closure_parameter
+  - unneeded_synthesized_initializer
+  - implicit_optional_initialization
+  - implicit_getter
+  - duplicate_imports
+  - non_optional_string_data_conversion
+  # ── Force-unwrap family: present in tests/bench fixtures ──────────
+  - force_cast
+  - force_try

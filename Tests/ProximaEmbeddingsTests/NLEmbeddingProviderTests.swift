@@ -83,6 +83,41 @@ final class NLEmbeddingProviderTests: XCTestCase {
         }
     }
 
+    // ── Output Normalization Contract ─────────────────────────────────
+
+    /// Regression test (CHA audit): both the sentence-embedding path and the
+    /// word-averaging fallback must return L2-normalized (unit-length)
+    /// vectors. Before the fix, the sentence path returned the raw model
+    /// vector (magnitude ≈ 9 for English), while the fallback normalized —
+    /// so EuclideanDistance/DotProductDistance behavior depended on which
+    /// path the language happened to select.
+    func testEmbedReturnsUnitVectors() async throws {
+        let provider = try makeProvider()
+
+        let inputs = [
+            "hello",
+            "The quick brown fox jumps over the lazy dog",
+            "vector search on device",
+        ]
+        for text in inputs {
+            let vector = try await provider.embed(text)
+            XCTAssertEqual(vector.magnitude, 1.0, accuracy: 1e-4,
+                "Embedding for \"\(text)\" should be unit-length, got magnitude \(vector.magnitude)")
+        }
+    }
+
+    /// Normalization must not change cosine-similarity rankings.
+    func testNormalizationPreservesCosineRanking() async throws {
+        let provider = try makeProvider()
+
+        let cat = try await provider.embed("cat")
+        let kitten = try await provider.embed("kitten")
+        let car = try await provider.embed("car")
+
+        XCTAssertGreaterThan(cat.cosineSimilarity(kitten), cat.cosineSimilarity(car),
+            "Unit-normalized vectors should preserve semantic ranking")
+    }
+
     func testDimensionConsistency() async throws {
         let provider = try makeProvider()
 

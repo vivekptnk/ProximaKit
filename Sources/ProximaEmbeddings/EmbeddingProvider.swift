@@ -10,9 +10,12 @@ import ProximaKit
 /// A provider that converts text into vectors for similarity search.
 ///
 /// Conform to this protocol to create custom embedding backends.
-/// ProximaEmbeddings ships two built-in providers:
+/// ProximaEmbeddings ships two built-in text providers:
 /// - ``NLEmbeddingProvider``: Apple's NaturalLanguage framework (fast, lower quality)
-/// - `CoreMLEmbeddingProvider`: Any Core ML model that outputs float arrays (future)
+/// - ``CoreMLEmbeddingProvider``: Any Core ML model that outputs float arrays
+///
+/// (``VisionEmbeddingProvider`` produces image embeddings and stands alone —
+/// it does not conform to this text-oriented protocol.)
 ///
 /// ```swift
 /// let provider = try NLEmbeddingProvider()

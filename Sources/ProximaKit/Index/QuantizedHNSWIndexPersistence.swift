@@ -107,43 +107,93 @@ extension QuantizedHNSWIndex {
 
         var offset = 0
 
-        func readUInt32() -> UInt32 {
+        // Bounds-checked little-endian readers: a truncated or corrupt file
+        // must throw PersistenceError, never read out of bounds.
+        func readUInt32() throws -> UInt32 {
+            guard offset + 4 <= fileData.count else {
+                throw PersistenceError.corruptedData("Quantized index file truncated")
+            }
             let val = fileData.loadLE(UInt32.self, at: offset)
             offset += 4
             return val
         }
 
-        func readInt32() -> Int32 {
+        func readInt32() throws -> Int32 {
+            guard offset + 4 <= fileData.count else {
+                throw PersistenceError.corruptedData("Quantized index file truncated")
+            }
             let val = fileData.loadLE(Int32.self, at: offset)
             offset += 4
             return val
         }
 
-        let fileMagic = readUInt32()
+        /// Verifies that `byteCount` more bytes exist at the current offset.
+        func requireBytes(_ byteCount: Int, _ section: String) throws {
+            guard byteCount >= 0, offset <= fileData.count,
+                  byteCount <= fileData.count - offset else {
+                throw PersistenceError.corruptedData("Quantized index \(section) truncated")
+            }
+        }
+
+        let fileMagic = try readUInt32()
         guard fileMagic == qhMagic else {
             throw PersistenceError.invalidMagic
         }
 
-        let version = readUInt32()
+        let version = try readUInt32()
         guard version == qhFormatVersion else {
             throw PersistenceError.unsupportedVersion(version)
         }
 
-        let dim = Int(readUInt32())
-        let nodeCount = Int(readUInt32())
-        let subspaceCount = Int(readUInt32())
-        let hnswM = Int(readUInt32())
-        let efConstruction = Int(readUInt32())
-        let efSearch = Int(readUInt32())
-        let maxLevel = Int(readInt32())
-        let epRaw = Int(readInt32())
+        let dim = Int(try readUInt32())
+        let nodeCount = Int(try readUInt32())
+        let subspaceCount = Int(try readUInt32())
+        let hnswM = Int(try readUInt32())
+        let efConstruction = Int(try readUInt32())
+        let efSearch = Int(try readUInt32())
+        let maxLevel = Int(try readInt32())
+        let epRaw = Int(try readInt32())
         let entryPoint: Int? = epRaw >= 0 ? epRaw : nil
-        let layerCount = Int(readUInt32())
-        let trainIters = Int(readUInt32())
+        let layerCount = Int(try readUInt32())
+        let trainIters = Int(try readUInt32())
 
         // Skip reserved
         offset += 8
         assert(offset == qhHeaderSize)
+
+        // ── Header sanity (prevents traps before section reads) ───────
+        // ProductQuantizer / PQConfiguration / HNSWConfiguration enforce
+        // these with preconditions, so a corrupt header would otherwise
+        // crash the process instead of throwing.
+        guard dim > 0, subspaceCount > 0, dim % subspaceCount == 0 else {
+            throw PersistenceError.corruptedData(
+                "Quantized index dimension \(dim) / subspaceCount \(subspaceCount) invalid")
+        }
+        guard trainIters > 0 else {
+            throw PersistenceError.corruptedData(
+                "Quantized index trainingIterations must be positive, got \(trainIters)")
+        }
+        // m >= 2 matches HNSWConfiguration's precondition; m == 1 would trap
+        // in the initializer (1/log(1) is infinite), so reject it here instead.
+        guard hnswM >= 2, efConstruction > 0, efSearch > 0 else {
+            throw PersistenceError.corruptedData(
+                "Quantized index HNSW configuration fields out of range "
+                + "(m: \(hnswM) [min 2], efConstruction: \(efConstruction), efSearch: \(efSearch))")
+        }
+        guard layerCount <= fileData.count else {
+            throw PersistenceError.corruptedData(
+                "Quantized index layer count \(layerCount) implausible for file of \(fileData.count) bytes")
+        }
+        guard maxLevel >= -1, maxLevel < layerCount else {
+            throw PersistenceError.corruptedData(
+                "Quantized index maxLevel \(maxLevel) outside valid range -1..<\(layerCount)")
+        }
+        if let entryPoint {
+            guard entryPoint < nodeCount else {
+                throw PersistenceError.corruptedData(
+                    "Quantized index entry point \(entryPoint) outside valid range 0..<\(nodeCount)")
+            }
+        }
 
         let ds = dim / subspaceCount
         let K = 256
@@ -154,6 +204,7 @@ extension QuantizedHNSWIndex {
         for _ in 0..<subspaceCount {
             let floatCount = K * ds
             let byteCount = floatCount * 4
+            try requireBytes(byteCount, "codebook section")
             var floats = [Float](repeating: 0, count: floatCount)
             fileData.withUnsafeBytes { buffer in
                 let src = buffer.baseAddress!.advanced(by: offset)
@@ -169,6 +220,11 @@ extension QuantizedHNSWIndex {
         let quantizer = ProductQuantizer(dimension: dim, config: pqConfig, codebooks: codebooks)
 
         // PQ codes
+        let (codeBytes, codeOverflow) = nodeCount.multipliedReportingOverflow(by: subspaceCount)
+        guard !codeOverflow else {
+            throw PersistenceError.corruptedData("Quantized index code section truncated")
+        }
+        try requireBytes(codeBytes, "code section")
         var pqCodes = [[UInt8]]()
         pqCodes.reserveCapacity(nodeCount)
         for _ in 0..<nodeCount {
@@ -178,6 +234,11 @@ extension QuantizedHNSWIndex {
         }
 
         // UUIDs
+        let (uuidBytes, uuidOverflow) = nodeCount.multipliedReportingOverflow(by: 16)
+        guard !uuidOverflow else {
+            throw PersistenceError.corruptedData("Quantized index UUID section truncated")
+        }
+        try requireBytes(uuidBytes, "UUID section")
         var nodeToUUID = [UUID]()
         nodeToUUID.reserveCapacity(nodeCount)
         var uuidToNode = [UUID: Int]()
@@ -195,7 +256,12 @@ extension QuantizedHNSWIndex {
         var nodeLevels = [Int]()
         nodeLevels.reserveCapacity(nodeCount)
         for _ in 0..<nodeCount {
-            nodeLevels.append(Int(readInt32()))
+            let level = Int(try readInt32())
+            guard level >= 0, level < layerCount else {
+                throw PersistenceError.corruptedData(
+                    "Quantized index node level \(level) outside valid range 0..<\(layerCount)")
+            }
+            nodeLevels.append(level)
         }
 
         // Graph layers
@@ -205,11 +271,15 @@ extension QuantizedHNSWIndex {
             var layer = [[Int]]()
             layer.reserveCapacity(nodeCount)
             for _ in 0..<nodeCount {
-                let neighborCount = Int(readUInt32())
+                let neighborCount = Int(try readUInt32())
                 var neighbors = [Int]()
-                neighbors.reserveCapacity(neighborCount)
                 for _ in 0..<neighborCount {
-                    neighbors.append(Int(readUInt32()))
+                    let n = Int(try readUInt32())
+                    guard n < nodeCount else {
+                        throw PersistenceError.corruptedData(
+                            "Quantized index neighbor \(n) outside valid range 0..<\(nodeCount)")
+                    }
+                    neighbors.append(n)
                 }
                 layer.append(neighbors)
             }
@@ -217,9 +287,15 @@ extension QuantizedHNSWIndex {
         }
 
         // Metadata
-        let metadataSize = Int(readUInt32())
+        let metadataSize = Int(try readUInt32())
+        try requireBytes(metadataSize, "metadata section")
         let metadataPayload = fileData[offset..<offset + metadataSize]
-        let decodedMetadata = try JSONDecoder().decode([[UInt8]?].self, from: metadataPayload)
+        let decodedMetadata: [[UInt8]?]
+        do {
+            decodedMetadata = try JSONDecoder().decode([[UInt8]?].self, from: metadataPayload)
+        } catch {
+            throw PersistenceError.corruptedData("Quantized index metadata is not valid JSON")
+        }
         let metadata: [Data?] = decodedMetadata.map { $0.map { Data($0) } }
 
         let hnswConfig = HNSWConfiguration(
