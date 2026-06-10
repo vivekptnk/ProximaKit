@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [1.5.0] — 2026-06-10
+
 Correctness fixes from a multi-agent audit (every fix reproduced before patching, re-verified after), INT8 scalar quantization, three new distance metrics, reproducible graph construction, and a CI overhaul.
 
 ### Added

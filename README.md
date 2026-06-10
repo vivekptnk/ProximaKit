@@ -130,7 +130,7 @@ How does it actually stack up on speed and recall? We measure instead of claimin
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.4.0")
+    .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.5.0")
 ]
 ```
 
