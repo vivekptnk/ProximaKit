@@ -8,6 +8,8 @@ ProximaKit lets you search content by meaning, not keywords. It converts text an
 
 Everything runs on-device using Apple's Accelerate framework. No internet, no API keys, no external dependencies.
 
+Beyond dense search, ProximaKit ships hybrid BM25 + dense retrieval with rank fusion, product and INT8 scalar quantization for memory-constrained deployments, filtered search, and versioned binary persistence.
+
 ### Three Steps to Semantic Search
 
 1. **Embed**: Convert your content into a ``Vector`` using an embedding provider
@@ -19,13 +21,14 @@ import ProximaKit
 
 let index = HNSWIndex(dimension: 384, metric: CosineDistance())
 try await index.add(vector, id: UUID())
-let results = try await index.search(query: queryVector, k: 10)
+let results = await index.search(query: queryVector, k: 10)
 ```
 
 ## Topics
 
 ### Essentials
 
+- <doc:GettingStarted>
 - ``Vector``
 - ``HNSWIndex``
 - ``BruteForceIndex``
@@ -39,6 +42,9 @@ let results = try await index.search(query: queryVector, k: 10)
 - ``DotProductDistance``
 - ``ManhattanDistance``
 - ``HammingDistance``
+- ``ChebyshevDistance``
+- ``BrayCurtisDistance``
+- ``MahalanobisDistance``
 
 ### Index Protocol
 
@@ -46,9 +52,38 @@ let results = try await index.search(query: queryVector, k: 10)
 - ``HNSWConfiguration``
 - ``IndexError``
 
+### Hybrid & Keyword Search
+
+- ``HybridIndex``
+- ``HybridFusionStrategy``
+- ``SparseIndex``
+- ``SparseVectorIndex``
+- ``BM25Configuration``
+- ``BM25Tokenizer``
+- ``DefaultBM25Tokenizer``
+
+### Quantization
+
+- ``ProductQuantizer``
+- ``PQConfiguration``
+- ``QuantizedHNSWIndex``
+- ``ScalarQuantizer``
+- ``ScalarQuantizedHNSWIndex``
+- ``ProductQuantizerError``
+
+### Document Stores
+
+- ``VectorStore``
+- ``HybridVectorStore``
+- ``TextEmbedder``
+- ``ChunkMetadata``
+- ``VectorStoreError``
+
 ### Batch Operations
 
 - ``batchDotProducts(query:matrix:vectorCount:dimension:)``
+- ``batchL2Distances(query:matrix:vectorCount:dimension:)``
+- ``batchL1Distances(query:matrix:vectorCount:dimension:)``
 - ``batchDistances(query:vectors:metric:)``
 - ``batchDistances(query:matrix:vectorCount:dimension:metric:)``
 
@@ -58,4 +93,5 @@ let results = try await index.search(query: queryVector, k: 10)
 - ``PersistenceError``
 - ``HNSWSnapshot``
 - ``BruteForceSnapshot``
+- ``SparseIndexSnapshot``
 - ``DistanceMetricType``

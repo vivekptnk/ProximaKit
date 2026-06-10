@@ -15,14 +15,14 @@ This document tracks planned improvements across the library, benchmarking harne
 - Dot product similarity
 - Manhattan / L1 distance
 - Hamming distance (binary vectors)
+- Chebyshev (L∞) distance
+- Bray-Curtis dissimilarity
+- Mahalanobis distance (covariance- or inverse-covariance-initialised; search-only — not serialisable via `DistanceMetricType`, so indices built with it cannot be persisted)
 
 ### Planned
 
 | Metric | Use Case | Status |
 |--------|----------|--------|
-| Mahalanobis | Covariate-aware similarity; useful when embedding dimensions have different scales | Planned |
-| Chebyshev (L∞) | Grid/game-AI pathfinding over embedded state spaces | Planned |
-| Bray-Curtis | Ecological / compositional similarity (count vectors) | Planned |
 | Jensen-Shannon divergence | Probability distribution comparison | Considering |
 
 All new metrics must satisfy the `DistanceMetric` protocol and pass the existing symmetry + triangle-inequality tests before merge.
@@ -31,11 +31,13 @@ All new metrics must satisfy the `DistanceMetric` protocol and pass the existing
 
 ## Quantization & Memory Efficiency
 
-ProximaKit currently stores all vectors as `Float32`. The next major memory reduction comes from quantization.
+Full-precision indexes store vectors as `Float32`; both quantization tiers below ship as alternatives when memory is the constraint.
 
-### INT8 Scalar Quantization
+### INT8 Scalar Quantization — Shipped
 
-Store each vector component as a signed 8-bit integer with a per-vector scale factor. Reduces index memory by ~4×; query accuracy degrades by ~1–2% Recall@10 at typical efSearch values. An ADR will document the chosen dequantization point (query-time vs. compare-time) and the tradeoff against vDSP batch alignment requirements.
+Store each vector component as a signed 8-bit integer with a per-vector scale factor. Reduces vector storage by ~4× (e.g. 384d: 1,536 B → 388 B per vector) with no training phase, and — unlike PQ's L2-only ADC — works with any serialisable distance metric.
+
+Implemented in `ScalarQuantizer` + `ScalarQuantizedHNSWIndex` (query-time reconstruction through the configured metric, binary persistence, acceptance-tested recall floors of ≥ 0.95 Recall@10 euclidean / ≥ 0.93 cosine). The dequantization-point decision (query-time vs. compare-time) and codec format are documented in [ADR-007](adr/ADR-007-int8-scalar-quantization.md).
 
 ### Product Quantization (PQ) — Shipped (v1.4.0)
 
@@ -46,7 +48,7 @@ Implemented in `ProductQuantizer` + `QuantizedHNSWIndex` (asymmetric distance co
 ### Status
 
 - PQ: **shipped** — `QuantizedHNSWIndex` with ADC and persistence; retrospective ADR accepted ([ADR-011](adr/ADR-011-pq-codec.md))
-- INT8 scalar quantization: ADR draft in progress (ADR-007), implementation not started
+- INT8 scalar quantization: **shipped** — `ScalarQuantizer` + `ScalarQuantizedHNSWIndex` with persistence and acceptance tests; ADR accepted ([ADR-007](adr/ADR-007-int8-scalar-quantization.md))
 
 ---
 
@@ -88,7 +90,7 @@ The post-filter decision and the graph-aware upgrade path (with the selectivity 
 
 - **Incremental delete:** current `remove(id:)` marks nodes as deleted (tombstone). A background compaction pass to physically remove tombstoned nodes and relink the graph is deferred; it requires an ADR on compaction policy.
 - **Hierarchical NSW variant with dynamic `M`:** vary the number of connections per layer based on layer height to improve recall at low `efSearch` values.
-- **Serialisation versioning:** a magic number (`PXKT`) and format version field are already written and validated on load (`PersistenceError.unsupportedVersion`). What remains is a format-evolution policy — migration strategy across versions — to be settled in ADR-010.
+- **Serialisation versioning:** a magic number (`PXKT`) and format version field are already written and validated on load (`PersistenceError.unsupportedVersion`). The format-evolution policy (monotonic version bumps, N-1 reads, documented defaults, mandatory corruption tests) is settled in [ADR-010](adr/ADR-010-format-evolution.md); format v2 shipped under it.
 
 ---
 
@@ -97,7 +99,7 @@ The post-filter decision and the graph-aware upgrade path (with the selectivity 
 | ADR | Topic | Status |
 |-----|-------|--------|
 | ADR-006 | Lumen integration (ProximaKit as KV-store backend) | Draft (in `docs/adr/`) |
-| ADR-007 | INT8 scalar quantization: dequantization policy + codec format | In progress |
+| ADR-007 | INT8 scalar quantization: dequantization policy + codec format | Accepted |
 | ADR-008 | Filtered search: post-filter shipped; document decision + graph-aware upgrade path | Accepted (retrospective) |
 | ADR-009 | Metal backend abstraction layer | Not started |
 | ADR-010 | Serialisation format evolution policy (version field already shipped) | Accepted |
@@ -122,10 +124,10 @@ The `ProximaDemoApp` (macOS SwiftUI) ships with the repo and demonstrates semant
 
 ## Documentation & Developer Experience
 
-Flagged in the [documentation audit](../docs/DOCUMENTATION-AUDIT.md) as out of scope for the initial documentation push but tracked here for completeness:
+Flagged during the documentation audit as out of scope for the initial documentation push but tracked here for completeness:
 
 - CONTRIBUTING.md — polish onboarding flow, add `scripts/check-imports.sh` usage note
-- CHANGELOG.md — backfill pre-v1.0 history; switch to Keep-a-Changelog format
+- CHANGELOG.md — backfill pre-v1.0 history (Keep-a-Changelog format already adopted)
 - Demo app README — expand with CoreML model install instructions
 - DocC Getting Started tutorial — interactive tutorial linked from the docc catalog
 

@@ -21,9 +21,8 @@
   <p align="center">
     <a href="https://github.com/vivekptnk/ProximaKit/actions/workflows/ci.yml"><img src="https://github.com/vivekptnk/ProximaKit/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="https://swift.org"><img src="https://img.shields.io/badge/Swift-5.9+-F05138?logo=swift&logoColor=white" alt="Swift" /></a>
-    <a href="https://developer.apple.com"><img src="https://img.shields.io/badge/Apple_Silicon-M1_M2_M3_M4-000000?logo=apple&logoColor=white" alt="Apple Silicon" /></a>
+    <img src="https://img.shields.io/badge/Platforms-iOS_17+_·_macOS_14+_·_visionOS_1+-000000?logo=apple&logoColor=white" alt="Platforms" />
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License" /></a>
-    <img src="https://img.shields.io/badge/tests-149_passing-brightgreen.svg" alt="Tests" />
   </p>
 </p>
 
@@ -34,6 +33,21 @@ ProximaKit finds **similar content by understanding what it means** — not by m
 Everything runs **on-device**. No server, no API key, no internet. Just your app and Apple Silicon.
 
 > *HNSW implemented from scratch in Swift. Zero dependencies. Zero C++ wrappers.*
+
+## What's Inside
+
+| Capability | Details |
+|------------|---------|
+| **HNSW graph search** | From-scratch multi-layer implementation — heuristic neighbour selection, tombstone deletes, auto-compaction, reproducible builds via `levelSeed` |
+| **Hybrid retrieval** | BM25 + dense fusion (`HybridIndex`, `HybridVectorStore`) with Reciprocal Rank Fusion or weighted sum |
+| **Product quantization** | 32× vector compression with asymmetric distance computation (`QuantizedHNSWIndex`, [ADR-011](docs/adr/ADR-011-pq-codec.md)) |
+| **INT8 scalar quantization** *(new)* | ~4× less vector memory, **works with any metric**, no training phase (`ScalarQuantizedHNSWIndex`, [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md)) |
+| **Filtered search** | `@Sendable` predicate on every index and store ([ADR-008](docs/adr/ADR-008-filtered-search.md)) |
+| **8 distance metrics** | Cosine, Euclidean, dot product, Manhattan, Hamming, Chebyshev *(new)*, Bray-Curtis *(new)*, Mahalanobis *(new)* — all vDSP-accelerated where it pays |
+| **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)) |
+| **Embedding providers** | Apple NaturalLanguage, Vision, and bring-your-own CoreML (BERT/MiniLM via WordPiece tokenizer) |
+| **Concurrency** | Every index is a Swift `actor`; `Sendable` API surface, built with `StrictConcurrency` |
+| **Proof** | 400+ tests, recall floors enforced in CI, cross-library benchmark harness vs FAISS/ScaNN running nightly |
 
 <table>
 <tr>
@@ -92,9 +106,9 @@ Not a wrapper. Not a port.
 
 ## Overview
 
-ProximaKit is a pure-Swift approximate nearest-neighbour library built from scratch on Apple's Accelerate framework. It provides HNSW-based semantic search that runs entirely on-device — no server, no API key, no C++ wrapper required.
+ProximaKit is a pure-Swift approximate nearest-neighbour library built from scratch on Apple's Accelerate framework. It provides HNSW-based semantic search — plus hybrid BM25+dense retrieval and two quantization tiers — that runs entirely on-device. No server, no API key, no C++ wrapper required.
 
-The library ships three targets: `ProximaKit` (core index + distance metrics + persistence), `ProximaEmbeddings` (text/image → vector converters using Apple's NaturalLanguage, Vision, and CoreML frameworks), and `ProximaDemo` (CLI) plus `ProximaDemoApp` (macOS SwiftUI app). All targets are distributed as a single Swift package.
+The package exposes two libraries: `ProximaKit` (indices, distance metrics, quantization, stores, persistence — Foundation + Accelerate only) and `ProximaEmbeddings` (text/image → vector converters using Apple's NaturalLanguage, Vision, and CoreML frameworks). A CLI demo (`ProximaDemo`) and a macOS SwiftUI demo app (`Examples/ProximaDemoApp`) ship in the same repo.
 
 ProximaKit is the foundation of the Chakravyuha stack and is used by TinyBrain (inference) and Lumen (knowledge retrieval) as their vector-search layer.
 
@@ -109,20 +123,22 @@ ProximaKit is the foundation of the Chakravyuha stack and is used by TinyBrain (
 | **iOS/macOS native** | Yes | No | No |
 | **Setup time** | 30 seconds | Hours | Minutes + billing |
 
+How does it actually stack up on speed and recall? We measure instead of claiming — see [Benchmarks](#performance).
+
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Requirements
 
-- macOS 14+ (macOS 15 recommended)
+- iOS 17+ / macOS 14+ / visionOS 1+ (Accelerate's modern vDSP API requires these)
 - Xcode 15+ / Swift 5.9+
-- Apple Silicon (M1 or newer) — Accelerate SIMD paths are Apple Silicon–optimised
+- Apple Silicon recommended — the SIMD paths are Apple Silicon–optimised
 
 ## Installation
 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.0.0")
+    .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.4.0")
 ]
 ```
 
@@ -130,7 +146,7 @@ dependencies: [
 .target(
     name: "YourApp",
     dependencies: [
-        "ProximaKit",          // Core: vectors, search indices, persistence
+        "ProximaKit",          // Core: indices, metrics, quantization, persistence
         "ProximaEmbeddings",   // Optional: turns text/images into vectors
     ]
 )
@@ -186,6 +202,8 @@ All of this happens **on your device**, using Apple's Accelerate framework for S
 
 **ProximaDemoApp** is a macOS SwiftUI app that ships with the repo. It indexes 48 sample documents at startup and lets you search by meaning in real time, tune `efSearch` with a slider, add your own notes to the live index, and persist across app launches.
 
+Illustrative mock-up of the app layout (ASCII, not a screenshot — build it yourself in one command):
+
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │  ProximaDemoApp — semantic search over 48 sample documents              │
@@ -196,11 +214,11 @@ All of this happens **on your device**, using Apple's Accelerate framework for S
 │  │                    │  │  ●  0.41  Astronauts aboard the ISS...   │  │
 │  │  Corpus: 48 docs   │  │  ●  0.44  NASA launched a new rover...  │  │
 │  │  Dimension: 512d   │  │  ●  0.48  The moon landing changed...   │  │
-│  │  Build:  ~0.9 s    │  │  ●  0.51  Scientists study black holes  │  │
-│  │  Query:  ~104 ms   │  │  ●  0.55  The James Webb telescope...   │  │
-│  │                    │  │                                          │  │
-│  │  [  Add Note  ]    │  │  ●  dist < 0.55 — strong match          │  │
-│  │  [  Add Image ]    │  │  ●  dist < 0.68 — partial match         │  │
+│  │                    │  │  ●  0.51  Scientists study black holes  │  │
+│  │  [  Add Note  ]    │  │  ●  0.55  The James Webb telescope...   │  │
+│  │  [  Add Image ]    │  │                                          │  │
+│  │                    │  │  ●  dist < 0.55 — strong match          │  │
+│  │                    │  │  ●  dist < 0.68 — partial match         │  │
 │  │                    │  │  ●  dist ≥ 0.68 — weak match            │  │
 │  └────────────────────┘  └──────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────────────────┘
@@ -238,7 +256,7 @@ for sentence in sentences {
 
 // Search by meaning
 let query = try await embedder.embed("animals playing outside")
-let results = try await index.search(query: query, k: 3)
+let results = await index.search(query: query, k: 3)
 
 // Results: "Dogs love playing fetch" (closest match!)
 //          "The cat sat on the warm windowsill"
@@ -246,6 +264,39 @@ let results = try await index.search(query: query, k: 3)
 ```
 
 **What happened:** "animals playing outside" found the dog and cat sentences — even though none contain those exact words. It searched by *meaning*.
+
+Need to restrict results — say, to one user's documents? Every index takes a filter:
+
+```swift
+let mine = await index.search(query: query, k: 3) { allowedIDs.contains($0) }
+```
+
+<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
+
+## Hybrid Search: Meaning + Keywords
+
+Dense search wins at paraphrase; BM25 wins at exact terms ("error E42", SKUs, names). `HybridIndex` runs both legs concurrently and fuses the rankings:
+
+```swift
+let hybrid = HybridIndex(dense: HNSWIndex(dimension: 384), sparse: SparseIndex())
+try await hybrid.add(text: chunkText, vector: embedding, id: UUID())
+let hits = await hybrid.search(queryText: "error E42", queryVector: queryVector, k: 10)
+```
+
+Fusion defaults to Reciprocal Rank Fusion (`.rrf(k: 60)`); `.weightedSum(alpha:)` is available when you've measured your corpus. Full design in [`docs/HYBRID.md`](docs/HYBRID.md).
+
+## Shrink the Index: INT8 Quantization
+
+~4× less vector memory, no training phase, works with any serialisable metric:
+
+```swift
+let sq = try await ScalarQuantizedHNSWIndex.build(
+    vectors: vectors, ids: ids, dimension: 384, metric: .cosine
+)
+let hits = await sq.search(query: queryVector, k: 10)
+```
+
+Need to go further? `QuantizedHNSWIndex` (product quantization) compresses 32× — at the cost of a k-means training pass and an L2-only search path. The trade-offs are spelled out in [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md) vs [ADR-011](docs/adr/ADR-011-pq-codec.md).
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
@@ -258,7 +309,7 @@ try await imageIndex.add(vector, id: photoID)
 
 // Find visually similar images
 let queryVector = try await vision.embed(anotherImage)
-let similar = try await imageIndex.search(query: queryVector, k: 5)
+let similar = await imageIndex.search(query: queryVector, k: 5)
 ```
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
@@ -271,9 +322,11 @@ Don't rebuild the index every time your app launches.
 // Save (compact binary format)
 try await index.save(to: fileURL)
 
-// Load (memory-mapped for instant startup)
+// Load (single bulk read; the index is fully in memory afterwards)
 let loaded = try HNSWIndex.load(from: fileURL)
 ```
+
+The format carries a magic number and version field; loaders validate graph structure before trusting it and throw typed `PersistenceError`s on corrupt input instead of crashing. Evolution policy: [ADR-010](docs/adr/ADR-010-format-evolution.md).
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
@@ -334,25 +387,33 @@ Place the exported `.mlmodelc` in `Models/` and ProximaKit will discover it auto
            │                      v     ProximaKit     │
            │                                            │
            │   ┌────────────────────────────────────┐  │
+           │   │  S T O R E S                       │  │
+           │   │  VectorStore · HybridVectorStore   │  │
+           │   │  (document-level chunks + saves)   │  │
+           │   └──────────────┬─────────────────────┘  │
+           │                  │                         │
+           │   ┌──────────────┴─────────────────────┐  │
            │   │  I N D E X   L A Y E R             │  │
            │   │                                     │  │
-           │   │   HNSWIndex          BruteForce    │  │
-           │   │   ◆──◆──◆             ◆ ◆ ◆ ◆     │  │
-           │   │   │╲ │ ╱│             ◆ ◆ ◆ ◆     │  │
-           │   │   ◆──◆──◆             ◆ ◆ ◆ ◆     │  │
-           │   │   O(log n)            O(n)         │  │
+           │   │  HNSWIndex            BruteForce    │  │
+           │   │  ◆──◆──◆  O(log n)    ◆◆◆  O(n)    │  │
+           │   │                                     │  │
+           │   │  QuantizedHNSW (PQ, 32×)            │  │
+           │   │  ScalarQuantizedHNSW (INT8, ~4×)    │  │
+           │   │  SparseIndex (BM25) · HybridIndex   │  │
            │   └──────────────┬─────────────────────┘  │
            │                  │                         │
            │   ┌──────────────┴─────────────────────┐  │
            │   │  D I S T A N C E   M E T R I C S   │  │
            │   │  cosine · euclidean · dot product   │  │
-           │   │  manhattan · hamming                 │  │
+           │   │  manhattan · hamming · chebyshev    │  │
+           │   │  bray-curtis · mahalanobis          │  │
            │   │       (vDSP / Accelerate)           │  │
            │   └──────────────┬─────────────────────┘  │
            │                  │                         │
            │   ┌──────────────┴─────────────────────┐  │
            │   │  P E R S I S T E N C E             │  │
-           │   │  binary save · mmap load · compact  │  │
+           │   │  versioned binary · mmap · hardened │  │
            │   └────────────────────────────────────┘  │
            │                                            │
            │   Foundation + Accelerate ONLY             │
@@ -361,42 +422,57 @@ Place the exported `.mlmodelc` in `Models/` and ProximaKit will discover it auto
 
 | Module | What It Does |
 |--------|-------------|
-| `ProximaKit` | Core engine: vectors, distance metrics, HNSW graph search, persistence |
+| `ProximaKit` | Core engine: vectors, 8 distance metrics, HNSW + quantized + sparse + hybrid indices, stores, persistence |
 | `ProximaEmbeddings` | Converts text/images to vectors using Apple frameworks |
 | `ProximaDemo` | Interactive demo app with live semantic search |
+
+Deep dive: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
 <p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## Performance
 
+Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full methodology; the highlights:
+
 ```
- ╔══════════════════════════════════════════════════╗
- ║              P E R F O R M A N C E               ║
- ╠══════════════════════════════════════════════════╣
- ║                                                  ║
- ║  ⚡ Query          104 ms   ████████████░░░░░░  ║
- ║  ⚡ Cold start      50 ms   █████░░░░░░░░░░░░░  ║
- ║  ⚡ Build          ~3.0 s   ██████████████████░  ║
- ║                                                  ║
- ║  ◎ Recall@10 (1K)  98-99%  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ ║
- ║  ◎ Recall@10 (10K)   87%+  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░ ║
- ║                                                  ║
- ║  ✓ Save/load roundtrip: exact binary match       ║
- ║  ✓ Memory-mapped I/O for instant startup         ║
- ║                                                  ║
- ╚══════════════════════════════════════════════════╝
+ ╔══════════════════════════════════════════════════════╗
+ ║              P E R F O R M A N C E                   ║
+ ╠══════════════════════════════════════════════════════╣
+ ║                                                      ║
+ ║  ⚡ Query latency    ~104 ms   (1K × 384d, cosine)  ║
+ ║  ⚡ Cold start        ~50 ms   (mmap, 10K vectors)  ║
+ ║                                                      ║
+ ║  ◎ Recall@10, real embeddings (512d):               ║
+ ║      100% measured  ·  >95% enforced in CI          ║
+ ║  ◎ Recall@10 floors:                                ║
+ ║      ≥95% INT8-quantized (euclidean) — CI-enforced  ║
+ ║      >90% @ 1K · >82% @ 10K (random vectors,        ║
+ ║      asserted in the benchmark suite*)              ║
+ ║                                                      ║
+ ║  ✓ Save/load roundtrip: exact binary match           ║
+ ║  ✓ vDSP batch ops beat naive loops (CI-asserted)     ║
+ ║                                                      ║
+ ╚══════════════════════════════════════════════════════╝
 ```
+
+<sub>* `RecallBenchmarkTests` is benchmark-class and excluded from the PR test job; run it with `swift test -c release --filter RecallBenchmarkTests`. The `benchmark.yml` smoke job separately gates core-touching PRs at recall@10 ≥ 0.90 on SIFT-10K.</sub>
+
+**Cross-library comparison (FAISS, ScaNN):** numbers are generated nightly by [`benchmark.yml`](.github/workflows/benchmark.yml) on SIFT1M-100K against shared brute-force ground truth (MS MARCO-50K is available in the harness for manual runs), and published as CI artifacts — never hand-copied into docs where they'd go stale. Harness + methodology: [`Benchmarks/`](Benchmarks/README.md), [ADR-005](docs/adr/ADR-005-benchmark-methodology.md). Results are reported honestly, including when ProximaKit loses.
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Which Index Should I Use?
 
-| Index | When | Speed |
-|-------|------|-------|
-| `HNSWIndex` | **Most cases.** Fast approximate search, scales to millions. | O(log n) |
-| `BruteForceIndex` | Under 1,000 items. 100% perfect accuracy. | O(n) |
+| Index | When | Memory |
+|-------|------|--------|
+| `HNSWIndex` | **Most cases.** Fast approximate search, O(log n). | Full (Float32) |
+| `BruteForceIndex` | Under 1,000 items. 100% exact accuracy, O(n). | Full (Float32) |
+| `ScalarQuantizedHNSWIndex` | Memory-constrained, any metric, no training. | **~4× smaller** |
+| `QuantizedHNSWIndex` | Maximum compression, L2 workloads, can afford training. | **32× smaller** |
+| `SparseIndex` | Keyword/BM25 search, no embeddings needed. | Postings lists |
+| `HybridIndex` | Best of both: semantic + exact-term recall. | Dense + sparse legs |
 
-Both have the exact same API. Swap them without changing any other code.
+`HNSWIndex` and `BruteForceIndex` share the same `VectorIndex` API — swap them without changing any other code.
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
@@ -409,6 +485,11 @@ Both have the exact same API. Swap them without changing any other code.
 | `DotProductDistance()` | Pre-normalized vectors (advanced). | "How aligned are these?" |
 | `ManhattanDistance()` | Sparse data, grid-based problems. | "How many blocks apart?" |
 | `HammingDistance()` | Binary/quantized vectors. | "How many bits differ?" |
+| `ChebyshevDistance()` | Worst-case-dimension comparisons, game grids. | "What's the single biggest gap?" |
+| `BrayCurtisDistance()` | Compositional/count data (ecology, histograms). | "How dissimilar are the proportions?" |
+| `MahalanobisDistance(covariance:)` | Correlated dimensions with different scales. | "How far apart, accounting for spread?" |
+
+All eight conform to the same `DistanceMetric` protocol. One caveat: `MahalanobisDistance` carries a matrix, so it is search-only — indices built with it cannot be persisted (`save` throws `PersistenceError.unserializableMetric`).
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
@@ -418,7 +499,8 @@ Both have the exact same API. Swap them without changing any other code.
 let config = HNSWConfiguration(
     m: 16,               // Connections per node
     efConstruction: 200,  // Build quality
-    efSearch: 50          // Search quality
+    efSearch: 50,         // Search quality
+    levelSeed: 42         // Optional: reproducible graph construction
 )
 ```
 
@@ -426,18 +508,19 @@ let config = HNSWConfiguration(
 |---------|-----|
 | Results aren't relevant | Increase `efSearch` (try 100-200) |
 | Search too slow | Decrease `efSearch` (try 20) |
-| Too much memory | Decrease `m` (try 8) |
+| Too much memory | Decrease `m` (try 8) — or switch to a quantized index |
 | Build takes too long | Decrease `efConstruction` (try 100) |
+| Flaky recall in tests | Set `levelSeed` for deterministic graph topology |
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Thread Safety
 
-ProximaKit is fully thread-safe. Both indices are Swift `actor` types — search from any thread, no crashes, no data races. The compiler enforces this at build time.
+ProximaKit is fully thread-safe. Every index and store is a Swift `actor`, the public surface is `Sendable`, and the package builds with `StrictConcurrency` enabled — the compiler enforces it at build time.
 
 ```swift
 // Safe from any thread or Task:
-let results = try await index.search(query: vector, k: 10)
+let results = await index.search(query: vector, k: 10)
 try await index.add(newVector, id: UUID())
 ```
 
@@ -452,14 +535,18 @@ try await index.add(newVector, id: UUID())
 | `Vector` | A list of floats. The fundamental data type. |
 | `HNSWIndex` | Fast approximate search (use this one). |
 | `BruteForceIndex` | Exact search (for small datasets). |
-| `CosineDistance` | Direction-based similarity (best for text). |
-| `EuclideanDistance` | Straight-line distance. |
-| `DotProductDistance` | Alignment-based (for normalized vectors). |
-| `ManhattanDistance` | L1 / taxicab distance (sparse data). |
-| `HammingDistance` | Count of differing positions (binary vectors). |
+| `ScalarQuantizedHNSWIndex` | INT8-compressed HNSW (~4×, any metric). |
+| `QuantizedHNSWIndex` | PQ-compressed HNSW (32×, L2 ADC). |
+| `SparseIndex` | BM25 keyword index (Okapi, Lucene-style IDF). |
+| `HybridIndex` | Dense + sparse fusion (RRF / weighted sum). |
+| `VectorStore` | Document-level layer: chunks, metadata, saves. |
+| `HybridVectorStore` | Same, over a hybrid index. |
+| `ScalarQuantizer` / `ProductQuantizer` | The codecs behind the quantized indices. |
+| `CosineDistance` … `MahalanobisDistance` | The 8 distance metrics. |
 | `SearchResult` | Result: `id`, `distance`, `metadata`. |
-| `HNSWConfiguration` | Tuning: `m`, `efConstruction`, `efSearch`. |
-| `PersistenceEngine` | Binary save/load with memory mapping. |
+| `HNSWConfiguration` | Tuning: `m`, `efConstruction`, `efSearch`, `autoCompactionThreshold`, `levelSeed`. |
+| `BM25Configuration` | Tuning: `k1`, `b`, `autoCompactionThreshold`. |
+| `PersistenceEngine` | Versioned binary save/load with memory mapping. |
 
 ### ProximaEmbeddings (content to vectors)
 
@@ -479,6 +566,11 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-002](docs/adr/ADR-002-actor-isolation.md): Why actors for thread safety
 - [ADR-003](docs/adr/ADR-003-binary-persistence.md): Why custom binary (not JSON)
 - [ADR-004](docs/adr/ADR-004-hnsw-heuristic-selection.md): Why heuristic neighbor selection
+- [ADR-005](docs/adr/ADR-005-benchmark-methodology.md): Cross-library benchmark methodology
+- [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md): INT8 scalar quantization codec
+- [ADR-008](docs/adr/ADR-008-filtered-search.md): Filtered search (post-filter now, graph-aware later)
+- [ADR-010](docs/adr/ADR-010-format-evolution.md): Persistence format evolution policy
+- [ADR-011](docs/adr/ADR-011-pq-codec.md): Product quantization codec
 
 <p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
@@ -498,6 +590,8 @@ swift test -c release --filter RecallBenchmarkTests
 swift package generate-documentation --target ProximaKit
 ```
 
+CI runs the full suite (400+ tests), SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR — plus a benchmark smoke-slice regression gate on PRs that touch the core index.
+
 <p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## Roadmap
@@ -506,14 +600,11 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
 
 | Area | Status |
 |------|--------|
-| Additional distance metrics — Mahalanobis, Chebyshev, Bray-Curtis | Planned |
 | GPU acceleration — Metal/MPSGraph backend for batch index builds | Planned |
-| Binary quantization — INT8 scalar, product quantization (PQ) | Planned |
-| Filtered search — pre-filter by metadata predicate before ANN | Planned |
-| ADR backlog — quantization strategy, filtered search design | In progress |
+| Graph-aware filtered search — higher recall under selective filters | Planned |
+| Jensen-Shannon divergence metric | Considering |
+| Background HNSW compaction policy | Planned |
 | Demo app — iOS target, CoreML model download UI, result export | Planned |
-
-Items flagged in the [documentation audit](../docs/DOCUMENTATION-AUDIT.md) (CONTRIBUTING.md polish, CHANGELOG.md, demo app README expansion) are tracked in the roadmap but are out of scope for this release.
 
 <p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 

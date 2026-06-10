@@ -221,7 +221,7 @@ swift test --filter SIMDBenchmarkTests
 
 ### Save/Load Roundtrip
 
-The `PersistenceEngine` uses a compact binary format with memory-mapped I/O for loading.
+The `PersistenceEngine` uses a compact binary format with bulk single-read loading (`.mappedIfSafe` speeds the read; the loaded index is fully memory-resident).
 
 | Operation | Characteristic |
 |-----------|---------------|
@@ -238,6 +238,41 @@ See [ADR-003: Binary Persistence](adr/ADR-003-binary-persistence.md) for the for
 |--------|----------------------|-----------|
 | JSON (rejected) | ~60 MB | ~3s |
 | Custom binary | ~58 MB | ~50ms (mmap) |
+
+---
+
+## INT8 Scalar Quantization
+
+**What it measures:** Memory footprint and accuracy floor of `ScalarQuantizedHNSWIndex` (one signed byte per component + one Float32 scale per vector) versus full-precision Float32 storage. See [ADR-007](adr/ADR-007-int8-scalar-quantization.md) for the codec design.
+
+### Memory Math (structural, not measured)
+
+Per-vector storage is `d × 1` byte of codes plus a 4-byte scale, versus `d × 4` bytes at full precision:
+
+| Dimension | Float32 | INT8 codes + scale | Ratio |
+|-----------|---------|--------------------|-------|
+| 128 | 512 B | 132 B | 3.88× |
+| 384 | 1,536 B | 388 B | 3.96× |
+| 768 | 3,072 B | 772 B | 3.98× |
+
+The ratio approaches 4× as dimension grows. `ScalarQuantizedHNSWIndex` exposes the exact arithmetic at runtime via `codeStorageBytes`, `equivalentFullPrecisionBytes`, and `memorySavingsRatio`. Graph adjacency lists are identical in both representations, so the savings apply to vector storage only.
+
+### Accuracy (acceptance-tested)
+
+Recall floors are enforced by the test suite — `ScalarQuantizedHNSWIndexTests` compares against `BruteForceIndex` ground truth on 1,000 clustered 64d vectors (k=10, efSearch=250, seeded RNG):
+
+| Metric | Recall@10 floor | Status |
+|--------|-----------------|--------|
+| Euclidean | ≥ 0.95 | Acceptance-tested |
+| Cosine | ≥ 0.93 | Acceptance-tested |
+
+These are asserted lower bounds, not point measurements — runs that dip below fail CI. Unlike PQ's L2-only ADC path, scalar quantization searches through the configured `DistanceMetric` (any serialisable metric), so the floors above are per-metric guarantees rather than a single L2 number.
+
+**Run the scalar-quantization tests:**
+
+```bash
+swift test --filter ScalarQuant
+```
 
 ---
 
@@ -365,7 +400,7 @@ python Benchmarks/python/compare.py --in out/ --out out/compare.md
 
 ### Results
 
-The first published tables land with the v1.4.0 release. Until then, the CI nightly artifact under the `benchmark` workflow is the canonical source — see the latest green nightly run on `main` for current numbers.
+Cross-library numbers are **generated, not hand-written**: the nightly `benchmark` workflow (`.github/workflows/benchmark.yml`) runs the full 100K slice and uploads per-library JSON plus the aggregated `compare.md` as workflow artifacts. The latest green nightly run on `main` is the canonical source — no numbers are copied into this document, by design (they would go stale the next time any library updates).
 
 Example table shape (filled in from the CI JSON artifacts):
 
