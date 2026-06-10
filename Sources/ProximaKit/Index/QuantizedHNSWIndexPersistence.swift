@@ -5,7 +5,7 @@
 //
 // File format (all little-endian):
 //   Magic:           0x50514857 ("PQHW")
-//   Version:         UInt32 (1)
+//   Version:         UInt32 (2)
 //   Dimension:       UInt32
 //   NodeCount:       UInt32
 //   SubspaceCount:   UInt32
@@ -16,7 +16,8 @@
 //   EntryPoint:      Int32 (-1 if nil)
 //   LayerCount:      UInt32
 //   TrainIters:      UInt32
-//   Reserved:        8 bytes (zero)
+//   OriginalsFlag:   UInt32 (v2+; 0 or 1 — reserved/zero in v1)
+//   Reserved:        4 bytes (zero)
 //   --- 56-byte header ---
 //   PQ codebooks:    M * 256 * ds Float32 values
 //   PQ codes:        nodeCount * M UInt8 values
@@ -24,11 +25,20 @@
 //   Node levels:     nodeCount * Int32
 //   Graph layers:    per-layer adjacency lists
 //   Metadata:        JSON-encoded [Data?]
+//   Originals:       nodeCount * dimension Float32 (v2+, iff OriginalsFlag == 1)
+//
+// Version history (ADR-010 / ADR-012):
+//   v1 — initial PQHW codec (ADR-011).
+//   v2 — originals flag in the previously reserved header bytes at offset 48
+//        plus an optional trailing originals section. v1 files load with the
+//        documented default retainOriginals == false. Readers accept v1...v2;
+//        writers always write v2.
 
 import Foundation
 
 private let qhMagic: UInt32 = 0x50514857       // "PQHW"
-private let qhFormatVersion: UInt32 = 1
+private let qhFormatVersion: UInt32 = 2
+private let qhMinSupportedVersion: UInt32 = 1
 private let qhHeaderSize = 56
 
 extension QuantizedHNSWIndex {
@@ -44,27 +54,36 @@ extension QuantizedHNSWIndex {
     /// quantized indexes compact equivalently here, at save time.
     private func compactedForSave() -> (
         codes: [[UInt8]], uuids: [UUID], levels: [Int],
-        metadata: [Data?], layers: [[[Int]]], entryPoint: Int?, maxLevel: Int
+        metadata: [Data?], layers: [[[Int]]], entryPoint: Int?, maxLevel: Int,
+        originals: [Vector]?
     ) {
         // Fast path: no tombstones — serialize state as-is (byte-identical
         // to the pre-compaction format, and no array copies).
         if uuidToNode.count == nodeToUUID.count {
             return (codes, nodeToUUID, nodeLevels, metadata,
-                    layers, entryPointNode, maxLevel)
+                    layers, entryPointNode, maxLevel, originals)
         }
 
         // Dense renumbering of live slots (identity check, not presence).
+        // Originals are a per-slot section like codes/metadata: compact them
+        // in the same loop so they stay slot-aligned after renumbering
+        // (ADR-012 — a reranked load would otherwise score against the
+        // wrong vectors).
         var oldToNew = [Int: Int]()
         var newCodes: [[UInt8]] = []
         var newUUIDs: [UUID] = []
         var newLevels: [Int] = []
         var newMetadata: [Data?] = []
+        var newOriginals: [Vector]? = originals != nil ? [] : nil
         for (node, uuid) in nodeToUUID.enumerated() where uuidToNode[uuid] == node {
             oldToNew[node] = newUUIDs.count
             newCodes.append(codes[node])
             newUUIDs.append(uuid)
             newLevels.append(nodeLevels[node])
             newMetadata.append(metadata[node])
+            if let originals {
+                newOriginals?.append(originals[node])
+            }
         }
 
         // Remap adjacency, dropping any edge into a tombstoned slot.
@@ -90,7 +109,7 @@ extension QuantizedHNSWIndex {
         }
 
         return (newCodes, newUUIDs, newLevels, newMetadata,
-                newLayers, newEntry, newMaxLevel)
+                newLayers, newEntry, newMaxLevel, newOriginals)
     }
 
     /// Saves this quantized index to a binary file.
@@ -117,8 +136,10 @@ extension QuantizedHNSWIndex {
         qhAppendLE(&data, Int32(live.entryPoint ?? -1))
         qhAppendLE(&data, UInt32(live.layers.count))
         qhAppendLE(&data, UInt32(quantizer.config.trainingIterations))
+        // Originals flag (v2 — previously reserved bytes, ADR-012)
+        qhAppendLE(&data, UInt32(live.originals != nil ? 1 : 0))
         // Reserved
-        data.append(Data(repeating: 0, count: 8))
+        data.append(Data(repeating: 0, count: 4))
 
         assert(data.count == qhHeaderSize)
 
@@ -157,6 +178,16 @@ extension QuantizedHNSWIndex {
         let metadataPayload = try JSONEncoder().encode(live.metadata.map { $0.map { Array($0) } })
         qhAppendLE(&data, UInt32(metadataPayload.count))
         data.append(metadataPayload)
+
+        // Originals (v2, iff retained): nodeCount * dimension Float32,
+        // row-major, slot-aligned with the PQ codes (ADR-012).
+        if let originals = live.originals {
+            assert(originals.count == nodeCount,
+                   "compacted originals must stay slot-aligned with codes")
+            for vector in originals {
+                vector.components.withUnsafeBytes { data.append(contentsOf: $0) }
+            }
+        }
 
         try data.write(to: url, options: .atomic)
     }
@@ -204,8 +235,9 @@ extension QuantizedHNSWIndex {
             throw PersistenceError.invalidMagic
         }
 
+        // N and N-1 are readable (ADR-010 rule 2); anything else throws.
         let version = try readUInt32()
-        guard version == qhFormatVersion else {
+        guard version >= qhMinSupportedVersion, version <= qhFormatVersion else {
             throw PersistenceError.unsupportedVersion(version)
         }
 
@@ -221,9 +253,25 @@ extension QuantizedHNSWIndex {
         let layerCount = Int(try readUInt32())
         let trainIters = Int(try readUInt32())
 
-        // Skip reserved
-        offset += 8
+        // Originals flag lives in the previously reserved bytes at offset 48.
+        // It is only meaningful from v2 on; v1 wrote zeros here, and v1 files
+        // load with the documented default retainOriginals == false
+        // (ADR-010 rule 3 / ADR-012).
+        let originalsFlag: UInt32
+        if version >= 2 {
+            originalsFlag = try readUInt32()
+            offset += 4  // remaining reserved
+        } else {
+            originalsFlag = 0
+            offset += 8  // v1: all 8 bytes reserved
+        }
         assert(offset == qhHeaderSize)
+
+        guard originalsFlag <= 1 else {
+            throw PersistenceError.corruptedData(
+                "Quantized index originals flag must be 0 or 1, got \(originalsFlag)")
+        }
+        let hasOriginals = originalsFlag == 1
 
         // ── Header sanity (prevents traps before section reads) ───────
         // ProductQuantizer / PQConfiguration / HNSWConfiguration enforce
@@ -361,6 +409,36 @@ extension QuantizedHNSWIndex {
             throw PersistenceError.corruptedData("Quantized index metadata is not valid JSON")
         }
         let metadata: [Data?] = decodedMetadata.map { $0.map { Data($0) } }
+        offset += metadataSize
+
+        // Originals (v2, iff the header flag is set): nodeCount * dim Float32,
+        // slot-aligned with the PQ codes. Truncation inside this section must
+        // throw, with the same bounds discipline as every other section.
+        var originals: [Vector]? = nil
+        if hasOriginals {
+            let (floatCount, floatOverflow) = nodeCount.multipliedReportingOverflow(by: dim)
+            let (originalsBytes, byteOverflow) =
+                floatCount.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+            guard !floatOverflow, !byteOverflow else {
+                throw PersistenceError.corruptedData("Quantized index originals section truncated")
+            }
+            try requireBytes(originalsBytes, "originals section")
+            var loaded = [Vector]()
+            loaded.reserveCapacity(nodeCount)
+            let vectorBytes = dim * MemoryLayout<Float>.size
+            for _ in 0..<nodeCount {
+                var floats = [Float](repeating: 0, count: dim)
+                fileData.withUnsafeBytes { buffer in
+                    let src = buffer.baseAddress!.advanced(by: offset)
+                    floats.withUnsafeMutableBytes { dest in
+                        dest.copyMemory(from: UnsafeRawBufferPointer(start: src, count: vectorBytes))
+                    }
+                }
+                loaded.append(Vector(floats))
+                offset += vectorBytes
+            }
+            originals = loaded
+        }
 
         let hnswConfig = HNSWConfiguration(
             m: hnswM,
@@ -380,7 +458,8 @@ extension QuantizedHNSWIndex {
             codes: pqCodes,
             nodeToUUID: nodeToUUID,
             uuidToNode: uuidToNode,
-            metadata: metadata
+            metadata: metadata,
+            originals: originals
         )
     }
 }

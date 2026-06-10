@@ -135,6 +135,19 @@ public actor HNSWIndex: VectorIndex {
     /// Per-layer adjacency lists. layers[l][n] = [neighbor indices].
     private var layers: [[[Int]]] = []
 
+    /// Reverse adjacency: inEdges[l][n] = the set of nodes whose layer-l
+    /// neighbor list contains n. This realizes the incoming-edge map
+    /// (node → {(layer, fromNode)}) in layer-major parallel-array form,
+    /// mirroring `layers`.
+    ///
+    /// Maintained on every edge mutation (insert-time connect, pruning,
+    /// remove-time reconnection) so `remove()` can delete all edges into a
+    /// node in O(in-degree) instead of sweeping every edge list on the
+    /// layer (O(E_l)). Derived state: NOT persisted — the snapshot format
+    /// is unchanged (ADR-010) and `init(restoring:)` rebuilds it from
+    /// the snapshot's layers.
+    private var inEdges: [[Set<Int>]] = []
+
     /// The maximum layer each node was assigned to.
     private var nodeLevels: [Int] = []
 
@@ -217,6 +230,7 @@ public actor HNSWIndex: VectorIndex {
         for l in 0..<layers.count {
             if layers[l].count <= newNode {
                 layers[l].append([])
+                inEdges[l].append([])
             }
         }
 
@@ -260,8 +274,8 @@ public actor HNSWIndex: VectorIndex {
 
             // Connect new node to selected neighbors on this layer.
             for (neighbor, _) in selected {
-                layers[level][newNode].append(neighbor)
-                layers[level][neighbor].append(newNode)
+                addEdge(from: newNode, to: neighbor, layer: level)
+                addEdge(from: neighbor, to: newNode, layer: level)
 
                 // Prune neighbor if over capacity.
                 let neighborMax = (level == 0) ? config.mMax0 : config.m
@@ -316,9 +330,32 @@ public actor HNSWIndex: VectorIndex {
         }
 
         // Phase 2: Full beam search on layer 0.
+        //
+        // Filtered queries take the graph-aware path (ADR-008 addendum):
+        // the predicate is applied DURING the beam, so rejected nodes are
+        // traversed for routing but never occupy result candidacy, and the
+        // beam width adapts to the observed acceptance rate so selective
+        // filters still fill k. Unfiltered queries keep the original
+        // filter-blind beam below — that path is unchanged (zero overhead).
+        if let filter = filter {
+            let accepted = searchLayer0Filtered(
+                query: query, entryPoint: currentEntry, ef: ef, k: k, filter: filter
+            )
+            // Every accepted candidate already passed the liveness and
+            // predicate checks inside the beam — materialize directly.
+            var results = accepted.map { (node, distance) in
+                SearchResult(id: nodeToUUID[node], distance: distance, metadata: metadata[node])
+            }
+            results.sort()
+            if results.count > k {
+                results = Array(results.prefix(k))
+            }
+            return results
+        }
+
         let candidates = searchLayer(query: query, entryPoint: currentEntry, ef: ef, layer: 0)
 
-        // Build results, skipping tombstoned nodes and applying filter.
+        // Build results, skipping tombstoned nodes.
         var results: [SearchResult] = []
         for (node, distance) in candidates {
             let uuid = nodeToUUID[node]
@@ -326,7 +363,6 @@ public actor HNSWIndex: VectorIndex {
             // Identity check: after a re-add of the same UUID, the UUID maps to
             // a NEW node — the old slot is live only if it maps back to itself.
             guard uuidToNode[uuid] == node else { continue }
-            if let filter = filter, !filter(uuid) { continue }
             results.append(SearchResult(
                 id: uuid,
                 distance: distance,
@@ -347,13 +383,15 @@ public actor HNSWIndex: VectorIndex {
     /// Removes a vector by ID, tombstoning its slot and repairing the graph.
     ///
     /// Repair policy, applied per layer the node lived on:
-    /// 1. **Reverse-edge sweep** — every edge pointing *into* the removed node
-    ///    is deleted. Insertion-time pruning is one-sided (`pruneConnections`
-    ///    trims only the over-capacity node's own list), so a live node X can
-    ///    hold an edge to this node without a reciprocal edge; iterating only
-    ///    the removed node's own adjacency would leave X's edge dangling and
-    ///    waste beam slots on a dead end during search. The sweep is O(E_l)
-    ///    per layer (all edges on that layer).
+    /// 1. **Reverse-edge cleanup** — every edge pointing *into* the removed
+    ///    node is deleted. Insertion-time pruning is one-sided
+    ///    (`pruneConnections` trims only the over-capacity node's own list),
+    ///    so a live node X can hold an edge to this node without a reciprocal
+    ///    edge; iterating only the removed node's own adjacency would leave
+    ///    X's edge dangling and waste beam slots on a dead end during search.
+    ///    The maintained reverse-adjacency map (`inEdges`) lists exactly the
+    ///    nodes holding such edges, so the cleanup is O(in-degree) per layer
+    ///    rather than a full O(E_l) sweep of every edge list on the layer.
     /// 2. **Neighbor reconnection** — the removed node's former neighbors are
     ///    offered each other as candidate edges and re-selected with the same
     ///    diversity heuristic used at insertion, so paths that ran through the
@@ -375,13 +413,16 @@ public actor HNSWIndex: VectorIndex {
             // the nodes whose connectivity may have run through the removed node.
             let formerNeighbors = layers[l][node]
 
-            // Step 1: reverse-edge sweep over the whole layer. Edges into this
-            // node can exist outside `formerNeighbors` (one-sided pruning), so
-            // a full pass is required for a complete cleanup.
-            for n in layers[l].indices where n != node {
-                layers[l][n].removeAll { $0 == node }
+            // Step 1: reverse-adjacency cleanup. Edges into this node can
+            // exist outside `formerNeighbors` (one-sided pruning); `inEdges`
+            // tracks exactly that set, so only the affected lists are touched
+            // — O(in-degree) instead of a whole-layer sweep.
+            for from in inEdges[l][node] {
+                layers[l][from].removeAll { $0 == node }
             }
-            layers[l][node] = []
+            inEdges[l][node] = []
+            // Clear the node's own out-edges (and their reverse entries).
+            setNeighbors([], node: node, layer: l)
 
             // Step 2: reconnect former neighbors among themselves.
             let maxConnections = (l == 0) ? config.mMax0 : config.m
@@ -403,7 +444,7 @@ public actor HNSWIndex: VectorIndex {
                     candidates: candidates,
                     m: maxConnections
                 )
-                layers[l][f] = selected.map(\.node)
+                setNeighbors(selected.map(\.node), node: f, layer: l)
             }
         }
 
@@ -444,6 +485,20 @@ public actor HNSWIndex: VectorIndex {
         // post-load insertions.
         self.levelRNG = snapshot.config.levelSeed.map(SplitMix64.init(seed:))
         self.layers = snapshot.layers
+        // Rebuild the reverse adjacency from the snapshot's layers. It is
+        // derived state and deliberately NOT part of the snapshot, so the
+        // on-disk format stays unchanged (ADR-010).
+        var rebuiltInEdges: [[Set<Int>]] = snapshot.layers.map { layer in
+            Array(repeating: Set<Int>(), count: layer.count)
+        }
+        for (l, layer) in snapshot.layers.enumerated() {
+            for (from, neighbors) in layer.enumerated() {
+                for to in neighbors {
+                    rebuiltInEdges[l][to].insert(from)
+                }
+            }
+        }
+        self.inEdges = rebuiltInEdges
         self.nodeLevels = snapshot.nodeLevels
         self.vectors = snapshot.vectors
         self.metadata = snapshot.metadata
@@ -516,6 +571,7 @@ public actor HNSWIndex: VectorIndex {
 
         // Reset all storage.
         layers = []
+        inEdges = []
         nodeLevels = []
         vectors = []
         metadata = []
@@ -557,6 +613,7 @@ public actor HNSWIndex: VectorIndex {
     private func ensureLayer(_ level: Int) {
         while layers.count <= level {
             layers.append(Array(repeating: [], count: vectors.count))
+            inEdges.append(Array(repeating: Set<Int>(), count: vectors.count))
         }
     }
 
@@ -610,6 +667,128 @@ public actor HNSWIndex: VectorIndex {
                     if results.count > ef {
                         results.pop()
                     }
+                }
+            }
+        }
+
+        var output: [(node: Int, distance: Float)] = []
+        output.reserveCapacity(results.count)
+        while let item = results.pop() {
+            output.append(item)
+        }
+        output.reverse()
+        return output
+    }
+
+    // ── Core: Graph-Aware Filtered Beam on Layer 0 (ADR-008 addendum) ─
+    //
+    // Differs from `searchLayer` in two ways:
+    //   1. Result candidacy: only live, predicate-passing nodes enter the
+    //      result heap. Rejected nodes (tombstoned or filtered out) still
+    //      join the candidate frontier, so the beam routes THROUGH them
+    //      toward matching regions instead of spending result slots on them.
+    //   2. Adaptive widening: the effective ef is recomputed from the
+    //      acceptance rate observed so far — roughly k / rate, add-one
+    //      smoothed, clamped to [ef, efCap] — so selective predicates keep
+    //      the beam exploring until k matching results are plausible. When
+    //      (nearly) every node passes, the recomputed value stays at `ef`
+    //      and the beam behaves like the unfiltered one.
+    //
+    // Termination: the beam stops early only once the result heap holds
+    // `effectiveEf` ACCEPTED nodes and the nearest frontier candidate is
+    // farther than the worst of them. With fewer matching nodes reachable
+    // than `effectiveEf`, the beam therefore explores the whole connected
+    // component — selective filters trade latency for filled, high-recall
+    // results (worst case O(liveCount) distance evaluations; the same
+    // trade hnswlib's filtered search makes). The unfiltered `searchLayer`
+    // path is untouched.
+
+    private func searchLayer0Filtered(
+        query: Vector,
+        entryPoint: Int,
+        ef: Int,
+        k: Int,
+        filter: (UUID) -> Bool
+    ) -> [(node: Int, distance: Float)] {
+        // Cap on adaptive widening: bounds the result-heap size and how far
+        // the early-exit check can be deferred once results ARE plentiful.
+        // liveCount is the natural ceiling.
+        let efCap = max(ef, min(liveCount, 16 * max(ef, k)))
+        var effectiveEf = ef
+
+        // Acceptance bookkeeping counts predicate *evaluations*, not visits:
+        // far nodes that never pass frontier admission are never evaluated.
+        var evaluated = 0
+        var accepted = 0
+
+        // Liveness first (identity-based tombstone check), then the user
+        // predicate — the filter is never invoked for tombstoned slots,
+        // matching the post-filter path's contract.
+        func acceptsIntoResults(_ node: Int) -> Bool {
+            evaluated += 1
+            guard isLiveNode(node) else { return false }
+            guard filter(nodeToUUID[node]) else { return false }
+            accepted += 1
+            return true
+        }
+
+        // effectiveEf ≈ k / acceptance-rate, add-one smoothed so an early
+        // run of rejections widens gradually rather than jumping to the cap.
+        // Recomputed (not monotonic): the estimate self-corrects as more
+        // nodes are evaluated.
+        func rewiden() {
+            let rate = Double(accepted + 1) / Double(evaluated + 1)
+            let needed = Int((Double(k) / rate).rounded(.up))
+            effectiveEf = min(efCap, max(ef, needed))
+        }
+
+        let epDist = metric.distance(query, vectors[entryPoint])
+
+        var candidates = Heap<(node: Int, distance: Float)>(comparator: { $0.distance < $1.distance })
+        candidates.push((entryPoint, epDist))
+
+        var results = Heap<(node: Int, distance: Float)>(comparator: { $0.distance > $1.distance })
+        if acceptsIntoResults(entryPoint) {
+            results.push((entryPoint, epDist))
+        }
+        rewiden()
+
+        var visited = Set<Int>([entryPoint])
+
+        while !candidates.isEmpty {
+            let nearest = candidates.pop()!
+
+            // Early exit only once the (widened) beam is full of accepted
+            // nodes — an under-filled beam keeps routing through rejects.
+            if results.count >= effectiveEf,
+               let furthest = results.peek(),
+               nearest.distance > furthest.distance {
+                break
+            }
+
+            for neighbor in layers[0][nearest.node] {
+                guard !visited.contains(neighbor) else { continue }
+                visited.insert(neighbor)
+
+                let dist = metric.distance(query, vectors[neighbor])
+
+                let shouldExplore: Bool
+                if results.count < effectiveEf {
+                    shouldExplore = true
+                } else if let furthest = results.peek(), dist < furthest.distance {
+                    shouldExplore = true
+                } else {
+                    shouldExplore = false
+                }
+                guard shouldExplore else { continue }
+
+                candidates.push((neighbor, dist))
+                if acceptsIntoResults(neighbor) {
+                    results.push((neighbor, dist))
+                }
+                rewiden()
+                while results.count > effectiveEf {
+                    results.pop()
                 }
             }
         }
@@ -696,7 +875,37 @@ public actor HNSWIndex: VectorIndex {
             m: maxConnections
         )
 
-        layers[layer][node] = selected.map(\.node)
+        setNeighbors(selected.map(\.node), node: node, layer: layer)
+    }
+
+    // ── Reverse-Adjacency Maintenance ─────────────────────────────────
+    //
+    // Every mutation of `layers` flows through these two helpers (plus the
+    // slot mirroring in add()/ensureLayer() and the wholesale resets in
+    // compact()/init(restoring:)), so `inEdges` is always the exact
+    // transpose of `layers`. Tests assert that invariant through
+    // `reverseAdjacencyIsConsistent`.
+
+    /// Appends the directed edge `from → to` on a layer, recording the
+    /// reverse entry. Callers guarantee the edge is not already present
+    /// (adjacency lists never hold duplicates).
+    private func addEdge(from: Int, to: Int, layer: Int) {
+        layers[layer][from].append(to)
+        inEdges[layer][to].insert(from)
+    }
+
+    /// Replaces a node's out-edge list on a layer, diffing old vs. new to
+    /// keep `inEdges` in sync. O(old + new).
+    private func setNeighbors(_ newNeighbors: [Int], node: Int, layer: Int) {
+        let oldSet = Set(layers[layer][node])
+        let newSet = Set(newNeighbors)
+        for dropped in oldSet.subtracting(newSet) {
+            inEdges[layer][dropped].remove(node)
+        }
+        for added in newSet.subtracting(oldSet) {
+            inEdges[layer][added].insert(node)
+        }
+        layers[layer][node] = newNeighbors
     }
 
     // ── Liveness ──────────────────────────────────────────────────────
@@ -721,6 +930,26 @@ public actor HNSWIndex: VectorIndex {
             }
         }
         return false
+    }
+
+    /// Structural invariant: `inEdges` must be exactly the transpose of
+    /// `layers` — every edge u→v on layer l is mirrored by v's in-set
+    /// containing u, and nothing else. O(total edges); used by tests to
+    /// verify the map stays consistent through add/prune/remove/compact
+    /// and is rebuilt correctly on restore.
+    internal var reverseAdjacencyIsConsistent: Bool {
+        guard inEdges.count == layers.count else { return false }
+        for l in layers.indices {
+            guard inEdges[l].count == layers[l].count else { return false }
+            var expected = Array(repeating: Set<Int>(), count: layers[l].count)
+            for (from, neighbors) in layers[l].enumerated() {
+                for to in neighbors {
+                    expected[to].insert(from)
+                }
+            }
+            if expected != inEdges[l] { return false }
+        }
+        return true
     }
 
     /// Whether every live node is reachable from every other live node by

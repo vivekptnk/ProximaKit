@@ -24,15 +24,52 @@ public struct PQConfiguration: Sendable, Codable, Equatable {
     /// Number of k-means iterations during training.
     public let trainingIterations: Int
 
+    /// Seeds the k-means centroid-initialization draws so training is
+    /// reproducible: the same training vectors and configuration yield
+    /// byte-identical codebooks (and therefore identical codes).
+    ///
+    /// `nil` (the default) uses the system RNG. The seed is a training-time
+    /// knob only — it is NOT persisted (mirroring
+    /// `HNSWConfiguration.levelSeed`), because it affects how a codebook is
+    /// trained, never how a trained quantizer encodes or searches.
+    public let seed: UInt64?
+
     public init(
         subspaceCount: Int,
-        trainingIterations: Int = 25
+        trainingIterations: Int = 25,
+        seed: UInt64? = nil
     ) {
         precondition(subspaceCount > 0, "subspaceCount must be positive")
         precondition(trainingIterations > 0, "trainingIterations must be positive")
         self.subspaceCount = subspaceCount
         self.centroidsPerSubspace = 256
         self.trainingIterations = trainingIterations
+        self.seed = seed
+    }
+
+    // ── Codable ──────────────────────────────────────────────────────
+    //
+    // `seed` is deliberately excluded from coding. The binary codecs
+    // (ADR-011: PQTT / PQHW) serialize subspaceCount and
+    // trainingIterations as individual UInt32 header fields and never
+    // encode this struct wholesale, so the on-disk formats are unaffected
+    // either way — but keeping the key out of CodingKeys also leaves the
+    // public Codable layout identical to pre-seed releases, and a decoded
+    // configuration honestly reports `nil` (the seed that trained an
+    // existing codebook is not recoverable from its serialized form).
+
+    private enum CodingKeys: String, CodingKey {
+        case subspaceCount
+        case centroidsPerSubspace
+        case trainingIterations
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.subspaceCount = try container.decode(Int.self, forKey: .subspaceCount)
+        self.centroidsPerSubspace = try container.decode(Int.self, forKey: .centroidsPerSubspace)
+        self.trainingIterations = try container.decode(Int.self, forKey: .trainingIterations)
+        self.seed = nil
     }
 }
 
@@ -115,6 +152,9 @@ public struct ProductQuantizer: Sendable {
 
     /// Trains a product quantizer on a set of vectors using k-means clustering.
     ///
+    /// Training is reproducible when `config.seed` is set: the same training
+    /// vectors and configuration yield byte-identical codebooks.
+    ///
     /// - Parameters:
     ///   - vectors: Training vectors as a flat row-major `[Float]` of length `n * dimension`.
     ///   - vectorCount: Number of training vectors.
@@ -163,14 +203,19 @@ public struct ProductQuantizer: Sendable {
                 }
             }
 
-            // Run k-means on this subspace.
+            // Run k-means on this subspace. Each subspace derives its own
+            // seed (base &+ m) so a seeded run doesn't reuse one
+            // initialization index sequence across all M subspaces;
+            // SplitMix64 yields well-scrambled streams from sequential seeds
+            // (that splitting is its design purpose).
             let effectiveK = min(K, vectorCount)
             var centroids = kmeans(
                 data: subVectors,
                 vectorCount: vectorCount,
                 dimension: ds,
                 k: effectiveK,
-                iterations: config.trainingIterations
+                iterations: config.trainingIterations,
+                seed: config.seed.map { $0 &+ UInt64(m) }
             )
 
             // Pad to K centroids if training set was smaller than K.
@@ -447,24 +492,36 @@ public struct ProductQuantizer: Sendable {
 ///   - dimension: Dimension of each vector.
 ///   - k: Number of clusters (centroids).
 ///   - iterations: Number of iterations.
+///   - seed: Seeds the centroid-initialization draws — the only source of
+///     randomness in this function — making the result reproducible.
+///     `nil` (the default) draws from the system RNG.
 /// - Returns: Flat row-major centroids, `k * dimension` floats.
 func kmeans(
     data: [Float],
     vectorCount: Int,
     dimension: Int,
     k: Int,
-    iterations: Int
+    iterations: Int,
+    seed: UInt64? = nil
 ) -> [Float] {
     precondition(vectorCount >= k, "Need at least k training vectors")
 
     // Initialize centroids by sampling k random vectors (without replacement).
+    // The assignment and update steps below are fully deterministic, so a
+    // seeded initialization pins the entire training result.
+    var seededRNG = seed.map(SplitMix64.init(seed:))
     var usedIndices = Set<Int>()
     var centroids = [Float](repeating: 0, count: k * dimension)
 
     for j in 0..<k {
         var idx: Int
         repeat {
-            idx = Int.random(in: 0..<vectorCount)
+            if var rng = seededRNG {
+                idx = Int.random(in: 0..<vectorCount, using: &rng)
+                seededRNG = rng // write the advanced state back
+            } else {
+                idx = Int.random(in: 0..<vectorCount)
+            }
         } while usedIndices.contains(idx)
         usedIndices.insert(idx)
 

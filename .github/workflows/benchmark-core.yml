@@ -1,0 +1,175 @@
+name: Benchmark Core
+
+# Reusable job body shared by the `smoke` (PR gate) and `full` (nightly)
+# slices of the Cross-Library Benchmark. The triggers and per-slice inputs
+# live in benchmark.yml; everything that used to be copy-pasted between the
+# two ~100-line jobs lives here exactly once. (GitHub Actions supports
+# neither YAML anchors nor a per-matrix-row job `if:`, hence workflow_call.)
+
+on:
+  workflow_call:
+    inputs:
+      slice:
+        description: "Slice label baked into dataset/result names (smoke | full)"
+        required: true
+        type: string
+      size:
+        description: "Number of base vectors to index (BENCH_SIZE)"
+        required: true
+        type: string
+      queries:
+        description: "Number of query vectors (BENCH_QUERIES)"
+        required: true
+        type: string
+      size_label:
+        description: "Human-readable vector count for the job name (e.g. 10K)"
+        required: true
+        type: string
+      gate:
+        description: "Run the ProximaKit recall regression gate (PR slice only)"
+        required: false
+        type: boolean
+        default: false
+      min_recall:
+        description: "Minimum ProximaKit recall@10 the gate accepts"
+        required: false
+        type: string
+        default: "0.90"
+
+jobs:
+  bench:
+    name: Benchmark (${{ inputs.slice }}, ${{ inputs.size_label }})
+    runs-on: macos-15
+    env:
+      BENCH_SIZE: ${{ inputs.size }}
+      BENCH_QUERIES: ${{ inputs.queries }}
+      BENCH_SLICE: ${{ inputs.slice }}
+      BENCH_OUT: "out"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache SIFT1M
+        id: cache-sift
+        uses: actions/cache@v4
+        with:
+          path: Benchmarks/datasets/sift-1m
+          key: sift1m-v1
+
+      - name: Download SIFT1M (if not cached)
+        if: steps.cache-sift.outputs.cache-hit != 'true'
+        run: bash Benchmarks/datasets/download_sift1m.sh
+
+      # The upstream mirror is plain FTP with no published checksum; verify
+      # sizes + fvecs/ivecs structure + pinned SHA-256 digests for fresh
+      # downloads AND restored caches before any numbers are produced.
+      - name: Verify SIFT1M integrity
+        run: bash .github/ci-scripts/verify_sift1m.sh
+
+      - name: Build ProximaBench (release)
+        run: swift build -c release --package-path Benchmarks
+
+      - name: Install Python baselines
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r Benchmarks/python/requirements.txt
+
+      - name: Prepare output dir
+        run: mkdir -p "$BENCH_OUT"
+
+      - name: Compute ground truth (l2)
+        run: |
+          ./Benchmarks/.build/release/ProximaBench ground-truth \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --k 10 --metric l2 \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --out     "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json"
+
+      # ScaNN searches cosine (it unit-normalizes and uses dot product), so it
+      # must be scored against a cosine ground truth — scoring cosine results
+      # against the L2 GT produces a meaningless recall number, because SIFT
+      # vectors are not unit-norm and the two neighbor rankings differ.
+      - name: Compute ground truth (cosine, for ScaNN)
+        run: |
+          ./Benchmarks/.build/release/ProximaBench ground-truth \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --k 10 --metric cosine \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --out     "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__cosine__k10.json"
+
+      - name: ProximaKit HNSW (ef=50)
+        run: |
+          ./Benchmarks/.build/release/ProximaBench hnsw \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json" \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --k 10 --m 16 --efc 200 --ef 50 --metric l2 \
+            --notes   "github-actions ${{ github.run_id }}" \
+            --out     "$BENCH_OUT/ProximaKit__sift-1m-${BENCH_SLICE}__hnsw__ef50.json"
+
+      - name: FAISS HNSW (ef=50)
+        run: |
+          python Benchmarks/python/faiss_hnsw.py \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json" \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --k 10 --m 16 --efc 200 --ef 50 --metric l2 \
+            --notes   "github-actions ${{ github.run_id }}" \
+            --out     "$BENCH_OUT/FAISS__sift-1m-${BENCH_SLICE}__hnsw__ef50.json"
+
+      - name: ScaNN (skip if unavailable)
+        run: |
+          python -m pip install "scann>=1.3.0" || true
+          python Benchmarks/python/scann_hnsw.py \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__cosine__k10.json" \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --k 10 --num-leaves 100 --num-leaves-to-search 10 --reorder 100 \
+            --metric cosine --skip-if-unavailable \
+            --notes   "github-actions ${{ github.run_id }}" \
+            --out     "$BENCH_OUT/ScaNN__sift-1m-${BENCH_SLICE}__scann__leaves100.json"
+
+      - name: Aggregate comparison table
+        run: |
+          python Benchmarks/python/compare.py --in "$BENCH_OUT/" --out "$BENCH_OUT/compare.md"
+          cat "$BENCH_OUT/compare.md"
+
+      # PR regression gate (smoke slice only — `gate: true`): fail the check
+      # if ProximaKit recall@10 drops below threshold (or its result file is
+      # missing entirely). Latency stays advisory-only — shared runners are
+      # too noisy to gate on. Nightly/full runs pass `gate: false` so a noisy
+      # scheduled run cannot page anyone.
+      - name: Recall regression gate
+        if: ${{ inputs.gate }}
+        env:
+          MIN_RECALL: ${{ inputs.min_recall }}
+        run: |
+          python Benchmarks/python/compare.py --in "$BENCH_OUT/" \
+            --min-recall "$MIN_RECALL" --gate-library ProximaKit > /dev/null
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ inputs.slice }}-${{ github.run_id }}
+          path: |
+            out/*.json
+            out/compare.md
+          if-no-files-found: error
+          retention-days: 30
