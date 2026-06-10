@@ -367,4 +367,38 @@ final class DistanceTests: XCTestCase {
         XCTAssertEqual(DistanceMetricType.manhattan.rawValue, 3)
         XCTAssertEqual(DistanceMetricType.hamming.rawValue, 4)
     }
+
+    // MARK: - Batch/scalar parity on zero vectors (CHA-201 audit, high)
+
+    /// The batch cosine fast path must agree with the scalar metric on
+    /// zero-magnitude vectors: similarity is undefined → distance 1.0
+    /// (neutral), never 0 (perfect match).
+    func testBatchCosineZeroVectorMatchesScalar() {
+        let metric = CosineDistance()
+        let query = Vector([1, 2, 3])
+        let zero = Vector([0, 0, 0])
+        let normal = Vector([3, 2, 1])
+
+        let scalarZero = metric.distance(query, zero)
+        let batch = batchDistances(query: query, vectors: [zero, normal], metric: metric)
+
+        XCTAssertEqual(batch[0], scalarZero, accuracy: 1e-6,
+                       "batch must match scalar on a zero stored vector")
+        XCTAssertEqual(batch[0], 1.0, accuracy: 1e-6)
+        XCTAssertEqual(batch[1], metric.distance(query, normal), accuracy: 1e-5)
+    }
+
+    /// Same parity requirement for a zero-magnitude QUERY.
+    func testBatchCosineZeroQueryMatchesScalar() {
+        let metric = CosineDistance()
+        let zeroQuery = Vector([0, 0, 0])
+        let stored = Vector([1, 2, 3])
+
+        let scalar = metric.distance(zeroQuery, stored)
+        let batch = batchDistances(query: zeroQuery, vectors: [stored], metric: metric)
+
+        XCTAssertEqual(batch[0], scalar, accuracy: 1e-6,
+                       "batch must match scalar on a zero query")
+        XCTAssertEqual(batch[0], 1.0, accuracy: 1e-6)
+    }
 }

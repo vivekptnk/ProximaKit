@@ -21,6 +21,12 @@ concurrency:
   group: benchmark-${{ github.ref }}
   cancel-in-progress: true
 
+# NOTE on duplication: the `smoke` and `full` jobs are intentionally parallel
+# copies differing only in env values and the gate step. GitHub Actions does
+# not support YAML anchors, and a job-level `if:` cannot vary per matrix row,
+# so true deduplication needs a reusable (workflow_call) workflow.
+# TODO(audit/ci): extract the shared steps into a reusable workflow; until
+# then, ANY step change below must be applied to BOTH jobs.
 jobs:
   smoke:
     name: Benchmark (smoke, 10K)
@@ -53,6 +59,12 @@ jobs:
         if: steps.cache-sift.outputs.cache-hit != 'true'
         run: bash Benchmarks/datasets/download_sift1m.sh
 
+      # The upstream mirror is plain FTP with no published checksum; verify
+      # sizes + fvecs/ivecs structure (and log SHA-256s) for fresh downloads
+      # AND restored caches before any numbers are produced from the data.
+      - name: Verify SIFT1M integrity
+        run: bash .github/ci-scripts/verify_sift1m.sh
+
       - name: Build ProximaBench (release)
         run: swift build -c release --package-path Benchmarks
 
@@ -64,7 +76,7 @@ jobs:
       - name: Prepare output dir
         run: mkdir -p "$BENCH_OUT"
 
-      - name: Compute ground truth
+      - name: Compute ground truth (l2)
         run: |
           ./Benchmarks/.build/release/ProximaBench ground-truth \
             --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
@@ -73,6 +85,20 @@ jobs:
             --k 10 --metric l2 \
             --dataset "sift-1m-${BENCH_SLICE}" \
             --out     "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json"
+
+      # ScaNN searches cosine (it unit-normalizes and uses dot product), so it
+      # must be scored against a cosine ground truth — scoring cosine results
+      # against the L2 GT produces a meaningless recall number, because SIFT
+      # vectors are not unit-norm and the two neighbor rankings differ.
+      - name: Compute ground truth (cosine, for ScaNN)
+        run: |
+          ./Benchmarks/.build/release/ProximaBench ground-truth \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --k 10 --metric cosine \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --out     "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__cosine__k10.json"
 
       - name: ProximaKit HNSW (ef=50)
         run: |
@@ -104,7 +130,7 @@ jobs:
           python Benchmarks/python/scann_hnsw.py \
             --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
             --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
-            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json" \
+            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__cosine__k10.json" \
             --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
             --dataset "sift-1m-${BENCH_SLICE}" \
             --k 10 --num-leaves 100 --num-leaves-to-search 10 --reorder 100 \
@@ -116,6 +142,14 @@ jobs:
         run: |
           python Benchmarks/python/compare.py --in "$BENCH_OUT/" --out "$BENCH_OUT/compare.md"
           cat "$BENCH_OUT/compare.md"
+
+      # PR regression gate: fail the check if ProximaKit recall@10 drops below
+      # threshold (or its result file is missing entirely). Latency stays
+      # advisory-only — shared runners are too noisy to gate on.
+      - name: Recall regression gate
+        run: |
+          python Benchmarks/python/compare.py --in "$BENCH_OUT/" \
+            --min-recall 0.90 --gate-library ProximaKit > /dev/null
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -158,6 +192,10 @@ jobs:
         if: steps.cache-sift.outputs.cache-hit != 'true'
         run: bash Benchmarks/datasets/download_sift1m.sh
 
+      # See the comment in the smoke job — verifies fresh downloads AND caches.
+      - name: Verify SIFT1M integrity
+        run: bash .github/ci-scripts/verify_sift1m.sh
+
       - name: Build ProximaBench (release)
         run: swift build -c release --package-path Benchmarks
 
@@ -169,7 +207,7 @@ jobs:
       - name: Prepare output dir
         run: mkdir -p "$BENCH_OUT"
 
-      - name: Compute ground truth
+      - name: Compute ground truth (l2)
         run: |
           ./Benchmarks/.build/release/ProximaBench ground-truth \
             --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
@@ -178,6 +216,18 @@ jobs:
             --k 10 --metric l2 \
             --dataset "sift-1m-${BENCH_SLICE}" \
             --out     "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json"
+
+      # See the comment in the smoke job — ScaNN must be scored against a
+      # cosine GT, not the L2 one.
+      - name: Compute ground truth (cosine, for ScaNN)
+        run: |
+          ./Benchmarks/.build/release/ProximaBench ground-truth \
+            --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
+            --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
+            --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
+            --k 10 --metric cosine \
+            --dataset "sift-1m-${BENCH_SLICE}" \
+            --out     "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__cosine__k10.json"
 
       - name: ProximaKit HNSW (ef=50)
         run: |
@@ -209,7 +259,7 @@ jobs:
           python Benchmarks/python/scann_hnsw.py \
             --base    Benchmarks/datasets/sift-1m/sift_base.fvecs \
             --queries Benchmarks/datasets/sift-1m/sift_query.fvecs \
-            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__k10.json" \
+            --gt      "$BENCH_OUT/GroundTruth__sift-1m-${BENCH_SLICE}__cosine__k10.json" \
             --size    "$BENCH_SIZE" --query-count "$BENCH_QUERIES" \
             --dataset "sift-1m-${BENCH_SLICE}" \
             --k 10 --num-leaves 100 --num-leaves-to-search 10 --reorder 100 \
@@ -221,6 +271,9 @@ jobs:
         run: |
           python Benchmarks/python/compare.py --in "$BENCH_OUT/" --out "$BENCH_OUT/compare.md"
           cat "$BENCH_OUT/compare.md"
+
+      # Nightly/full runs are informational — no recall gate here, so a noisy
+      # scheduled run cannot page anyone. The PR smoke job is the gate.
 
       - name: Upload results
         uses: actions/upload-artifact@v4

@@ -347,4 +347,49 @@ final class QuantizedHNSWIndexTests: XCTestCase {
         XCTAssertGreaterThan(avgRecall, 0.50,
             "QuantizedHNSW recall@10 should be >50% on clustered data (got \(avgRecall))")
     }
+
+    /// remove -> save -> load must NOT resurrect tombstoned ids — the PQHW
+    /// codec shares the save-time compaction fix with SQHW (CHA-201
+    /// final-signoff blocker).
+    func testRemoveSaveLoadDoesNotResurrectTombstones() async throws {
+        var rng = SeededRandom(seed: 0x0DEAD_9097)
+        var vectors: [Vector] = []
+        var ids: [UUID] = []
+        for _ in 0..<64 {
+            vectors.append(Vector((0..<8).map { _ in Float.random(in: -1...1, using: &rng) }))
+            ids.append(UUID())
+        }
+        let index = try await QuantizedHNSWIndex.build(
+            vectors: vectors, ids: ids, dimension: 8,
+            hnswConfig: HNSWConfiguration(m: 8, efConstruction: 100, efSearch: 50,
+                                          levelSeed: 0x9097_5EED),
+            pqConfig: PQConfiguration(subspaceCount: 2, trainingIterations: 5)
+        )
+        let removed = Array(ids.prefix(16))
+        for id in removed {
+            let ok = await index.remove(id: id)
+            XCTAssertTrue(ok)
+        }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pq-tombstone-\(UUID().uuidString).pqhw")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await index.save(to: url)
+        let loaded = try QuantizedHNSWIndex.load(from: url)
+
+        let count = await loaded.count
+        let live = await loaded.liveCount
+        XCTAssertEqual(count, 48, "dead slots must be compacted out at save")
+        XCTAssertEqual(live, 48)
+
+        for id in removed {
+            let again = await loaded.remove(id: id)
+            XCTAssertFalse(again, "tombstoned id must not be resurrected by load")
+        }
+        let removedSet = Set(removed)
+        let results = await loaded.search(query: vectors[30], k: 10)
+        XCTAssertFalse(results.isEmpty)
+        XCTAssertTrue(results.allSatisfy { !removedSet.contains($0.id) })
+    }
+
 }

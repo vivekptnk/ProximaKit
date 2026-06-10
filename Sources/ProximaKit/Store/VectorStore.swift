@@ -19,6 +19,7 @@ import Foundation
 ///     embedder: myEmbedder,
 ///     storageDirectory: appSupportURL
 /// )
+/// try await store.loadDocumentMap()  // when reopening a persisted store
 /// let ids = try await store.addChunks(texts, metadata: metas)
 /// let results = try await store.query("key findings", k: 5)
 /// try await store.save()
@@ -40,11 +41,22 @@ public actor VectorStore {
     public nonisolated let storageURL: URL
 
     /// Tracks which document IDs map to which vector UUIDs.
-    /// Rebuilt from metadata on load.
+    /// Persisted to `docmap.json` on save; restored via ``loadDocumentMap()``.
     private var documentMap: [String: Set<UUID>] = [:]
 
+    /// Monotonic counter bumped on every committed mutation.
+    /// ``save()`` snapshots this value before writing and only marks the
+    /// store clean if no mutation landed while the write was in flight.
+    private var mutationGeneration: UInt64 = 0
+
+    /// The mutation generation last persisted to disk.
+    private var savedGeneration: UInt64 = 0
+
     /// Whether the store has unsaved changes.
-    private var isDirty: Bool = false
+    private var isDirty: Bool { mutationGeneration != savedGeneration }
+
+    /// Tail of the compound-operation chain (see ``serialized(_:)``).
+    private var operationTail: Task<Void, Never>?
 
     // MARK: - Initialization
 
@@ -52,6 +64,16 @@ public actor VectorStore {
     ///
     /// If a persisted index exists at the storage path, it is loaded.
     /// Otherwise, a fresh index is created with the given configuration.
+    ///
+    /// - Important: This initializer restores **only the index**. The
+    ///   document → UUID map is persisted separately (`docmap.json`) and is
+    ///   NOT loaded here — call ``loadDocumentMap()`` after init when
+    ///   reopening a persisted store. Until then, ``documentIds`` and
+    ///   ``chunkCount(forDocument:)`` report an empty map, and
+    ///   ``removeDocument(id:)`` throws
+    ///   ``VectorStoreError/documentNotFound(_:)`` for documents that are
+    ///   present in the index. Vector-level operations (``query(_:k:efSearch:filter:)``)
+    ///   work immediately.
     ///
     /// - Parameters:
     ///   - name: The collection name (used as the directory name within `storageDirectory`).
@@ -105,12 +127,42 @@ public actor VectorStore {
         self.storageURL = storageDirectory.appendingPathComponent(name)
     }
 
+    // MARK: - Operation Serialization
+
+    /// Runs `operation` after every previously enqueued compound operation
+    /// has finished.
+    ///
+    /// Actors are reentrant: at every `await`, another call can interleave.
+    /// Compound operations (``addChunks(_:metadata:)``, ``removeDocument(id:)``,
+    /// ``save()``) span multiple suspension points, so without serialization a
+    /// `save()` could persist a half-applied mutation and then mark the store
+    /// clean (silently losing the interleaved write), and a removal could drop
+    /// UUIDs inserted by a concurrent `addChunks`. Chaining them keeps reads
+    /// (``query(_:k:efSearch:filter:)``) concurrent while guaranteeing that
+    /// mutators and saves never overlap.
+    private func serialized<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let previous = operationTail
+        let task = Task<T, Error> {
+            await previous?.value
+            return try await operation()
+        }
+        // Park the new tail. Errors are surfaced to the caller below and
+        // must not break the chain for subsequent operations.
+        operationTail = Task { _ = try? await task.value }
+        return try await task.value
+    }
+
     // MARK: - Document-Level Operations
 
     /// Adds text chunks with metadata, embedding them automatically.
     ///
     /// Each chunk is embedded via the store's ``TextEmbedder`` and added
     /// to the underlying index with its metadata encoded as JSON.
+    ///
+    /// Runs serialized with other compound operations: it never interleaves
+    /// with an in-flight ``save()`` or ``removeDocument(id:)``.
     ///
     /// - Parameters:
     ///   - chunks: The text strings to embed and store.
@@ -132,6 +184,16 @@ public actor VectorStore {
             )
         }
 
+        return try await serialized {
+            try await self.performAddChunks(chunks, metadata: metadata)
+        }
+    }
+
+    /// Embeds and inserts chunks. Must only run inside ``serialized(_:)``.
+    private func performAddChunks(
+        _ chunks: [String],
+        metadata: [ChunkMetadata]
+    ) async throws -> [UUID] {
         // Batch embed all chunks.
         let vectors = try await embedder.embedBatch(chunks)
 
@@ -145,14 +207,16 @@ public actor VectorStore {
 
             try await index.add(vector, id: id, metadata: metaData)
 
-            // Track document → UUID mapping.
+            // Track document → UUID mapping. The generation is bumped per
+            // committed chunk so even a partially failed batch leaves the
+            // store marked dirty.
             let docId = metadata[i].documentId
             documentMap[docId, default: []].insert(id)
+            mutationGeneration += 1
 
             ids.append(id)
         }
 
-        isDirty = true
         return ids
     }
 
@@ -184,12 +248,23 @@ public actor VectorStore {
 
     /// Removes all chunks associated with a document ID.
     ///
+    /// Runs serialized with other compound operations: a concurrent
+    /// ``addChunks(_:metadata:)`` for the same document cannot interleave
+    /// with the removal loop, so freshly added chunks are never orphaned.
+    ///
     /// - Parameter id: The document identifier whose chunks should be removed.
     /// - Returns: The number of chunks removed.
     /// - Throws: ``VectorStoreError/documentNotFound(_:)`` if the document ID
     ///   is not tracked by this store.
     @discardableResult
     public func removeDocument(id: String) async throws -> Int {
+        try await serialized {
+            try await self.performRemoveDocument(id: id)
+        }
+    }
+
+    /// Removes a document's chunks. Must only run inside ``serialized(_:)``.
+    private func performRemoveDocument(id: String) async throws -> Int {
         guard let uuids = documentMap[id] else {
             throw VectorStoreError.documentNotFound(id)
         }
@@ -198,12 +273,16 @@ public actor VectorStore {
         for uuid in uuids {
             if await index.remove(id: uuid) {
                 removed += 1
+                mutationGeneration += 1
             }
         }
 
-        documentMap.removeValue(forKey: id)
-        if removed > 0 {
-            isDirty = true
+        // Subtract only the snapshotted UUIDs rather than dropping the entry
+        // wholesale: chunks inserted for the same document while the removal
+        // loop was suspended must not be orphaned in the index.
+        documentMap[id]?.subtract(uuids)
+        if documentMap[id]?.isEmpty == true {
+            documentMap.removeValue(forKey: id)
         }
 
         return removed
@@ -216,8 +295,24 @@ public actor VectorStore {
     /// as a separate JSON file for fast reload.
     ///
     /// Skips the write if no changes have been made since the last save.
+    /// Runs serialized with other compound operations: a mutation enqueued
+    /// while a save is in flight runs after it and re-dirties the store,
+    /// so it is never silently marked clean.
     public func save() async throws {
+        try await serialized {
+            try await self.performSave()
+        }
+    }
+
+    /// Writes the index and document map. Must only run inside ``serialized(_:)``.
+    private func performSave() async throws {
         guard isDirty else { return }
+
+        // Snapshot the generation and document map before any suspension
+        // point so the docmap written below matches the index snapshot even
+        // if a mutation were ever to interleave with this save.
+        let generation = mutationGeneration
+        let mapSnapshot = documentMap.mapValues { Array($0) }
 
         let fm = FileManager.default
         if !fm.fileExists(atPath: storageURL.path) {
@@ -228,14 +323,18 @@ public actor VectorStore {
         let indexURL = storageURL.appendingPathComponent("index.pxkt")
         try await index.save(to: indexURL)
 
-        // Save the document map for fast reload.
+        // Save the document map for fast reload. `.atomic` so a crash
+        // mid-write cannot leave a truncated/corrupt docmap.json behind.
         let mapURL = storageURL.appendingPathComponent("docmap.json")
-        let mapData = try JSONEncoder().encode(
-            documentMap.mapValues { Array($0) }
-        )
-        try mapData.write(to: mapURL)
+        let mapData = try JSONEncoder().encode(mapSnapshot)
+        try mapData.write(to: mapURL, options: .atomic)
 
-        isDirty = false
+        // Only mark clean if no mutation landed while the files were being
+        // written; otherwise the store stays dirty and the next save
+        // persists the newer state.
+        if mutationGeneration == generation {
+            savedGeneration = generation
+        }
     }
 
     /// Loads the document map from disk if it exists.

@@ -466,4 +466,32 @@ final class HNSWTests: XCTestCase {
         let config = HNSWConfiguration()
         XCTAssertEqual(config.autoCompactionThreshold, 0.7)
     }
+
+    /// levelSeed makes graph construction reproducible: identical seeds and
+    /// insertion order produce identical search results; the seed is a
+    /// build-time knob only (CHA-201 wave-2: deterministic recall tests).
+    func testLevelSeedMakesConstructionDeterministic() async throws {
+        var rng = SeededRandom(seed: 0xD37E_2017)
+        let vectors = (0..<200).map { _ in
+            Vector((0..<16).map { _ in Float.random(in: -1...1, using: &rng) })
+        }
+        let ids = (0..<200).map { _ in UUID() }
+        let config = HNSWConfiguration(m: 8, efConstruction: 100, efSearch: 50,
+                                       levelSeed: 0xFEED_FACE)
+
+        let a = HNSWIndex(dimension: 16, metric: EuclideanDistance(), config: config)
+        let b = HNSWIndex(dimension: 16, metric: EuclideanDistance(), config: config)
+        for i in 0..<vectors.count {
+            try await a.add(vectors[i], id: ids[i])
+            try await b.add(vectors[i], id: ids[i])
+        }
+
+        for q in stride(from: 0, to: 200, by: 25) {
+            let ra = await a.search(query: vectors[q], k: 10)
+            let rb = await b.search(query: vectors[q], k: 10)
+            XCTAssertEqual(ra.map(\.id), rb.map(\.id),
+                           "same seed + same insertions must give identical graphs")
+        }
+    }
+
 }

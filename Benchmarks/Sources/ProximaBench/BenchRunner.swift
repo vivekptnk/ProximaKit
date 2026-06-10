@@ -25,7 +25,13 @@ struct BenchOptions {
 
 enum BenchRunner {
     static func run(_ opts: BenchOptions) async throws {
+        // Date() is wall-clock (subject to NTP slew) — keep it only for the
+        // human-readable runStartedAt timestamp. All measured intervals use
+        // ContinuousClock, matching the monotonic time.perf_counter() used by
+        // the Python baselines so cross-library latency numbers are comparable.
         let started = Date()
+        let clock = ContinuousClock()
+        let runStart = clock.now
 
         // ── Load data ─────────────────────────────────────────────────
         let base = try FVecLoader.loadFvecs(path: opts.baseVectorsPath, limit: opts.datasetSize)
@@ -57,14 +63,14 @@ enum BenchRunner {
             indexByUuid[id] = i
         }
 
-        let buildStart = Date()
+        let buildStart = clock.now
         for i in 0..<base.count {
             let start = i * base.dimension
             let end = start + base.dimension
             let slice = Array(base.data[start..<end])
             try await index.add(Vector(slice), id: uuidByIndex[i])
         }
-        let buildTime = Date().timeIntervalSince(buildStart)
+        let buildTime = (clock.now - buildStart).asSeconds
         let rssBytes = PlatformProbe.residentMemoryBytes()
 
         // ── Search + measure ──────────────────────────────────────────
@@ -77,9 +83,9 @@ enum BenchRunner {
             let qe = qs + queries.dimension
             let queryVec = Vector(Array(queries.data[qs..<qe]))
 
-            let t0 = Date()
+            let t0 = clock.now
             let results = await index.search(query: queryVec, k: opts.k)
-            let elapsed = Date().timeIntervalSince(t0) * 1000.0
+            let elapsed = (clock.now - t0).asMilliseconds
             latenciesMs.append(elapsed)
 
             let gtStart = q * gt.k
@@ -125,7 +131,7 @@ enum BenchRunner {
             platform: PlatformProbe.current(),
             seed: opts.seed,
             runStartedAt: ISO8601DateFormatter().string(from: started),
-            runDurationSeconds: Date().timeIntervalSince(started),
+            runDurationSeconds: (clock.now - runStart).asSeconds,
             notes: opts.notes
         )
 
@@ -157,4 +163,16 @@ enum BenchRunner {
             return EuclideanDistance()
         }
     }
+}
+
+// ── Monotonic Duration Helpers ────────────────────────────────────────
+private extension Duration {
+    /// Total duration in seconds as a Double.
+    var asSeconds: Double {
+        let parts = components
+        return Double(parts.seconds) + Double(parts.attoseconds) * 1e-18
+    }
+
+    /// Total duration in milliseconds as a Double.
+    var asMilliseconds: Double { asSeconds * 1000.0 }
 }

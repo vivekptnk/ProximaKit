@@ -27,6 +27,28 @@ final class CoreMLEmbeddingProviderTests: XCTestCase {
         }
     }
 
+    // ── Protocol Conformance (no model needed) ────────────────────────
+
+    /// Regression test (CHA audit): CoreMLEmbeddingProvider must conform to
+    /// EmbeddingProvider/TextEmbedder as the module docs and README state.
+    /// The assignments below fail to COMPILE if either conformance is removed,
+    /// so this test guards the contract without needing the model on disk.
+    func testConformsToEmbeddingProviderAndTextEmbedder() {
+        let providerType: any EmbeddingProvider.Type = CoreMLEmbeddingProvider.self
+        let embedderType: any TextEmbedder.Type = CoreMLEmbeddingProvider.self
+        XCTAssertTrue(providerType is CoreMLEmbeddingProvider.Type)
+        XCTAssertTrue(embedderType is CoreMLEmbeddingProvider.Type)
+    }
+
+    /// Embedding through the `any EmbeddingProvider` existential must behave
+    /// the same as calling the actor directly (skips if model is absent).
+    func testUsableThroughEmbeddingProviderExistential() async throws {
+        let provider: any EmbeddingProvider = try makeProvider()
+        let vector = try await provider.embed("protocol conformance check")
+        XCTAssertEqual(vector.dimension, provider.dimension)
+        XCTAssertGreaterThan(vector.magnitude, 0)
+    }
+
     // ── Model Loading ─────────────────────────────────────────────────
 
     func testLoadModel() throws {

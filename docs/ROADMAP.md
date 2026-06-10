@@ -1,6 +1,6 @@
 # ProximaKit Roadmap
 
-**Updated:** 2026-04-23
+**Updated:** 2026-06-09
 **Current release:** v1.4.0
 
 This document tracks planned improvements across the library, benchmarking harness, and demo experience. Items are grouped by theme, not by release, because ordering depends on dependencies and measured impact.
@@ -15,14 +15,14 @@ This document tracks planned improvements across the library, benchmarking harne
 - Dot product similarity
 - Manhattan / L1 distance
 - Hamming distance (binary vectors)
+- Chebyshev (L∞) distance
+- Bray-Curtis dissimilarity
+- Mahalanobis distance (covariance- or inverse-covariance-initialised; search-only — not serialisable via `DistanceMetricType`, so indices built with it cannot be persisted)
 
 ### Planned
 
 | Metric | Use Case | Status |
 |--------|----------|--------|
-| Mahalanobis | Covariate-aware similarity; useful when embedding dimensions have different scales | Planned |
-| Chebyshev (L∞) | Grid/game-AI pathfinding over embedded state spaces | Planned |
-| Bray-Curtis | Ecological / compositional similarity (count vectors) | Planned |
 | Jensen-Shannon divergence | Probability distribution comparison | Considering |
 
 All new metrics must satisfy the `DistanceMetric` protocol and pass the existing symmetry + triangle-inequality tests before merge.
@@ -31,22 +31,24 @@ All new metrics must satisfy the `DistanceMetric` protocol and pass the existing
 
 ## Quantization & Memory Efficiency
 
-ProximaKit currently stores all vectors as `Float32`. The next major memory reduction comes from quantization.
+Full-precision indexes store vectors as `Float32`; both quantization tiers below ship as alternatives when memory is the constraint.
 
-### INT8 Scalar Quantization
+### INT8 Scalar Quantization — Shipped
 
-Store each vector component as a signed 8-bit integer with a per-vector scale factor. Reduces index memory by ~4×; query accuracy degrades by ~1–2% Recall@10 at typical efSearch values. An ADR will document the chosen dequantization point (query-time vs. compare-time) and the tradeoff against vDSP batch alignment requirements.
+Store each vector component as a signed 8-bit integer with a per-vector scale factor. Reduces vector storage by ~4× (e.g. 384d: 1,536 B → 388 B per vector) with no training phase, and — unlike PQ's L2-only ADC — works with any serialisable distance metric.
 
-### Product Quantization (PQ)
+Implemented in `ScalarQuantizer` + `ScalarQuantizedHNSWIndex` (query-time reconstruction through the configured metric, binary persistence, acceptance-tested recall floors of ≥ 0.95 Recall@10 euclidean / ≥ 0.93 cosine). The dequantization-point decision (query-time vs. compare-time) and codec format are documented in [ADR-007](adr/ADR-007-int8-scalar-quantization.md).
+
+### Product Quantization (PQ) — Shipped (v1.4.0)
 
 Divide each vector into `M` sub-vectors, each quantized to a `K`-centroid codebook. Memory footprint: `N × M × log₂(K)` bits vs. `N × d × 32` bits. Enables 32–128× compression at moderate recall cost.
 
-**Complexity note:** PQ requires a training phase (k-means over the vector population) and adds a codebook persistence format. An ADR is needed before starting implementation to agree on the API surface and codec versioning.
+Implemented in `ProductQuantizer` + `QuantizedHNSWIndex` (asymmetric distance computation, codebook persistence in `ProductQuantizerPersistence`). The codec format is documented in [ADR-011](adr/ADR-011-pq-codec.md).
 
 ### Status
 
-- INT8 scalar quantization: ADR draft in progress (ADR-007)
-- PQ: design phase, no ADR yet
+- PQ: **shipped** — `QuantizedHNSWIndex` with ADC and persistence; retrospective ADR accepted ([ADR-011](adr/ADR-011-pq-codec.md))
+- INT8 scalar quantization: **shipped** — `ScalarQuantizer` + `ScalarQuantizedHNSWIndex` with persistence and acceptance tests; ADR accepted ([ADR-007](adr/ADR-007-int8-scalar-quantization.md))
 
 ---
 
@@ -73,14 +75,14 @@ Building a 100K-vector HNSW index on CPU (M-series) currently takes ~30–60 s. 
 
 ## Filtered Search
 
-Support a metadata predicate in `VectorIndex.search(query:k:filter:)` that narrows the candidate set before or during ANN traversal. Two strategies:
+`VectorIndex.search(query:k:efSearch:filter:)` ships with a **post-filter** strategy across all index types (HNSW, BruteForce, QuantizedHNSW, Sparse, Hybrid, and the stores). Two strategies were considered:
 
-| Strategy | Recall | Latency | Notes |
-|----------|--------|---------|-------|
-| Post-filter | Lower (may return < k) | Fast | Simple; degrades with high selectivity |
-| Graph-aware filter | Higher | Slower build | Requires filter-aware neighbour selection in HNSW |
+| Strategy | Recall | Latency | Status |
+|----------|--------|---------|--------|
+| Post-filter | Lower (may return < k) | Fast | **Shipped** — predicate applied during candidate traversal |
+| Graph-aware filter | Higher | Slower build | Planned — requires filter-aware neighbour selection in HNSW |
 
-An ADR will evaluate both strategies against a selectivity benchmark (10%, 1%, 0.1% pass rate) before committing to the API.
+The post-filter decision and the graph-aware upgrade path (with the selectivity benchmark at 10%, 1%, 0.1% pass rates as acceptance criteria) are documented in [ADR-008](adr/ADR-008-filtered-search.md).
 
 ---
 
@@ -88,7 +90,7 @@ An ADR will evaluate both strategies against a selectivity benchmark (10%, 1%, 0
 
 - **Incremental delete:** current `remove(id:)` marks nodes as deleted (tombstone). A background compaction pass to physically remove tombstoned nodes and relink the graph is deferred; it requires an ADR on compaction policy.
 - **Hierarchical NSW variant with dynamic `M`:** vary the number of connections per layer based on layer height to improve recall at low `efSearch` values.
-- **Serialisation versioning:** add a format version byte to `.proxima` files so future changes to the binary layout are detectable and recoverable.
+- **Serialisation versioning:** a magic number (`PXKT`) and format version field are already written and validated on load (`PersistenceError.unsupportedVersion`). The format-evolution policy (monotonic version bumps, N-1 reads, documented defaults, mandatory corruption tests) is settled in [ADR-010](adr/ADR-010-format-evolution.md); format v2 shipped under it.
 
 ---
 
@@ -96,11 +98,12 @@ An ADR will evaluate both strategies against a selectivity benchmark (10%, 1%, 0
 
 | ADR | Topic | Status |
 |-----|-------|--------|
-| ADR-006 | Lumen integration (ProximaKit as KV-store backend) | Draft (in `docs/`) |
-| ADR-007 | INT8 scalar quantization: dequantization policy + codec format | In progress |
-| ADR-008 | Filtered search: post-filter vs. graph-aware strategy | Not started |
+| ADR-006 | Lumen integration (ProximaKit as KV-store backend) | Draft (in `docs/adr/`) |
+| ADR-007 | INT8 scalar quantization: dequantization policy + codec format | Accepted |
+| ADR-008 | Filtered search: post-filter shipped; document decision + graph-aware upgrade path | Accepted (retrospective) |
 | ADR-009 | Metal backend abstraction layer | Not started |
-| ADR-010 | Serialisation versioning and format evolution | Not started |
+| ADR-010 | Serialisation format evolution policy (version field already shipped) | Accepted |
+| ADR-011 | Product quantization codec format (`PQTT` / `PQHW`, ADC, K=256) | Accepted (retrospective) |
 
 ---
 
@@ -121,10 +124,10 @@ The `ProximaDemoApp` (macOS SwiftUI) ships with the repo and demonstrates semant
 
 ## Documentation & Developer Experience
 
-Flagged in the [documentation audit](../docs/DOCUMENTATION-AUDIT.md) as out of scope for the initial documentation push but tracked here for completeness:
+Flagged during the documentation audit as out of scope for the initial documentation push but tracked here for completeness:
 
 - CONTRIBUTING.md — polish onboarding flow, add `scripts/check-imports.sh` usage note
-- CHANGELOG.md — backfill pre-v1.0 history; switch to Keep-a-Changelog format
+- CHANGELOG.md — backfill pre-v1.0 history (Keep-a-Changelog format already adopted)
 - Demo app README — expand with CoreML model install instructions
 - DocC Getting Started tutorial — interactive tutorial linked from the docc catalog
 

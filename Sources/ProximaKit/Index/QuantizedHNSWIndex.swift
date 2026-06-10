@@ -69,10 +69,12 @@ public actor QuantizedHNSWIndex {
     var uuidToNode: [UUID: Int]
     var metadata: [Data?]
 
-    /// The number of vectors in the index.
+    /// The number of slots in the index, **including tombstoned (removed) nodes**.
+    /// Use `liveCount` to get the number of searchable vectors.
+    /// Equal to `liveCount` right after `build(...)`; diverges after `remove(id:)`.
     public var count: Int { codes.count }
 
-    /// The number of live (non-tombstoned) vectors.
+    /// The number of live (non-tombstoned) vectors available for search.
     public var liveCount: Int { uuidToNode.count }
 
     // ── Memory Statistics ────────────────────────────────────────────
@@ -132,6 +134,10 @@ public actor QuantizedHNSWIndex {
     ///
     /// The full vectors are discarded after building — only the graph and PQ codes are kept.
     ///
+    /// Duplicate ids follow `HNSWIndex`'s replace-on-duplicate semantics: the
+    /// *last* vector for a given id wins, and the built index contains one node
+    /// per distinct id (`count == liveCount`, both equal to the distinct-id count).
+    ///
     /// - Parameters:
     ///   - vectors: The vectors to index.
     ///   - ids: UUID for each vector. Must have the same count as `vectors`.
@@ -172,11 +178,17 @@ public actor QuantizedHNSWIndex {
             config: pqConfig
         )
 
-        // Phase 3: Encode all vectors to PQ codes.
-        let pqCodes = vectors.map { pq.encode($0) }
-
-        // Phase 4: Extract graph structure from the full index.
+        // Phase 3: Extract graph structure from the full index.
+        // persistenceSnapshot() COMPACTS when slots were tombstoned (e.g. a
+        // duplicate id replaced an earlier vector), renumbering every node.
         let snapshot = try await fullIndex.persistenceSnapshot()
+
+        // Phase 4: Encode PQ codes from the snapshot's vectors — NOT from the
+        // raw input — so codes/metadata stay positionally aligned with the
+        // snapshot's node order (`snapshot.layers` / `snapshot.nodeToUUID`).
+        // Encoding from the input would silently shift every code and metadata
+        // payload after a compacted slot.
+        let pqCodes = snapshot.vectors.map { pq.encode($0) }
 
         // Build the UUID lookup.
         var uuidToNode: [UUID: Int] = [:]
@@ -195,7 +207,7 @@ public actor QuantizedHNSWIndex {
             codes: pqCodes,
             nodeToUUID: snapshot.nodeToUUID,
             uuidToNode: uuidToNode,
-            metadata: metadataArray
+            metadata: snapshot.metadata
         )
     }
 
@@ -213,6 +225,11 @@ public actor QuantizedHNSWIndex {
     ///   - efSearch: Beam width override. Defaults to the HNSW config value.
     ///   - filter: Optional predicate to exclude vectors by ID.
     /// - Returns: Up to `k` results, sorted by ascending distance.
+    ///
+    /// - Important: If `query.dimension` does not match the index dimension,
+    ///   this returns `[]` rather than throwing. If you get empty results from
+    ///   a non-empty index, check that the query embedder produces vectors of
+    ///   the index's dimension.
     public func search(
         query: Vector,
         k: Int,
@@ -249,7 +266,9 @@ public actor QuantizedHNSWIndex {
         var results: [SearchResult] = []
         for (node, distance) in candidates {
             let uuid = nodeToUUID[node]
-            guard uuidToNode[uuid] != nil else { continue }
+            // Identity check: a slot is live only if its UUID maps back to it
+            // (a re-added UUID maps to a newer node, tombstoning this slot).
+            guard uuidToNode[uuid] == node else { continue }
             if let filter = filter, !filter(uuid) { continue }
             results.append(SearchResult(
                 id: uuid,
@@ -269,14 +288,23 @@ public actor QuantizedHNSWIndex {
     // ── Remove ───────────────────────────────────────────────────────
 
     /// Removes a vector by its ID (tombstone — graph edges are disconnected).
+    ///
+    /// The graph was built by a full-precision `HNSWIndex`, whose insertion-time
+    /// pruning is one-sided: a live node can hold an edge to this node without a
+    /// reciprocal edge. A full reverse-edge sweep — O(E_l) per layer — is therefore
+    /// required to leave no dangling references. Unlike `HNSWIndex.remove(id:)`,
+    /// no neighbor reconnection is performed (the full vectors needed for the
+    /// diversity heuristic were discarded at build time); heavy removal workloads
+    /// should rebuild the index for best recall.
     @discardableResult
     public func remove(id: UUID) -> Bool {
         guard let node = uuidToNode[id] else { return false }
         let level = nodeLevels[node]
 
         for l in 0...level where l < layers.count {
-            for neighbor in layers[l][node] {
-                layers[l][neighbor].removeAll { $0 == node }
+            // Full sweep: edges into this node can exist outside its own list.
+            for n in layers[l].indices where n != node {
+                layers[l][n].removeAll { $0 == node }
             }
             layers[l][node] = []
         }
@@ -287,7 +315,7 @@ public actor QuantizedHNSWIndex {
             entryPointNode = nil
             maxLevel = -1
             for (n, nUUID) in nodeToUUID.enumerated() {
-                guard uuidToNode[nUUID] != nil else { continue }
+                guard uuidToNode[nUUID] == n else { continue }
                 if nodeLevels[n] > maxLevel {
                     maxLevel = nodeLevels[n]
                     entryPointNode = n

@@ -3,7 +3,9 @@
 //
 // Binary persistence for ProximaKit indices.
 // Format: 64-byte header + UUIDs + raw Float32 vectors + graph + metadata.
-// Vectors are memory-mapped on load for fast cold starts.
+// Files are read with `.mappedIfSafe` (the OS maps rather than copies the
+// raw bytes during parsing), but every section is then decoded into Swift
+// arrays — a loaded index is fully memory-resident, not paged on demand.
 // See ADR-003 for design rationale.
 
 import Foundation
@@ -11,8 +13,21 @@ import Foundation
 // MARK: - Constants
 
 private let magic: UInt32 = 0x50584B54  // "PXKT"
-private let formatVersion: UInt32 = 1
+
+/// Current on-disk format version.
+///
+/// - v1: original layout; `autoCompactionThreshold` was not serialized and
+///   silently reset to the `HNSWConfiguration` default (`0.7`) on load.
+/// - v2: encodes `autoCompactionThreshold` in the previously reserved header
+///   bytes at offset 56 (Float64 bit pattern; all-zero bits encode `nil`).
+///   v1 files remain readable; they load with the documented default (`0.7`).
+private let formatVersion: UInt32 = 2
+private let minSupportedVersion: UInt32 = 1
 private let headerSize = 64
+
+/// The `HNSWConfiguration` default threshold, applied when loading v1 files
+/// that predate threshold serialization.
+private let legacyDefaultCompactionThreshold = 0.7
 
 private let indexTypeBruteForce: UInt32 = 0
 private let indexTypeHNSW: UInt32 = 1
@@ -47,7 +62,10 @@ public struct HNSWSnapshot: Sendable {
 /// Binary persistence for ProximaKit indices.
 ///
 /// Saves indices to a compact binary format. Vectors are stored as contiguous
-/// Float32 values, enabling memory-mapped loading for fast cold starts.
+/// Float32 values for fast bulk decoding. Loading reads the file with
+/// `.mappedIfSafe` — which avoids an up-front copy of the raw bytes — but all
+/// sections are copied into Swift arrays during parsing, so the loaded index
+/// is fully resident in memory (no OS paging of vector data after load).
 ///
 /// ```swift
 /// // Save
@@ -124,11 +142,20 @@ public enum PersistenceEngine {
         let dimension = Int(header.dimension)
         var offset = headerSize
 
+        // ── Header sanity (prevents traps before section reads) ───────
+        guard dimension > 0 else {
+            throw PersistenceError.corruptedData("Dimension must be positive, got \(dimension)")
+        }
+
         // ── UUIDs ─────────────────────────────────────────────────────
         let ids = try readUUIDs(fileData, count: count, offset: &offset)
 
         // ── Vectors ───────────────────────────────────────────────────
-        let vectorData = try readFloats(fileData, count: count * dimension, offset: &offset)
+        let (floatCount, floatOverflow) = count.multipliedReportingOverflow(by: dimension)
+        guard !floatOverflow else {
+            throw PersistenceError.corruptedData("Vector section truncated")
+        }
+        let vectorData = try readFloats(fileData, count: floatCount, offset: &offset)
 
         // ── Metadata ──────────────────────────────────────────────────
         var metaOffset = Int(header.metadataOffset)
@@ -170,7 +197,10 @@ public enum PersistenceEngine {
         let metadataOffsetPosition = data.count
         appendUInt32(&data, 0) // placeholder
 
-        appendUInt64(&data, 0) // reserved
+        // Auto-compaction threshold (v2): Float64 bit pattern.
+        // `nil` (auto-compaction disabled) is encoded as all-zero bits,
+        // which can never collide with a valid threshold in (0, 1).
+        appendUInt64(&data, snapshot.config.autoCompactionThreshold?.bitPattern ?? 0)
 
         assert(data.count == headerSize)
 
@@ -227,6 +257,26 @@ public enum PersistenceEngine {
         let layerCount = Int(header.layerCount)
         var offset = headerSize
 
+        // ── Header sanity (prevents traps before section reads) ───────
+        guard dimension > 0 else {
+            throw PersistenceError.corruptedData("Dimension must be positive, got \(dimension)")
+        }
+        guard layerCount <= fileData.count else {
+            throw PersistenceError.corruptedData(
+                "Layer count \(layerCount) implausible for file of \(fileData.count) bytes")
+        }
+        // m >= 2 matches HNSWConfiguration's precondition; m == 1 would trap
+        // in the initializer (1/log(1) is infinite), so reject it here instead.
+        guard header.m >= 2, header.efConstruction > 0, header.efSearch > 0 else {
+            throw PersistenceError.corruptedData(
+                "HNSW configuration fields out of range "
+                + "(m: \(header.m) [min 2], efConstruction: \(header.efConstruction), efSearch: \(header.efSearch))")
+        }
+        guard UInt64(header.mMax0) == 2 * UInt64(header.m) else {
+            throw PersistenceError.corruptedData(
+                "mMax0 \(header.mMax0) inconsistent with m \(header.m) (expected \(2 * UInt64(header.m)))")
+        }
+
         // ── UUIDs ─────────────────────────────────────────────────────
         let uuids = try readUUIDs(fileData, count: count, offset: &offset)
 
@@ -239,7 +289,12 @@ public enum PersistenceEngine {
         // ── Graph: nodeLevels ─────────────────────────────────────────
         let nodeLevels: [Int] = try (0..<count).map { _ in
             let v = try readInt32(fileData, offset: &offset)
-            return Int(v)
+            let level = Int(v)
+            guard level >= 0, level < layerCount else {
+                throw PersistenceError.corruptedData(
+                    "Node level \(level) outside valid range 0..<\(layerCount)")
+            }
+            return level
         }
 
         // ── Graph: per-layer adjacency ────────────────────────────────
@@ -251,11 +306,33 @@ public enum PersistenceEngine {
                 var neighbors: [Int] = []
                 for _ in 0..<neighborCount {
                     let n = try readInt32(fileData, offset: &offset)
+                    guard n >= 0, n < count else {
+                        throw PersistenceError.corruptedData(
+                            "Neighbor index \(n) outside valid range 0..<\(count)")
+                    }
                     neighbors.append(Int(n))
                 }
                 layer.append(neighbors)
             }
             layers.append(layer)
+        }
+
+        // ── Graph integrity: entry point and maxLevel ─────────────────
+        let maxLevel = Int(header.maxLevel)
+        guard maxLevel >= -1, maxLevel < layerCount else {
+            throw PersistenceError.corruptedData(
+                "maxLevel \(maxLevel) outside valid range -1..<\(layerCount)")
+        }
+        let entryPointNode: Int? = header.entryPoint >= 0 ? Int(header.entryPoint) : nil
+        if let entryPoint = entryPointNode {
+            guard entryPoint < count else {
+                throw PersistenceError.corruptedData(
+                    "Entry point \(entryPoint) outside valid range 0..<\(count)")
+            }
+            guard maxLevel >= 0 else {
+                throw PersistenceError.corruptedData(
+                    "Entry point \(entryPoint) present but maxLevel is \(maxLevel)")
+            }
         }
 
         // ── Metadata ──────────────────────────────────────────────────
@@ -265,7 +342,8 @@ public enum PersistenceEngine {
         let config = HNSWConfiguration(
             m: Int(header.m),
             efConstruction: Int(header.efConstruction),
-            efSearch: Int(header.efSearch)
+            efSearch: Int(header.efSearch),
+            autoCompactionThreshold: header.autoCompactionThreshold
         )
 
         let snapshot = HNSWSnapshot(
@@ -277,8 +355,8 @@ public enum PersistenceEngine {
             nodeToUUID: uuids,
             layers: layers,
             nodeLevels: nodeLevels,
-            entryPointNode: header.entryPoint >= 0 ? Int(header.entryPoint) : nil,
-            maxLevel: Int(header.maxLevel)
+            entryPointNode: entryPointNode,
+            maxLevel: maxLevel
         )
 
         return HNSWIndex(restoring: snapshot)
@@ -300,6 +378,7 @@ private struct FileHeader {
     let maxLevel: Int32
     let layerCount: UInt32
     let metadataOffset: UInt32
+    let autoCompactionThreshold: Double?
 }
 
 private func readHeader(_ data: Data) throws -> FileHeader {
@@ -313,13 +392,32 @@ private func readHeader(_ data: Data) throws -> FileHeader {
     }
 
     let version = data.loadLE(UInt32.self, at: 4)
-    guard version == formatVersion else {
+    guard version >= minSupportedVersion, version <= formatVersion else {
         throw PersistenceError.unsupportedVersion(version)
     }
 
     let metricRaw = data.loadLE(UInt32.self, at: 20)
     guard let metricType = DistanceMetricType(rawValue: metricRaw) else {
         throw PersistenceError.unknownMetricType(metricRaw)
+    }
+
+    // ── Auto-compaction threshold (v2+) ───────────────────────────────
+    // v1 files predate serialization; they get the documented default.
+    let autoCompactionThreshold: Double?
+    if version >= 2 {
+        let bits = data.loadLE(UInt64.self, at: 56)
+        if bits == 0 {
+            autoCompactionThreshold = nil
+        } else {
+            let value = Double(bitPattern: bits)
+            guard value.isFinite, value > 0, value < 1 else {
+                throw PersistenceError.corruptedData(
+                    "autoCompactionThreshold \(value) outside valid range (0, 1)")
+            }
+            autoCompactionThreshold = value
+        }
+    } else {
+        autoCompactionThreshold = legacyDefaultCompactionThreshold
     }
 
     return FileHeader(
@@ -334,7 +432,8 @@ private func readHeader(_ data: Data) throws -> FileHeader {
         entryPoint: Int32(bitPattern: data.loadLE(UInt32.self, at: 40)),
         maxLevel: Int32(bitPattern: data.loadLE(UInt32.self, at: 44)),
         layerCount: data.loadLE(UInt32.self, at: 48),
-        metadataOffset: data.loadLE(UInt32.self, at: 52)
+        metadataOffset: data.loadLE(UInt32.self, at: 52),
+        autoCompactionThreshold: autoCompactionThreshold
     )
 }
 
@@ -386,8 +485,8 @@ extension Data {
 }
 
 private func readUUIDs(_ data: Data, count: Int, offset: inout Int) throws -> [UUID] {
-    let needed = count * 16
-    guard offset + needed <= data.count else {
+    let (needed, overflow) = count.multipliedReportingOverflow(by: 16)
+    guard !overflow, count >= 0, offset <= data.count, needed <= data.count - offset else {
         throw PersistenceError.corruptedData("UUID section truncated")
     }
 
@@ -404,8 +503,8 @@ private func readUUIDs(_ data: Data, count: Int, offset: inout Int) throws -> [U
 }
 
 private func readFloats(_ data: Data, count: Int, offset: inout Int) throws -> [Float] {
-    let needed = count * 4
-    guard offset + needed <= data.count else {
+    let (needed, overflow) = count.multipliedReportingOverflow(by: 4)
+    guard !overflow, count >= 0, offset <= data.count, needed <= data.count - offset else {
         throw PersistenceError.corruptedData("Vector section truncated")
     }
 

@@ -28,8 +28,21 @@ public struct SparseIndexSnapshot: Sendable {
 // MARK: - Constants
 
 private let sparseMagic: UInt32 = 0x50584D42  // "PXBM"
-private let sparseFormatVersion: UInt32 = 1
+
+/// Current `.pxbm` format version.
+///
+/// - v1: original layout; `autoCompactionThreshold` was not serialized and
+///   silently reset to the `BM25Configuration` default (`0.7`) on load.
+/// - v2: encodes `autoCompactionThreshold` in the previously reserved header
+///   bytes at offset 40 (Float64 bit pattern; all-zero bits encode `nil`).
+///   v1 files remain readable; they load with the documented default (`0.7`).
+private let sparseFormatVersion: UInt32 = 2
+private let sparseMinSupportedVersion: UInt32 = 1
 private let sparseHeaderSize = 64
+
+/// The `BM25Configuration` default threshold, applied when loading v1 files
+/// that predate threshold serialization.
+private let sparseLegacyDefaultCompactionThreshold = 0.7
 
 // MARK: - PersistenceEngine Extension
 
@@ -92,7 +105,8 @@ extension PersistenceEngine {
             b: Float(snapshot.configuration.b),
             totalLiveTokens: UInt64(snapshot.docLengths.reduce(0, +)),
             postingsOffset: postingsOffset,
-            metadataOffset: metadataOffset
+            metadataOffset: metadataOffset,
+            autoCompactionThreshold: snapshot.configuration.autoCompactionThreshold
         )
 
         try data.write(to: url, options: .atomic)
@@ -115,7 +129,7 @@ extension PersistenceEngine {
         }
 
         let version = fileData.loadLE(UInt32.self, at: 4)
-        guard version == sparseFormatVersion else {
+        guard version >= sparseMinSupportedVersion, version <= sparseFormatVersion else {
             throw PersistenceError.unsupportedVersion(version)
         }
 
@@ -132,7 +146,39 @@ extension PersistenceEngine {
         let postingsOffset = Int(fileData.loadLE(UInt32.self, at: 32))
         let metadataOffset = Int(fileData.loadLE(UInt32.self, at: 36))
 
-        let configuration = BM25Configuration(k1: k1, b: b)
+        // Validate before constructing BM25Configuration — its initializer
+        // preconditions would trap the process on corrupt float bits.
+        guard k1.isFinite, k1 >= 0 else {
+            throw PersistenceError.corruptedData("SparseIndex k1 \(k1) is invalid")
+        }
+        guard b.isFinite, b >= 0, b <= 1 else {
+            throw PersistenceError.corruptedData("SparseIndex b \(b) outside valid range [0, 1]")
+        }
+
+        // ── Auto-compaction threshold (v2+) ───────────────────────────
+        // v1 files predate serialization; they get the documented default.
+        let autoCompactionThreshold: Double?
+        if version >= 2 {
+            let bits = fileData.loadLE(UInt64.self, at: 40)
+            if bits == 0 {
+                autoCompactionThreshold = nil
+            } else {
+                let value = Double(bitPattern: bits)
+                guard value.isFinite, value > 0, value < 1 else {
+                    throw PersistenceError.corruptedData(
+                        "SparseIndex autoCompactionThreshold \(value) outside valid range (0, 1)")
+                }
+                autoCompactionThreshold = value
+            }
+        } else {
+            autoCompactionThreshold = sparseLegacyDefaultCompactionThreshold
+        }
+
+        let configuration = BM25Configuration(
+            k1: k1,
+            b: b,
+            autoCompactionThreshold: autoCompactionThreshold
+        )
 
         var offset = sparseHeaderSize
 
@@ -269,7 +315,8 @@ private func sparseWriteHeader(
     b: Float,
     totalLiveTokens: UInt64,
     postingsOffset: UInt32,
-    metadataOffset: UInt32
+    metadataOffset: UInt32,
+    autoCompactionThreshold: Double?
 ) {
     sparseWriteUInt32(&data, sparseMagic, at: 0)
     sparseWriteUInt32(&data, sparseFormatVersion, at: 4)
@@ -280,7 +327,11 @@ private func sparseWriteHeader(
     sparseWriteUInt64(&data, totalLiveTokens, at: 24)
     sparseWriteUInt32(&data, postingsOffset, at: 32)
     sparseWriteUInt32(&data, metadataOffset, at: 36)
-    // Bytes 40..64 remain zero (reserved).
+    // Auto-compaction threshold (v2): Float64 bit pattern.
+    // `nil` (auto-compaction disabled) is encoded as all-zero bits,
+    // which can never collide with a valid threshold in (0, 1).
+    sparseWriteUInt64(&data, autoCompactionThreshold?.bitPattern ?? 0, at: 40)
+    // Bytes 48..64 remain zero (reserved).
 }
 
 // MARK: - Little-Endian Write Helpers

@@ -31,9 +31,26 @@ public enum HybridFusionStrategy: Sendable, Equatable {
     /// `1 - alpha`. `alpha = 1.0` degenerates to dense-only, `alpha = 0.0` to
     /// sparse-only. Use this when you've validated both legs' score
     /// distributions on your own data and want finer control.
+    ///
+    /// `alpha` must be in `[0, 1]`. ``HybridIndex`` validates it with a
+    /// precondition when the strategy is installed (init or `setFusion`),
+    /// matching the construction-time validation of `HNSWConfiguration`
+    /// and `BM25Configuration`; the fusion math additionally clamps to
+    /// `[0, 1]` so an out-of-range value can never invert a leg's ranking.
     case weightedSum(alpha: Double)
 
     public static var rrf: HybridFusionStrategy { .rrf() }
+
+    /// Traps if the strategy's parameters are out of range
+    /// (`weightedSum` alpha outside `[0, 1]`).
+    func validate() {
+        if case .weightedSum(let alpha) = self {
+            precondition(
+                alpha >= 0.0 && alpha <= 1.0,
+                "weightedSum alpha must be in [0, 1], got \(alpha)"
+            )
+        }
+    }
 }
 
 // MARK: - HybridIndex
@@ -67,16 +84,31 @@ public actor HybridIndex {
     /// The sparse (BM25) leg.
     public nonisolated let sparse: any SparseVectorIndex
 
-    /// Current fusion strategy. Mutable — swap it per-query or per-index-lifetime.
-    public var fusion: HybridFusionStrategy
+    /// Current fusion strategy. Mutable — swap it per-query or per-index-lifetime
+    /// via ``setFusion(_:)``. Validated on every change (see
+    /// ``HybridFusionStrategy/weightedSum(alpha:)`` for the alpha range).
+    public var fusion: HybridFusionStrategy {
+        didSet { fusion.validate() }
+    }
+
+    /// Replaces the fusion strategy.
+    ///
+    /// - Precondition: `strategy` parameters must be in range
+    ///   (`weightedSum` alpha in `[0, 1]`).
+    public func setFusion(_ strategy: HybridFusionStrategy) {
+        fusion = strategy
+    }
 
     // ── Initialization ────────────────────────────────────────────────
 
+    /// - Precondition: `fusion` parameters must be in range
+    ///   (`weightedSum` alpha in `[0, 1]`).
     public init(
         dense: any VectorIndex,
         sparse: any SparseVectorIndex,
         fusion: HybridFusionStrategy = .rrf()
     ) {
+        fusion.validate()
         self.dense = dense
         self.sparse = sparse
         self.fusion = fusion
@@ -84,12 +116,20 @@ public actor HybridIndex {
 
     // ── Counts ────────────────────────────────────────────────────────
 
-    /// The number of documents in the dense leg.
+    /// The number of documents in the dense leg, as reported by its `count`.
+    ///
+    /// - Note: The legs' `count` conventions differ. ``HNSWIndex/count``
+    ///   includes tombstoned (removed-but-uncompacted) slots, while
+    ///   ``SparseIndex`` counts live documents only — so after removals
+    ///   `denseCount` can exceed `sparseCount` even though both legs hold the
+    ///   same logical document set. Compare the dense leg's `liveCount`
+    ///   against `sparseCount` for an apples-to-apples comparison.
     public var denseCount: Int {
         get async { await dense.count }
     }
 
     /// The number of live documents in the sparse leg.
+    /// See `denseCount` for how the two legs' count conventions differ.
     public var sparseCount: Int {
         get async { await sparse.count }
     }
@@ -141,6 +181,13 @@ public actor HybridIndex {
     ///     Defaults to `max(k * 5, 50)`, chosen so k=10 draws 50 per leg —
     ///     enough to fill the fusion buffer even if the legs barely overlap.
     ///   - filter: Applied on both legs before fusion.
+    ///
+    /// - Important: If `queryVector`'s dimension does not match the dense
+    ///   leg's dimension, the dense leg silently returns `[]` (it does not
+    ///   throw — see ``HNSWIndex/search(query:k:efSearch:filter:)``), and the
+    ///   fused output degrades to sparse-only ranking with no diagnostic.
+    ///   Check your embedder's output dimension if hybrid results look
+    ///   keyword-only.
     public func search(
         queryText: String,
         queryVector: Vector,
@@ -229,6 +276,10 @@ public actor HybridIndex {
         k: Int,
         alpha: Double
     ) -> [SearchResult] {
+        // Defense in depth: HybridIndex validates alpha at init/setFusion, but
+        // this static hook is callable directly — clamp so an out-of-range
+        // alpha can never produce a negative weight that inverts a leg's ranking.
+        let alpha = min(max(alpha, 0.0), 1.0)
         let denseNorm = minMaxNormalize(dense)
         let sparseNorm = minMaxNormalize(sparse)
 

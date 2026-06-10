@@ -37,13 +37,25 @@ public struct HNSWConfiguration: Sendable {
     /// Default: `0.7` (compact when fewer than 70% of slots are live).
     public let autoCompactionThreshold: Double?
 
+    /// Seeds the random layer-assignment draw so graph construction is
+    /// reproducible: the same insertion sequence yields the same topology.
+    ///
+    /// `nil` (the default) uses the system RNG. The seed is a build-time
+    /// knob only — it is NOT persisted, because it affects how a graph is
+    /// constructed, never how an existing graph is searched.
+    public let levelSeed: UInt64?
+
     public init(
         m: Int = 16,
         efConstruction: Int = 200,
         efSearch: Int = 50,
-        autoCompactionThreshold: Double? = 0.7
+        autoCompactionThreshold: Double? = 0.7,
+        levelSeed: UInt64? = nil
     ) {
-        precondition(m > 0, "M must be positive")
+        // m == 1 would make levelMultiplier = 1/ln(1) = +inf, which traps on
+        // the first add() when assignLevel() converts the level to Int.
+        // m == 1 is also degenerate for the graph (mMax0 = 2), so reject it here.
+        precondition(m >= 2, "M must be at least 2 (m = 1 yields an infinite level multiplier)")
         precondition(efConstruction > 0, "efConstruction must be positive")
         precondition(efSearch > 0, "efSearch must be positive")
         if let threshold = autoCompactionThreshold {
@@ -54,6 +66,25 @@ public struct HNSWConfiguration: Sendable {
         self.efConstruction = efConstruction
         self.efSearch = efSearch
         self.autoCompactionThreshold = autoCompactionThreshold
+        self.levelSeed = levelSeed
+    }
+}
+
+/// SplitMix64 — deterministic generator for seeded layer assignment.
+/// Not cryptographic; reproducible-construction use only.
+struct SplitMix64: RandomNumberGenerator {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        self.state = seed
+    }
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
     }
 }
 
@@ -69,7 +100,7 @@ public struct HNSWConfiguration: Sendable {
 /// ```swift
 /// let index = HNSWIndex(dimension: 384, metric: CosineDistance())
 /// try await index.add(vector, id: UUID())
-/// let results = try await index.search(query: queryVec, k: 10)
+/// let results = await index.search(query: queryVec, k: 10)  // search doesn't throw
 /// ```
 public actor HNSWIndex: VectorIndex {
 
@@ -87,6 +118,10 @@ public actor HNSWIndex: VectorIndex {
 
     /// Level multiplier: mL = 1/ln(M). Used for exponential layer assignment.
     private let levelMultiplier: Double
+
+    /// Seeded generator for layer assignment when `config.levelSeed` is set;
+    /// `nil` means draw from the system RNG (the default, non-reproducible).
+    private var levelRNG: SplitMix64?
 
     // ── Node Storage ──────────────────────────────────────────────────
     //
@@ -121,13 +156,23 @@ public actor HNSWIndex: VectorIndex {
     /// The highest layer currently in the index.
     private var maxLevel: Int = -1
 
-    /// The number of slots in the index, including tombstoned (removed) nodes.
+    /// The number of slots in the index, **including tombstoned (removed) nodes**.
     /// Use `liveCount` to get the number of searchable vectors.
+    ///
+    /// - Note: Sibling index types differ here: ``SparseIndex`` reports its
+    ///   *live* document count from `count` (its slot total is `slotCount`).
+    ///   When comparing the two legs of a ``HybridIndex`` after removals,
+    ///   compare this index's `liveCount` against the sparse leg's `count`.
     public var count: Int { vectors.count }
 
     /// The number of live (non-tombstoned) vectors available for search.
     /// After removals, `liveCount <= count`. After `compact()`, they are equal.
     public var liveCount: Int { uuidToNode.count }
+
+    /// Whether the index contains no live vectors.
+    /// `true` for a fresh index and after every live vector has been removed,
+    /// even if tombstoned slots remain (`count > 0`).
+    public var isEmpty: Bool { uuidToNode.isEmpty }
 
     // ── Initialization ────────────────────────────────────────────────
 
@@ -141,6 +186,7 @@ public actor HNSWIndex: VectorIndex {
         self.metric = metric
         self.config = config
         self.levelMultiplier = 1.0 / log(Double(config.m))
+        self.levelRNG = config.levelSeed.map(SplitMix64.init(seed:))
     }
 
     // ── VectorIndex: Add (Algorithm 1 from paper) ─────────────────────
@@ -240,6 +286,13 @@ public actor HNSWIndex: VectorIndex {
 
     // ── VectorIndex: Search (Algorithm 5 from paper) ──────────────────
 
+    /// Searches for the `k` nearest neighbors of `query`.
+    ///
+    /// - Important: If `query.dimension` does not match the index dimension,
+    ///   this returns `[]` rather than throwing — unlike ``add(_:id:metadata:)``,
+    ///   which throws `IndexError.dimensionMismatch` for the same condition.
+    ///   If you get empty results from a non-empty index, check that the query
+    ///   embedder produces vectors of the index's dimension.
     public func search(
         query: Vector,
         k: Int,
@@ -270,7 +323,9 @@ public actor HNSWIndex: VectorIndex {
         for (node, distance) in candidates {
             let uuid = nodeToUUID[node]
             // Skip tombstoned nodes (removed but slot not compacted).
-            guard uuidToNode[uuid] != nil else { continue }
+            // Identity check: after a re-add of the same UUID, the UUID maps to
+            // a NEW node — the old slot is live only if it maps back to itself.
+            guard uuidToNode[uuid] == node else { continue }
             if let filter = filter, !filter(uuid) { continue }
             results.append(SearchResult(
                 id: uuid,
@@ -289,27 +344,75 @@ public actor HNSWIndex: VectorIndex {
 
     // ── VectorIndex: Remove ───────────────────────────────────────────
 
+    /// Removes a vector by ID, tombstoning its slot and repairing the graph.
+    ///
+    /// Repair policy, applied per layer the node lived on:
+    /// 1. **Reverse-edge sweep** — every edge pointing *into* the removed node
+    ///    is deleted. Insertion-time pruning is one-sided (`pruneConnections`
+    ///    trims only the over-capacity node's own list), so a live node X can
+    ///    hold an edge to this node without a reciprocal edge; iterating only
+    ///    the removed node's own adjacency would leave X's edge dangling and
+    ///    waste beam slots on a dead end during search. The sweep is O(E_l)
+    ///    per layer (all edges on that layer).
+    /// 2. **Neighbor reconnection** — the removed node's former neighbors are
+    ///    offered each other as candidate edges and re-selected with the same
+    ///    diversity heuristic used at insertion, so paths that ran through the
+    ///    removed node are bridged rather than severed. O(d² · D) per layer,
+    ///    where d = the removed node's degree and D = the vector dimension.
+    ///
+    /// The slot itself is kept as a tombstone (`count` unchanged, `liveCount`
+    /// decremented) until `compact()` or auto-compaction reclaims it.
     @discardableResult
     public func remove(id: UUID) -> Bool {
         guard let node = uuidToNode[id] else { return false }
         let level = nodeLevels[node]
 
-        // Disconnect this node on all its layers.
+        // Tombstone first so the reconnection step never selects this node.
+        uuidToNode.removeValue(forKey: id)
+
         for l in 0...level where l < layers.count {
-            for neighbor in layers[l][node] {
-                layers[l][neighbor].removeAll { $0 == node }
+            // Capture the node's own neighbor list before clearing — these are
+            // the nodes whose connectivity may have run through the removed node.
+            let formerNeighbors = layers[l][node]
+
+            // Step 1: reverse-edge sweep over the whole layer. Edges into this
+            // node can exist outside `formerNeighbors` (one-sided pruning), so
+            // a full pass is required for a complete cleanup.
+            for n in layers[l].indices where n != node {
+                layers[l][n].removeAll { $0 == node }
             }
             layers[l][node] = []
-        }
 
-        uuidToNode.removeValue(forKey: id)
+            // Step 2: reconnect former neighbors among themselves.
+            let maxConnections = (l == 0) ? config.mMax0 : config.m
+            let liveNeighbors = formerNeighbors.filter { isLiveNode($0) }
+            for f in liveNeighbors {
+                var candidateNodes = Set(layers[l][f])
+                for other in liveNeighbors where other != f {
+                    candidateNodes.insert(other)
+                }
+                candidateNodes.remove(f)
+                guard !candidateNodes.isEmpty else { continue }
+
+                let fVector = vectors[f]
+                let candidates = candidateNodes.map { candidate in
+                    (node: candidate, distance: metric.distance(fVector, vectors[candidate]))
+                }
+                let selected = selectNeighborsHeuristic(
+                    target: fVector,
+                    candidates: candidates,
+                    m: maxConnections
+                )
+                layers[l][f] = selected.map(\.node)
+            }
+        }
 
         // If we removed the entry point, find the node with the highest level.
         if entryPointNode == node {
             entryPointNode = nil
             maxLevel = -1
             for (n, nUUID) in nodeToUUID.enumerated() {
-                guard uuidToNode[nUUID] != nil else { continue }
+                guard uuidToNode[nUUID] == n else { continue }
                 if nodeLevels[n] > maxLevel {
                     maxLevel = nodeLevels[n]
                     entryPointNode = n
@@ -336,6 +439,10 @@ public actor HNSWIndex: VectorIndex {
         self.metric = snapshot.metricType.makeMetric()
         self.config = snapshot.config
         self.levelMultiplier = 1.0 / log(Double(snapshot.config.m))
+        // levelSeed is a build-time knob and is not persisted; a snapshot's
+        // config carries nil, so restored indexes use the system RNG for any
+        // post-load insertions.
+        self.levelRNG = snapshot.config.levelSeed.map(SplitMix64.init(seed:))
         self.layers = snapshot.layers
         self.nodeLevels = snapshot.nodeLevels
         self.vectors = snapshot.vectors
@@ -396,14 +503,14 @@ public actor HNSWIndex: VectorIndex {
     /// ratio `liveCount / count` drops below your acceptable threshold (e.g., 0.7).
     ///
     /// ```swift
-    /// await index.compact()
+    /// try await index.compact()
     /// // Now count == liveCount
     /// ```
     public func compact() throws {
         // Snapshot all live nodes before clearing state.
         var live: [(id: UUID, vector: Vector, metadata: Data?)] = []
         for (node, uuid) in nodeToUUID.enumerated() {
-            guard uuidToNode[uuid] != nil else { continue }
+            guard uuidToNode[uuid] == node else { continue }
             live.append((id: uuid, vector: vectors[node], metadata: metadata[node]))
         }
 
@@ -436,7 +543,13 @@ public actor HNSWIndex: VectorIndex {
     // and each upper layer has ~1/M as many nodes.
 
     private func assignLevel() -> Int {
-        let random = Double.random(in: Double.leastNonzeroMagnitude...1.0)
+        let random: Double
+        if var rng = levelRNG {
+            random = Double.random(in: Double.leastNonzeroMagnitude...1.0, using: &rng)
+            levelRNG = rng // write the advanced state back
+        } else {
+            random = Double.random(in: Double.leastNonzeroMagnitude...1.0)
+        }
         return Int(floor(-log(random) * levelMultiplier))
     }
 
@@ -584,5 +697,60 @@ public actor HNSWIndex: VectorIndex {
         )
 
         layers[layer][node] = selected.map(\.node)
+    }
+
+    // ── Liveness ──────────────────────────────────────────────────────
+
+    /// A slot is live iff its UUID still maps back to it.
+    /// (After a re-add of the same UUID, the UUID maps to a newer node,
+    /// tombstoning the old slot.)
+    private func isLiveNode(_ node: Int) -> Bool {
+        uuidToNode[nodeToUUID[node]] == node
+    }
+
+    // ── Test Hooks (internal) ─────────────────────────────────────────
+
+    /// Whether any adjacency list still references a tombstoned slot.
+    /// Used by tests to verify `remove()` leaves no dangling incoming edges.
+    internal var hasDanglingEdges: Bool {
+        for layer in layers {
+            for neighbors in layer {
+                for neighbor in neighbors where !isLiveNode(neighbor) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Whether every live node is reachable from every other live node by
+    /// traversing layer-0 edges (treated as undirected) between live nodes.
+    /// Used by tests to verify `remove()` repairs connectivity.
+    internal var isLayer0Connected: Bool {
+        guard !layers.isEmpty else { return true }
+        let liveNodes = (0..<vectors.count).filter { isLiveNode($0) }
+        guard let start = liveNodes.first else { return true }
+
+        // Build an undirected view of layer 0 (pruning can leave edges
+        // one-sided between live nodes; either direction is traversable
+        // in practice because beam search discovers from both endpoints).
+        var undirected: [Int: Set<Int>] = [:]
+        for source in liveNodes {
+            for neighbor in layers[0][source] where isLiveNode(neighbor) {
+                undirected[source, default: []].insert(neighbor)
+                undirected[neighbor, default: []].insert(source)
+            }
+        }
+
+        var visited = Set<Int>([start])
+        var frontier = [start]
+        while let current = frontier.popLast() {
+            for neighbor in undirected[current] ?? [] {
+                if visited.insert(neighbor).inserted {
+                    frontier.append(neighbor)
+                }
+            }
+        }
+        return visited.count == liveNodes.count
     }
 }

@@ -3,7 +3,7 @@
 //
 // Binary persistence for trained product quantizers.
 //
-// Format: 16-byte header + codebook data.
+// Format: 24-byte header (six UInt32 fields, little-endian) + codebook data.
 //   Magic:         0x50515454 ("PQTT")
 //   Version:       1
 //   Dimension:     UInt32
@@ -73,6 +73,23 @@ extension ProductQuantizer {
         let M = Int(fileData.loadLE(UInt32.self, at: 12))
         let K = Int(fileData.loadLE(UInt32.self, at: 16))
         let trainIters = Int(fileData.loadLE(UInt32.self, at: 20))
+
+        // ── Header sanity (prevents traps before codebook reads) ──────
+        // PQConfiguration / ProductQuantizer enforce these with
+        // preconditions, so a corrupt header would otherwise crash the
+        // process (including a division by zero for M == 0).
+        guard dimension > 0, M > 0, dimension % M == 0 else {
+            throw PersistenceError.corruptedData(
+                "PQ dimension \(dimension) / subspaceCount \(M) invalid")
+        }
+        guard K == 256 else {
+            throw PersistenceError.corruptedData(
+                "PQ centroidsPerSubspace must be 256, got \(K)")
+        }
+        guard trainIters > 0 else {
+            throw PersistenceError.corruptedData(
+                "PQ trainingIterations must be positive, got \(trainIters)")
+        }
 
         let ds = dimension / M
         let expectedSize = pqHeaderSize + M * K * ds * 4

@@ -319,7 +319,9 @@ public actor SparseIndex: SparseVectorIndex {
         newNodeToUUID.reserveCapacity(uuidToNode.count)
 
         for (oldNode, uuid) in nodeToUUID.enumerated() {
-            guard uuidToNode[uuid] != nil,
+            // Identity check (uuid must map back to THIS slot) — a re-added
+            // UUID maps to a newer node, so presence alone is not liveness.
+            guard uuidToNode[uuid] == oldNode,
                   let counts = tokenCounts[oldNode] else { continue }
 
             let newNode = newNodeToUUID.count

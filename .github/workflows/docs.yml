@@ -1,0 +1,84 @@
+name: Docs
+
+# Builds the DocC catalog with the static-hosting transform and publishes it
+# to GitHub Pages. CI already builds documentation on every PR as a
+# compile-check (ci.yml) but discards the output; this workflow is the
+# publish leg, so it only runs on main.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # manual re-publish (e.g., after enabling Pages)
+
+# Only the deploy job talks to Pages; the build job needs checkout only.
+permissions:
+  contents: read
+
+# One Pages deployment at a time. Never cancel an in-flight deployment —
+# let the queued run supersede it instead (GitHub's recommended setting).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  XCODE_VERSION: "16.2"
+
+jobs:
+  build:
+    name: Build DocC
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+
+      # --hosting-base-path must match the repo name: Pages serves project
+      # sites from https://<owner>.github.io/ProximaKit/, and DocC bakes the
+      # base path into every generated asset URL.
+      - name: Build documentation (static hosting)
+        run: |
+          swift package --allow-writing-to-directory docs-out \
+            generate-documentation \
+            --target ProximaKit \
+            --disable-indexing \
+            --transform-for-static-hosting \
+            --hosting-base-path ProximaKit \
+            --output-path docs-out
+
+      # DocC's static output has no landing page at the site root — send
+      # visitors of https://<owner>.github.io/ProximaKit/ to the module page.
+      - name: Add root redirect
+        run: |
+          cat > docs-out/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html>
+            <head>
+              <meta http-equiv="refresh" content="0; url=documentation/proximakit/">
+              <link rel="canonical" href="documentation/proximakit/">
+            </head>
+            <body>
+              <p>Redirecting to <a href="documentation/proximakit/">ProximaKit documentation</a>…</p>
+            </body>
+          </html>
+          HTML
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-out
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    # Artifact upload/deploy only — no Swift toolchain needed, cheap runner.
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

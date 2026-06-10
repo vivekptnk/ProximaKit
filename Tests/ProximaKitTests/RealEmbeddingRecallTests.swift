@@ -314,18 +314,11 @@ final class RealEmbeddingRecallTests: XCTestCase {
         let dim = embedding.dimension
         let vectors = try embedSentences(Self.sentences, embedding: embedding, dimension: dim)
 
+        // Build with tracked IDs so each result maps back to its sentence.
+        // (A dead throwaway index build that previously preceded this was
+        // removed in the CHA-201 audit — it added ~half the test's runtime
+        // and asserted nothing.)
         let config = HNSWConfiguration(m: 16, efConstruction: 200, efSearch: 100)
-        let hnsw = HNSWIndex(dimension: dim, metric: CosineDistance(), config: config)
-
-        for (i, vec) in vectors.enumerated() {
-            try await hnsw.add(vec, id: UUID())
-            // Store sentence index in metadata for verification
-            let data = withUnsafeBytes(of: Int32(i)) { Data($0) }
-            // Re-add with metadata
-            _ = await hnsw.remove(id: UUID()) // skip; just use simple approach
-        }
-
-        // Simpler approach: rebuild with tracked IDs
         let index = HNSWIndex(dimension: dim, metric: CosineDistance(), config: config)
         var idToSentenceIndex: [UUID: Int] = [:]
 
@@ -348,10 +341,13 @@ final class RealEmbeddingRecallTests: XCTestCase {
             }
         }
 
-        // At least 3 of top 5 should be from technology category (indices 0-14)
+        // At least 3 of top 5 should be from technology category (indices 0-14).
+        // The bound matches this comment (the assertion previously said >= 2
+        // while the comment claimed 3 — aligned in the CHA-201 audit; the
+        // compiler-themed query reliably pulls 4-5 tech sentences).
         let techHits = results.compactMap { idToSentenceIndex[$0.id] }.filter { $0 < 15 }.count
-        XCTAssertGreaterThanOrEqual(techHits, 2,
-            "Tech query should retrieve mostly tech sentences")
+        XCTAssertGreaterThanOrEqual(techHits, 3,
+            "Tech query should retrieve mostly tech sentences (got \(techHits)/5)")
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

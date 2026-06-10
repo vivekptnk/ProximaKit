@@ -24,6 +24,7 @@ import Foundation
 ///     embedder: myEmbedder,
 ///     storageDirectory: appSupportURL
 /// )
+/// try await store.loadDocumentMap()  // when reopening a persisted store
 /// try await store.addChunks(texts, metadata: metas)
 /// let hits = try await store.query("lanthanides", k: 10)
 /// try await store.save()
@@ -56,14 +57,40 @@ public actor HybridVectorStore {
 
     private let embedder: any TextEmbedder
     private var documentMap: [String: Set<UUID>] = [:]
-    private var isDirty: Bool = false
+
+    /// Monotonic counter bumped on every committed mutation.
+    /// ``save()`` snapshots this value before writing and only marks the
+    /// store clean if no mutation landed while the write was in flight.
+    private var mutationGeneration: UInt64 = 0
+
+    /// The mutation generation last persisted to disk.
+    private var savedGeneration: UInt64 = 0
+
+    /// Whether the store has unsaved changes.
+    private var isDirty: Bool { mutationGeneration != savedGeneration }
+
+    /// Tail of the compound-operation chain (see ``serialized(_:)``).
+    private var operationTail: Task<Void, Never>?
 
     // MARK: - Initialization
 
     /// Creates (or restores) a hybrid vector store at the given storage directory.
     ///
-    /// If both `index.pxkt` and `index.pxbm` exist under `storageDirectory/name/`,
-    /// they are loaded. Otherwise fresh empty legs are constructed.
+    /// Each leg is restored **independently** from `storageDirectory/name/`:
+    /// the dense leg loads from `index.pxkt` if that file exists (otherwise a
+    /// fresh ``HNSWIndex`` is created), and the sparse leg loads from
+    /// `index.pxbm` if that file exists (otherwise a fresh ``SparseIndex`` is
+    /// created). If only one file is present, that leg is restored and the
+    /// other starts empty.
+    ///
+    /// - Important: This initializer restores **only the index legs**. The
+    ///   document → UUID map is persisted separately (`hybrid.json`) and is
+    ///   NOT loaded here — call ``loadDocumentMap()`` after init when
+    ///   reopening a persisted store. Until then, ``documentIds`` and
+    ///   ``chunkCount(forDocument:)`` report an empty map, and
+    ///   ``removeDocument(id:)`` throws
+    ///   ``VectorStoreError/documentNotFound(_:)`` for documents that are
+    ///   present in the legs. Vector-level queries work immediately.
     public init(
         name: String,
         embedder: any TextEmbedder,
@@ -127,9 +154,40 @@ public actor HybridVectorStore {
         self.storageURL = storageDirectory.appendingPathComponent(name)
     }
 
+    // MARK: - Operation Serialization
+
+    /// Runs `operation` after every previously enqueued compound operation
+    /// has finished.
+    ///
+    /// Actors are reentrant: at every `await`, another call can interleave.
+    /// Compound operations here are doubly exposed because every mutation
+    /// touches *two* legs (dense + sparse) on two separate actors. Without
+    /// serialization, a reentrant ``addChunks(_:metadata:)`` could land
+    /// between ``save()``'s two leg writes, persisting a torn pair where one
+    /// leg contains a document the other lacks; and a save interleaved with
+    /// a mutation could mark the store clean while losing the write.
+    /// Chaining keeps reads (``query(_:k:candidatePoolK:filter:)``)
+    /// concurrent while guaranteeing mutators and saves never overlap.
+    private func serialized<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let previous = operationTail
+        let task = Task<T, Error> {
+            await previous?.value
+            return try await operation()
+        }
+        // Park the new tail. Errors are surfaced to the caller below and
+        // must not break the chain for subsequent operations.
+        operationTail = Task { _ = try? await task.value }
+        return try await task.value
+    }
+
     // MARK: - Document-Level Operations
 
     /// Adds text chunks with metadata, embedding each chunk and writing it to both legs.
+    ///
+    /// Runs serialized with other compound operations: it never interleaves
+    /// with an in-flight ``save()`` or ``removeDocument(id:)``.
     @discardableResult
     public func addChunks(
         _ chunks: [String],
@@ -145,6 +203,16 @@ public actor HybridVectorStore {
             )
         }
 
+        return try await serialized {
+            try await self.performAddChunks(chunks, metadata: metadata)
+        }
+    }
+
+    /// Embeds and inserts chunks into both legs. Must only run inside ``serialized(_:)``.
+    private func performAddChunks(
+        _ chunks: [String],
+        metadata: [ChunkMetadata]
+    ) async throws -> [UUID] {
         let vectors = try await embedder.embedBatch(chunks)
 
         let encoder = JSONEncoder()
@@ -162,11 +230,13 @@ public actor HybridVectorStore {
                 metadata: metaData
             )
 
+            // Bump the generation per committed chunk so even a partially
+            // failed batch leaves the store marked dirty.
             documentMap[metadata[i].documentId, default: []].insert(id)
+            mutationGeneration += 1
             ids.append(id)
         }
 
-        isDirty = true
         return ids
     }
 
@@ -188,8 +258,19 @@ public actor HybridVectorStore {
     }
 
     /// Removes all chunks associated with a document ID from both legs.
+    ///
+    /// Runs serialized with other compound operations: a concurrent
+    /// ``addChunks(_:metadata:)`` for the same document cannot interleave
+    /// with the removal loop, so freshly added chunks are never orphaned.
     @discardableResult
     public func removeDocument(id: String) async throws -> Int {
+        try await serialized {
+            try await self.performRemoveDocument(id: id)
+        }
+    }
+
+    /// Removes a document's chunks from both legs. Must only run inside ``serialized(_:)``.
+    private func performRemoveDocument(id: String) async throws -> Int {
         guard let uuids = documentMap[id] else {
             throw VectorStoreError.documentNotFound(id)
         }
@@ -198,12 +279,16 @@ public actor HybridVectorStore {
         for uuid in uuids {
             if await index.remove(id: uuid) {
                 removed += 1
+                mutationGeneration += 1
             }
         }
 
-        documentMap.removeValue(forKey: id)
-        if removed > 0 {
-            isDirty = true
+        // Subtract only the snapshotted UUIDs rather than dropping the entry
+        // wholesale: chunks inserted for the same document while the removal
+        // loop was suspended must not be orphaned in either leg.
+        documentMap[id]?.subtract(uuids)
+        if documentMap[id]?.isEmpty == true {
+            documentMap.removeValue(forKey: id)
         }
         return removed
     }
@@ -211,8 +296,27 @@ public actor HybridVectorStore {
     // MARK: - Persistence
 
     /// Persists both legs and the document map to disk. Skips writes when clean.
+    ///
+    /// Runs serialized with other compound operations, so no mutation can
+    /// land between the dense and sparse leg writes — the two files always
+    /// describe the same document set. If the sparse write throws after the
+    /// dense write succeeded, the store stays dirty and the next save
+    /// rewrites both legs.
     public func save() async throws {
+        try await serialized {
+            try await self.performSave()
+        }
+    }
+
+    /// Writes both legs and the document map. Must only run inside ``serialized(_:)``.
+    private func performSave() async throws {
         guard isDirty else { return }
+
+        // Snapshot the generation and document map before any suspension
+        // point so the map written below matches the leg snapshots even if
+        // a mutation were ever to interleave with this save.
+        let generation = mutationGeneration
+        let mapSnapshot = documentMap.mapValues { Array($0) }
 
         let fm = FileManager.default
         if !fm.fileExists(atPath: storageURL.path) {
@@ -222,13 +326,18 @@ public actor HybridVectorStore {
         try await _dense.save(to: storageURL.appendingPathComponent("index.pxkt"))
         try await _sparse.save(to: storageURL.appendingPathComponent("index.pxbm"))
 
+        // `.atomic` so a crash mid-write cannot leave a truncated/corrupt
+        // hybrid.json behind.
         let mapURL = storageURL.appendingPathComponent("hybrid.json")
-        let mapData = try JSONEncoder().encode(
-            documentMap.mapValues { Array($0) }
-        )
-        try mapData.write(to: mapURL)
+        let mapData = try JSONEncoder().encode(mapSnapshot)
+        try mapData.write(to: mapURL, options: .atomic)
 
-        isDirty = false
+        // Only mark clean if no mutation landed while the files were being
+        // written; otherwise the store stays dirty and the next save
+        // persists the newer state.
+        if mutationGeneration == generation {
+            savedGeneration = generation
+        }
     }
 
     /// Restores the document map from disk after a cold-load.

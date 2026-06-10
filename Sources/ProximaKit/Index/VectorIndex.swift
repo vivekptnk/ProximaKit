@@ -26,6 +26,10 @@ public protocol VectorIndex: Actor {
     var dimension: Int { get }
 
     /// The number of vectors currently in the index.
+    ///
+    /// - Note: Conformers differ on tombstone accounting: ``HNSWIndex/count``
+    ///   includes tombstoned slots (see ``HNSWIndex/liveCount``), while
+    ///   ``SparseIndex/count`` reports live documents only.
     var count: Int { get }
 
     /// Adds a vector to the index.

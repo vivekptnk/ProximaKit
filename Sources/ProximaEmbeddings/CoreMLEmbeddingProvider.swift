@@ -15,6 +15,9 @@ import ProximaKit
 /// model converted to CoreML format. The provider handles model loading,
 /// input preparation, prediction, and output conversion.
 ///
+/// Conforms to ``EmbeddingProvider`` (and therefore ProximaKit's `TextEmbedder`),
+/// so it can be used anywhere a provider is expected — including `VectorStore`.
+///
 /// ```swift
 /// let provider = try CoreMLEmbeddingProvider(modelAt: modelURL)
 /// let vector = try await provider.embed("sunset over the ocean")
@@ -75,11 +78,10 @@ public actor CoreMLEmbeddingProvider {
     /// This compiles the model on first load (may take a few seconds).
     /// For production, pre-compile and use `init(compiledModelURL:)`.
     ///
-    /// - Parameter url: Path to the .mlpackage or .mlmodel file.
-    /// - Throws: `EmbeddingError.modelNotAvailable` if compilation or loading fails.
     /// - Parameters:
     ///   - url: Path to the .mlpackage or .mlmodel file.
     ///   - vocabURL: Optional path to a WordPiece vocab.txt for proper tokenization.
+    /// - Throws: `EmbeddingError.modelNotAvailable` if compilation or loading fails.
     public init(modelAt url: URL, vocabURL: URL? = nil) throws {
         let compiledURL = try MLModel.compileModel(at: url)
         let model = try Self.loadModel(from: compiledURL)
@@ -92,8 +94,9 @@ public actor CoreMLEmbeddingProvider {
 
     /// Embeds a text string into a vector.
     ///
-    /// Tokenizes the text into integer IDs (basic whitespace tokenizer),
-    /// runs the CoreML model, and extracts the output embedding.
+    /// Tokenizes the text into integer IDs (WordPiece when a vocab was
+    /// provided at init, hash-based fallback otherwise), runs the CoreML
+    /// model, and extracts the output embedding.
     ///
     /// - Parameter text: The text to embed. Must not be empty.
     /// - Returns: A vector of dimension `self.dimension`.
@@ -245,6 +248,15 @@ public actor CoreMLEmbeddingProvider {
         return (outputName, dim, maxLen)
     }
 }
+
+// ── EmbeddingProvider Conformance ─────────────────────────────────────
+
+/// `CoreMLEmbeddingProvider` satisfies ``EmbeddingProvider`` (and therefore
+/// ProximaKit's `TextEmbedder`) without any bridging code: actors are
+/// implicitly `Sendable`, ``dimension`` is a `nonisolated let`, and both
+/// ``embed(_:)`` and ``embedBatch(_:)`` are `async throws`, so protocol
+/// callers hop onto the actor exactly as direct callers do.
+extension CoreMLEmbeddingProvider: EmbeddingProvider {}
 
 // ── Float16 Conversion ────────────────────────────────────────────────
 

@@ -8,13 +8,121 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Correctness fixes from a multi-agent audit (every fix reproduced before patching, re-verified after), INT8 scalar quantization, three new distance metrics, reproducible graph construction, and a CI overhaul.
+
+### Added
+- **INT8 scalar quantization (ADR-007).** `ScalarQuantizer` — symmetric
+  per-vector scaling (`scale = maxAbs / 127`, explicit zero-vector handling)
+  — plus the `ScalarQuantizedHNSWIndex` actor. ~4× vector-storage reduction
+  (384d: 1,536 B → 388 B per vector), **no training phase**, and search runs
+  through the configured `DistanceMetric`, so any serialisable metric works
+  (contrast with PQ's L2-only ADC). Two-phase `build` (full-precision graph
+  construction, then encode), binary persistence, memory introspection
+  (`codeStorageBytes` / `memorySavingsRatio`), and acceptance-tested recall
+  floors: Recall@10 ≥ 0.95 (euclidean) / ≥ 0.93 (cosine) against brute-force
+  ground truth. Design rationale in
+  [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md).
+- **Three new distance metrics:** `ChebyshevDistance` (L∞),
+  `BrayCurtisDistance`, and `MahalanobisDistance` (constructible from a
+  covariance or inverse-covariance matrix). Chebyshev and Bray-Curtis join
+  `DistanceMetricType` and persist with any index; Mahalanobis is search-only
+  (not serialisable), and `persistenceSnapshot()` reports it as
+  `PersistenceError.unserializableMetric` rather than guessing.
+- **`HNSWConfiguration.levelSeed`** — seeds the layer-assignment RNG so graph
+  construction is reproducible: the same insertion sequence yields the same
+  topology. Build-time knob only; deliberately not persisted.
+- **Persistence corruption-hardening test matrix** — 42 tests across all four
+  binary codecs, covering truncated sections, out-of-range graph indices,
+  invalid entry points, and bad configuration values.
+- **DocC published to GitHub Pages** on every push to `main` (`docs.yml`),
+  and **automatic GitHub Releases** with CHANGELOG-extracted notes on version
+  tags (`release.yml`).
+- **CI overhaul:** SwiftLint job (pinned 0.63.2, strict config), iOS Simulator
+  build job for `ProximaKit` + `ProximaEmbeddings`, release tag/version/
+  changelog consistency check, benchmark regression gate wired to
+  `compare.py`, SIFT1M SHA-256 verification, and fixed SwiftPM caching.
+- **ADRs:** [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md) (INT8
+  scalar quantization — accepted),
+  [ADR-008](docs/adr/ADR-008-filtered-search.md) (filtered search —
+  retrospective), [ADR-010](docs/adr/ADR-010-format-evolution.md) (format
+  evolution policy), [ADR-011](docs/adr/ADR-011-pq-codec.md) (PQ codec —
+  retrospective). ADR-006 moved into `docs/adr/` with its siblings.
+
+### Changed
+
+- **`NLEmbeddingProvider` sentence embeddings are now L2-normalized**, matching
+  the word-averaging fallback path (previously only the fallback normalized).
+  Every vector the provider returns now has unit magnitude. **Migration:**
+  indexes persisted from pre-1.5 *unnormalized* sentence vectors will rank
+  differently under `DotProductDistance`/`EuclideanDistance` when queried with
+  the new unit-length vectors — re-embed and rebuild those indexes, or pin to
+  v1.4.x until you can. (`CosineDistance` users are unaffected.)
+
+- **On-disk format v2.** `autoCompactionThreshold` now survives a save/load
+  round-trip. Format v1 files still load — see
+  [ADR-010](docs/adr/ADR-010-format-evolution.md) for the evolution policy.
+- `HNSWConfiguration` rejects `m < 2` (`m == 1` yields an infinite level
+  multiplier and trapped on the first `add`).
+- `ProximaKit.version` now reports the actual release (was stuck at `1.0.0`);
+  a consistency test and a release-workflow check keep it that way.
+
+### Fixed
+- **Critical: tombstone liveness is now identity-based.** Liveness was
+  presence-based (`uuidToNode[uuid] != nil`), which breaks after re-adding an
+  existing UUID: the old tombstoned slot looked live because the UUID resolves
+  to the *new* node. Search could return stale vectors/metadata, entry-point
+  recovery could select a disconnected tombstone (collapsing the graph), and
+  `compact()` resurrected deleted vector bodies. Affected `HNSWIndex`,
+  `QuantizedHNSWIndex`, and `SparseIndex`; reproduced 20/20 pre-fix and locked
+  in by `TombstoneLivenessTests`.
+- **Batch cosine zero-vector parity.** The batch fast path returned distance
+  `0` (perfect match) for zero-magnitude vectors where scalar `CosineDistance`
+  returns `1.0` (neutral) — degenerate embeddings ranked as top hits in batch
+  paths. Both zero-query and zero-stored-vector now return `1.0`.
+- **Store reentrancy.** `VectorStore.save()` no longer loses concurrent
+  `addChunks` dirty-flag updates across its suspension point;
+  `HybridVectorStore` two-leg saves can no longer persist diverged
+  dense/sparse files; `removeDocument()` closed its orphan window; document-map
+  writes are atomic.
+- **Persistence loaders validate before trusting.** Graph indices, entry
+  points, levels, and configuration ranges are checked on load, throwing typed
+  `PersistenceError` instead of crashing on corrupt or hostile files.
+- `QuantizedHNSWIndex.build` no longer misaligns PQ codes/metadata when the
+  input contains duplicate ids; HNSW `remove()` now repairs dangling incoming
+  edges; `.weightedSum` fusion validates `alpha ∈ [0, 1]`.
+- `DefaultBM25Tokenizer` dropped locale-sensitive lowercasing — tokenization
+  is now deterministic regardless of device locale, per its contract.
+- `CoreMLEmbeddingProvider` now conforms to `EmbeddingProvider` /
+  `TextEmbedder` as documented, so it plugs into `VectorStore` directly.
+
 ---
 
 ## [1.4.0] — 2026-04-19
 
-Hybrid BM25 + dense retrieval and a cross-library benchmark harness (FAISS + ScaNN). The core `ProximaKit` target remains Foundation + Accelerate only — no new external dependencies.
+Hybrid BM25 + dense retrieval, product quantization, the `VectorStore` document layer, two new distance metrics, and a cross-library benchmark harness (FAISS + ScaNN). The core `ProximaKit` target remains Foundation + Accelerate only — no new external dependencies.
+
+> No v1.2/v1.3 tags were cut — all work merged to `main` between v1.1.0 and v1.4.0 first shipped in this release.
 
 ### Added
+- **Product quantization (PQ).** `ProductQuantizer` — k-means-trained
+  codebooks (K = 256 centroids per sub-quantizer) with asymmetric distance
+  computation (ADC) — plus `QuantizedHNSWIndex`, which searches the HNSW
+  graph over PQ codes instead of full vectors. Memory per vector drops from
+  `d × 4` bytes to `M` bytes (e.g. 384d at M = 48: 1,536 B → 48 B, 32×).
+  Codebook + index persistence via `ProductQuantizerPersistence`. Codec
+  format documented retrospectively in
+  [ADR-011](docs/adr/ADR-011-pq-codec.md).
+- **`VectorStore` actor (ADR-006 Phase 1).** Document-level layer over
+  `HNSWIndex` + `TextEmbedder`: `addChunks` / `query` / `removeDocument` /
+  `save`, `ChunkMetadata` (documentId, chunkIndex, text), typed
+  `VectorStoreError`, document → chunk-UUID map persisted as JSON alongside
+  the index, and a dirty flag to skip redundant saves. `TextEmbedder` lives
+  in core so `ProximaKit` gains no dependency on `ProximaEmbeddings`.
+- **Manhattan (L1) and Hamming distance metrics**, both with
+  Accelerate-optimised paths and `DistanceMetricType` serialization.
+- **Actor-based `CoreMLEmbeddingProvider`** and flat-array batch-distance
+  overloads, with 10K-scale batch benchmarks comparing flat-array vs
+  `Vector`-array layouts across all metrics.
 - **Cross-library benchmark harness (`Benchmarks/`).** Standalone SPM package
   `ProximaBench` that compares ProximaKit HNSW against FAISS HNSW and ScaNN
   on identical datasets and identical brute-force ground truth. The core
@@ -68,8 +176,9 @@ Hybrid BM25 + dense retrieval and a cross-library benchmark harness (FAISS + Sca
 ### Changed
 - `.gitignore` now tracks `Benchmarks/` sources but ignores the on-demand
   `Benchmarks/datasets/` payloads and `Benchmarks/out/` run artifacts.
-- `docs/ADR-006-lumen-integration.md` — new addendum covering the hybrid
-  opt-in path. The v1.1 `VectorStore` contract is unchanged.
+- [`docs/adr/ADR-006-lumen-integration.md`](docs/adr/ADR-006-lumen-integration.md)
+  — new addendum covering the hybrid opt-in path. The v1.1 `VectorStore`
+  contract is unchanged.
 
 ### Fixed
 - `SparseIndexTests.testBM25ParityAgainstOracle` no longer flakes when BM25

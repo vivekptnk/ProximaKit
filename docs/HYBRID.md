@@ -1,6 +1,6 @@
 # Hybrid Retrieval in ProximaKit
 
-**Status:** Shipping in v1.4.0 (Unreleased)
+**Status:** Shipped in v1.4.0
 **Layers:** `SparseIndex` (BM25) → `HybridIndex` (fusion) → `HybridVectorStore` (document-level)
 
 ProximaKit v1.4 adds lexical + dense hybrid retrieval on top of the existing
@@ -251,8 +251,9 @@ shape-compatible — `HybridVectorStore` is source-compatible with the
 - Fusion is O(|dense| + |sparse|) for RRF; add a hash map probe per entry for
   weighted sum's normalization pass. Dominated by the per-leg search cost.
 
-Cross-library benchmarks (FAISS, hnswlib, Annoy) land in `BENCHMARKS.md`
-under the CHA-105b ticket.
+Cross-library benchmarks (FAISS, ScaNN) live in
+[`BENCHMARKS.md` → Cross-Library Comparison](BENCHMARKS.md#cross-library-comparison),
+backed by the reproducible harness under `Benchmarks/`.
 
 ---
 
