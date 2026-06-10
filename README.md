@@ -12,7 +12,6 @@
   </p>
 </p>
 
-<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ProximaKit finds **similar content by understanding what it means** — not by matching keywords. Type "beach vacation" and it finds photos of oceans, notes about travel, articles about tropical destinations. None of them need to contain the words "beach" or "vacation."
 
@@ -32,10 +31,11 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 |------------|---------|
 | **HNSW graph search** | From-scratch multi-layer implementation — heuristic neighbour selection, tombstone deletes, auto-compaction, reproducible builds via `levelSeed` |
 | **Hybrid retrieval** | BM25 + dense fusion (`HybridIndex`, `HybridVectorStore`) with Reciprocal Rank Fusion or weighted sum |
-| **Product quantization** | 32× vector compression with asymmetric distance computation (`QuantizedHNSWIndex`, [ADR-011](docs/adr/ADR-011-pq-codec.md)) |
-| **INT8 scalar quantization** *(new)* | ~4× less vector memory, **works with any metric**, no training phase (`ScalarQuantizedHNSWIndex`, [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md)) |
-| **Filtered search** | `@Sendable` predicate on every index and store ([ADR-008](docs/adr/ADR-008-filtered-search.md)) |
-| **8 distance metrics** | Cosine, Euclidean, dot product, Manhattan, Hamming, Chebyshev *(new)*, Bray-Curtis *(new)*, Mahalanobis *(new)* — all vDSP-accelerated where it pays |
+| **Product quantization** | 32× vector compression with asymmetric distance computation, plus *(new)* opt-in exact reranking — retain the originals and `search` re-scores the top ADC candidates at full precision (`QuantizedHNSWIndex`, [ADR-011](docs/adr/ADR-011-pq-codec.md), [ADR-012](docs/adr/ADR-012-pq-reranking.md)) |
+| **INT8 scalar quantization** | ~4× less vector memory, **works with any metric**, no training phase (`ScalarQuantizedHNSWIndex`, [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md)) |
+| **Filtered search** | `@Sendable` predicate on every index and store; *(new)* graph-aware on `HNSWIndex` — the layer-0 beam applies the filter during traversal with adaptive widening, so selective filters still fill `k` ([ADR-008](docs/adr/ADR-008-filtered-search.md)) |
+| **GPU batch distance (v1)** *(new)* | `MetalBatchDistance` — standalone one-query-to-N squared-L2/cosine utility with automatic vDSP fallback. Not yet wired into index build or search; no speedup claimed until measured ([ADR-009](docs/adr/ADR-009-metal-backend.md)) |
+| **8 distance metrics** | Cosine, Euclidean, dot product, Manhattan, Hamming, Chebyshev, Bray-Curtis, Mahalanobis — all vDSP-accelerated where it pays |
 | **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)) |
 | **Embedding providers** | Apple NaturalLanguage, Vision, and bring-your-own CoreML (BERT/MiniLM via WordPiece tokenizer) |
 | **Concurrency** | Every index is a Swift `actor`; `Sendable` API surface, built with `StrictConcurrency` |
@@ -94,7 +94,6 @@ Not a wrapper. Not a port.
 </tr>
 </table>
 
-<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## Overview
 
@@ -117,7 +116,6 @@ ProximaKit is the foundation of the Chakravyuha stack and is used by TinyBrain (
 
 How does it actually stack up on speed and recall? We measure instead of claiming — see [Benchmarks](#performance).
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Requirements
 
@@ -156,7 +154,18 @@ swift run ProximaDemo
 
 Or open `Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj` in Xcode for the full GUI experience.
 
-<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
+### Build a RAG App
+
+Retrieval-augmented generation over your own notes — embed, index, retrieve, and let an on-device language model answer with citations. The whole pipeline is ~100 lines of Swift, works in airplane mode, and ships as a runnable target:
+
+```bash
+swift run OnDeviceRAG -question "How long should I steep cold brew?"
+```
+
+ProximaKit does the retrieval; Apple's FoundationModels on-device LLM answers where the OS provides one, with a deterministic template model standing in everywhere else. Walkthrough: [`docs/RAG-TUTORIAL.md`](docs/RAG-TUTORIAL.md) · Code: [`Examples/OnDeviceRAG/`](Examples/OnDeviceRAG/)
+
+New to vector search itself? The [interactive DocC tutorial](https://vivekptnk.github.io/ProximaKit/tutorials/meetproximakit) builds the core pipeline step by step.
+
 
 ## How It Works
 
@@ -192,7 +201,6 @@ You type: "beach vacation"
 
 All of this happens **on your device**, using Apple's Accelerate framework for SIMD math. No internet required.
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Demo
 
@@ -220,7 +228,6 @@ The animated terminal at the top of this README replays a real `swift run Proxim
 
 Open in Xcode: `open Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj`
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Search Text by Meaning
 
@@ -265,7 +272,8 @@ Need to restrict results — say, to one user's documents? Every index takes a f
 let mine = await index.search(query: query, k: 3) { allowedIDs.contains($0) }
 ```
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
+On `HNSWIndex` the predicate is applied *during* graph traversal (with adaptive beam widening), so even highly selective filters return a full `k` results instead of under-filling ([ADR-008](docs/adr/ADR-008-filtered-search.md)).
+
 
 ## Hybrid Search: Meaning + Keywords
 
@@ -284,6 +292,7 @@ Fusion defaults to Reciprocal Rank Fusion (`.rrf(k: 60)`); `.weightedSum(alpha:)
 <p align="center">
   <img src="docs/assets/quantization.svg" alt="Animated comparison: a 384-dim vector at 1,536 bytes in Float32 shrinks to 388 bytes with INT8 scalar quantization and 48 bytes with product quantization" width="760" />
 </p>
+<p align="center"><sub>INT8 scalar quantization (any metric, no training — <a href="docs/adr/ADR-007-int8-scalar-quantization.md">ADR-007</a>) and product quantization (L2 ADC, k-means codebooks — <a href="docs/adr/ADR-011-pq-codec.md">ADR-011</a>). Both build a full-precision HNSW graph first, then store only compressed codes; recall floors are CI-asserted.</sub></p>
 
 ~4× less vector memory, no training phase, works with any serialisable metric:
 
@@ -296,7 +305,8 @@ let hits = await sq.search(query: queryVector, k: 10)
 
 Need to go further? `QuantizedHNSWIndex` (product quantization) compresses 32× — at the cost of a k-means training pass and an L2-only search path. The trade-offs are spelled out in [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md) vs [ADR-011](docs/adr/ADR-011-pq-codec.md).
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
+If recall matters more than the memory win, build the PQ index with `retainOriginals: true`: search then re-scores the top quantized candidates with exact distances before returning, recovering near-full-precision recall ([ADR-012](docs/adr/ADR-012-pq-reranking.md)). Be aware of the trade — retaining originals stores the Float32 vectors again, so you give up the compression story for accuracy.
+
 
 ## Search Images
 
@@ -310,7 +320,6 @@ let queryVector = try await vision.embed(anotherImage)
 let similar = await imageIndex.search(query: queryVector, k: 5)
 ```
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Save and Load
 
@@ -326,7 +335,6 @@ let loaded = try HNSWIndex.load(from: fileURL)
 
 The format carries a magic number and version field; loaders validate graph structure before trusting it and throw typed `PersistenceError`s on corrupt input instead of crashing. Evolution policy: [ADR-010](docs/adr/ADR-010-format-evolution.md).
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Use a Custom AI Model (CoreML)
 
@@ -355,7 +363,6 @@ model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
 
 Pass the compiled model's URL to `CoreMLEmbeddingProvider(modelAt:vocabURL:)` — the library never scans directories. (The demo app additionally looks for models in its own `Models/` folder as a convenience.)
 
-<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## Architecture
 
@@ -426,7 +433,6 @@ Pass the compiled model's URL to `CoreMLEmbeddingProvider(modelAt:vocabURL:)` �
 
 Deep dive: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
-<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## Performance
 
@@ -459,7 +465,6 @@ Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full me
 
 **Cross-library comparison (FAISS, ScaNN):** numbers are generated nightly by [`benchmark.yml`](.github/workflows/benchmark.yml) on SIFT1M-100K against shared brute-force ground truth (MS MARCO-50K is available in the harness for manual runs), and published as CI artifacts — never hand-copied into docs where they'd go stale. Harness + methodology: [`Benchmarks/`](Benchmarks/README.md), [ADR-005](docs/adr/ADR-005-benchmark-methodology.md). Results are reported honestly, including when ProximaKit loses.
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Which Index Should I Use?
 
@@ -468,13 +473,12 @@ Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full me
 | `HNSWIndex` | **Most cases.** Fast approximate search, O(log n). | Full (Float32) |
 | `BruteForceIndex` | Under 1,000 items. 100% exact accuracy, O(n). | Full (Float32) |
 | `ScalarQuantizedHNSWIndex` | Memory-constrained, any metric, no training. | **~4× smaller** |
-| `QuantizedHNSWIndex` | Maximum compression, L2 workloads, can afford training. | **32× smaller** |
+| `QuantizedHNSWIndex` | Maximum compression, L2 workloads, can afford training. Opt-in exact reranking recovers recall — but stores originals again ([ADR-012](docs/adr/ADR-012-pq-reranking.md)). | **32× smaller** |
 | `SparseIndex` | Keyword/BM25 search, no embeddings needed. | Postings lists |
 | `HybridIndex` | Best of both: semantic + exact-term recall. | Dense + sparse legs |
 
 `HNSWIndex` and `BruteForceIndex` share the same `VectorIndex` API — swap them without changing any other code.
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Which Distance Metric?
 
@@ -491,7 +495,6 @@ Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full me
 
 All eight conform to the same `DistanceMetric` protocol. One caveat: `MahalanobisDistance` carries a matrix, so it is search-only — indices built with it cannot be persisted (`save` throws `PersistenceError.unserializableMetric`).
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Tuning
 
@@ -512,7 +515,6 @@ let config = HNSWConfiguration(
 | Build takes too long | Decrease `efConstruction` (try 100) |
 | Flaky recall in tests | Set `levelSeed` for deterministic graph topology |
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Thread Safety
 
@@ -524,7 +526,6 @@ let results = await index.search(query: vector, k: 10)
 try await index.add(newVector, id: UUID())
 ```
 
-<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## API Reference
 
@@ -542,6 +543,7 @@ try await index.add(newVector, id: UUID())
 | `VectorStore` | Document-level layer: chunks, metadata, saves. |
 | `HybridVectorStore` | Same, over a hybrid index. |
 | `ScalarQuantizer` / `ProductQuantizer` | The codecs behind the quantized indices. |
+| `MetalBatchDistance` | Standalone GPU one-query-to-N batch distances (vDSP fallback; not used by the indices yet). |
 | `CosineDistance` … `MahalanobisDistance` | The 8 distance metrics. |
 | `SearchResult` | Result: `id`, `distance`, `metadata`. |
 | `HNSWConfiguration` | Tuning: `m`, `efConstruction`, `efSearch`, `autoCompactionThreshold`, `levelSeed`. |
@@ -557,7 +559,12 @@ try await index.add(newVector, id: UUID())
 | `CoreMLEmbeddingProvider` | Any CoreML model (BERT, MiniLM, etc). |
 | `WordPieceTokenizer` | BERT-compatible tokenizer for CoreML models. |
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
+
+## Documentation
+
+- **API reference (DocC):** <https://vivekptnk.github.io/ProximaKit/> — rebuilt and published from `main` on every push
+- **Interactive tutorial:** [Build On-Device Semantic Search](https://vivekptnk.github.io/ProximaKit/tutorials/meetproximakit) — a step-by-step DocC tutorial: create an index, embed text with NLEmbedding, search by meaning, persist to disk
+- **Guides:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/HYBRID.md`](docs/HYBRID.md) · [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) · [`docs/RAG-TUTORIAL.md`](docs/RAG-TUTORIAL.md)
 
 ## Design Decisions
 
@@ -568,11 +575,13 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-004](docs/adr/ADR-004-hnsw-heuristic-selection.md): Why heuristic neighbor selection
 - [ADR-005](docs/adr/ADR-005-benchmark-methodology.md): Cross-library benchmark methodology
 - [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md): INT8 scalar quantization codec
-- [ADR-008](docs/adr/ADR-008-filtered-search.md): Filtered search (post-filter now, graph-aware later)
+- [ADR-008](docs/adr/ADR-008-filtered-search.md): Filtered search (post-filter, plus the graph-aware addendum for `HNSWIndex`)
+- [ADR-009](docs/adr/ADR-009-metal-backend.md): Metal batch distance — v1 scoped to a standalone utility
 - [ADR-010](docs/adr/ADR-010-format-evolution.md): Persistence format evolution policy
 - [ADR-011](docs/adr/ADR-011-pq-codec.md): Product quantization codec
+- [ADR-012](docs/adr/ADR-012-pq-reranking.md): Full-precision reranking for quantized HNSW
+- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence (proposed — design only, not implemented)
 
-<p align="center">◇ ── ◆ ── ◇ ── ◆ ── ◇</p>
 
 ## Building & Testing
 
@@ -592,7 +601,6 @@ swift package generate-documentation --target ProximaKit
 
 CI runs the full functional suite (400+ tests; benchmark classes run separately), SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR — plus a benchmark smoke-slice regression gate on PRs that touch the core index.
 
-<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## Roadmap
 
@@ -600,13 +608,13 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
 
 | Area | Status |
 |------|--------|
-| GPU acceleration — Metal/MPSGraph backend for batch index builds | Planned |
-| Graph-aware filtered search — higher recall under selective filters | Planned |
+| Graph-aware filtered search — higher recall under selective filters | **Shipped** for `HNSWIndex` ([ADR-008 addendum](docs/adr/ADR-008-filtered-search.md)); quantized and sparse indexes still post-filter |
+| GPU acceleration | v1 shipped: `MetalBatchDistance` batch utility ([ADR-009](docs/adr/ADR-009-metal-backend.md)). Index build/search integration still planned — gated on measured speedups |
+| Streaming persistence — incremental saves (WAL) + paged vectors | Proposed, design only ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
 | Jensen-Shannon divergence metric | Considering |
 | Background HNSW compaction policy | Planned |
-| Demo app — iOS target, CoreML model download UI, result export | Planned |
+| Demo app — CoreML model download UI, benchmark tab, result export | Planned |
 
-<p align="center">◆ ─────── ◇ ─────── ◆ ─────── ◇ ─────── ◆</p>
 
 ## License
 

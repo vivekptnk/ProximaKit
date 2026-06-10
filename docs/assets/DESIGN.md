@@ -22,6 +22,12 @@ Apple-grade discipline. Every SVG asset in this directory follows these rules.
 - Forbidden: blinking, dash-offset storms, parallel competing animations, anything under 2s.
 - Traveling elements use SMIL (`animateMotion` + `keyTimes`), not CSS `offset-path` (compatibility).
 
+### Sanctioned exception: terminal session bodies
+Long monospace session transcripts may use `<text>` with a pure monospace stack
+(`ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace`) when
+outlining would exceed ~200 KB. Chrome labels (titles, captions) are still SF
+outlines. Declare the exception in the asset's PR/report.
+
 ## Hygiene
 - `xmllint --noout` must pass (a duplicate attribute once shipped a broken image).
 - Render with `qlmanage -t -s 880 -o /tmp <file>` and INSPECT the PNG before calling it done.
