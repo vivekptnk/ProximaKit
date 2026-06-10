@@ -113,7 +113,7 @@ The `ProximaDemoApp` (macOS SwiftUI) ships with the repo and demonstrates semant
 
 | Item | Priority |
 |------|----------|
-| iOS / iPadOS target | **Shipped** — single multiplatform SwiftUI target (compact tab layout on iPhone; split view on iPad) |
+| iOS / iPadOS / visionOS target | **Shipped** — single multiplatform SwiftUI target (compact tab layout on iPhone; split view on iPad; spatial panel on Vision Pro) |
 | CoreML model download UI — browse HuggingFace Hub, download `.mlpackage`, hot-swap embedding provider | High |
 | Benchmark tab — run efSearch sweep in-app and display a recall vs. latency chart | Medium |
 | Export results to CSV / JSON | Medium |

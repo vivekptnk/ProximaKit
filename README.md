@@ -206,6 +206,12 @@ The app now runs on **iPhone, iPad, macOS, and visionOS** from a single SwiftUI 
   <img src="docs/assets/screenshot-ipad.png" alt="ProximaDemoApp on iPad: query 'machine learning on device' returns technology results led by machine-learning and cloud-computing sentences, 5.5 ms search time" width="430" />
 </p>
 
+And on Apple Vision Pro, the same target renders as a spatial glass panel (real visionOS simulator screenshot):
+
+<p align="center">
+  <img src="docs/assets/screenshot-visionos.png" alt="ProximaDemoApp on Apple Vision Pro: the search interface floats as a translucent glass panel in a simulated living room" width="760" />
+</p>
+
 The animated terminal at the top of this README replays a real `swift run ProximaDemo` CLI session, and the desktop layout looks like this (illustrative mock-up):
 
 <p align="center">
