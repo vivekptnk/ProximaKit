@@ -42,18 +42,17 @@ public struct PQConfiguration: Sendable, Codable, Equatable {
 /// ## Usage
 ///
 /// ```swift
-/// // Train on a representative sample of vectors
+/// // Train on a representative sample of vectors ([Vector], e.g. 384-dim)
 /// let pq = try ProductQuantizer.train(
 ///     vectors: trainingVectors,
-///     dimension: 384,
 ///     config: PQConfiguration(subspaceCount: 48)
 /// )
 ///
 /// // Encode vectors to compact codes
 /// let codes = pq.encode(vector)  // 48 bytes instead of 1536
 ///
-/// // Asymmetric distance: full-precision query vs quantized database
-/// let table = pq.buildDistanceTable(query: queryVector, metric: .euclidean)
+/// // Asymmetric distance (squared L2): full-precision query vs quantized database
+/// let table = pq.buildDistanceTable(query: queryVector)
 /// let distance = pq.asymmetricDistance(table: table, codes: codes)
 /// ```
 public struct ProductQuantizer: Sendable {

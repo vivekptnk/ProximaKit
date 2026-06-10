@@ -333,4 +333,144 @@ final class HybridIndexTests: XCTestCase {
         XCTAssertEqual(fused.first?.id, x)
         XCTAssertEqual(fused[1].id, y)
     }
+
+    // MARK: - Weighted Sum Fusion Math (non-degenerate alpha, hand-computed)
+    //
+    // The live-leg tests above only cover the degenerate alphas (0.0 and 1.0).
+    // These pin the actual blend math at alpha = 0.3 / 0.5 / 0.7 on one shared
+    // fixture, hand-computed through minMaxNormalize:
+    //
+    //   dense leg (distance, lower = better):  A: 0.0   B: 0.2   C: 0.8
+    //     negate → min-max over range 0.8:     A: 1.0   B: 0.75  C: 0.0
+    //   sparse leg (negated BM25 scores):      C: -1.0  A: -0.4  B: -0.1
+    //     negate → min-max over range 0.9:     C: 1.0   A: 1/3   B: 0.0
+    //
+    //   fused(id) = alpha * dense_norm + (1 - alpha) * sparse_norm:
+    //     A = alpha + (1 - alpha)/3      B = 0.75 * alpha      C = 1 - alpha
+    //
+    //   alpha = 0.3:  C (0.700) > A (0.533) > B (0.225)
+    //   alpha = 0.5:  A (0.667) > C (0.500) > B (0.375)
+    //   alpha = 0.7:  A (0.800) > B (0.525) > C (0.300)
+    //
+    // Each alpha yields a *different* total order, so a sign/weight bug in
+    // either leg's contribution cannot pass all three.
+
+    private static let wsA = UUID()
+    private static let wsB = UUID()
+    private static let wsC = UUID()
+
+    private var weightedSumFixture: (dense: [SearchResult], sparse: [SearchResult]) {
+        (
+            dense: [
+                SearchResult(id: Self.wsA, distance: 0.0),
+                SearchResult(id: Self.wsB, distance: 0.2),
+                SearchResult(id: Self.wsC, distance: 0.8),
+            ],
+            sparse: [
+                SearchResult(id: Self.wsC, distance: -1.0),
+                SearchResult(id: Self.wsA, distance: -0.4),
+                SearchResult(id: Self.wsB, distance: -0.1),
+            ]
+        )
+    }
+
+    func testWeightedSumAlpha03Ordering() {
+        let (dense, sparse) = weightedSumFixture
+        let fused = HybridIndex.fuse(
+            dense: dense, sparse: sparse,
+            strategy: .weightedSum(alpha: 0.3), k: 3
+        )
+        XCTAssertEqual(fused.map(\.id), [Self.wsC, Self.wsA, Self.wsB],
+            "alpha=0.3: expected C (0.700) > A (0.533) > B (0.225)")
+    }
+
+    func testWeightedSumAlpha05Ordering() {
+        let (dense, sparse) = weightedSumFixture
+        let fused = HybridIndex.fuse(
+            dense: dense, sparse: sparse,
+            strategy: .weightedSum(alpha: 0.5), k: 3
+        )
+        XCTAssertEqual(fused.map(\.id), [Self.wsA, Self.wsC, Self.wsB],
+            "alpha=0.5: expected A (0.667) > C (0.500) > B (0.375)")
+    }
+
+    func testWeightedSumAlpha07Ordering() {
+        let (dense, sparse) = weightedSumFixture
+        let fused = HybridIndex.fuse(
+            dense: dense, sparse: sparse,
+            strategy: .weightedSum(alpha: 0.7), k: 3
+        )
+        XCTAssertEqual(fused.map(\.id), [Self.wsA, Self.wsB, Self.wsC],
+            "alpha=0.7: expected A (0.800) > B (0.525) > C (0.300)")
+    }
+
+    // MARK: - Weighted Sum Normalization Edge Cases
+
+    func testWeightedSumIdenticalScoresInOneLegNormalizeToMidpoint() {
+        // All dense distances tied → min-max range is 0 → every dense doc
+        // gets the 0.5 midpoint (not NaN, not 0, not 1). Ordering must then
+        // be decided entirely by the sparse leg.
+        let a = UUID(), b = UUID()
+        let dense = [
+            SearchResult(id: a, distance: 0.5),
+            SearchResult(id: b, distance: 0.5),
+        ]
+        let sparse = [
+            SearchResult(id: b, distance: -1.0),  // sparse-best
+            SearchResult(id: a, distance: -0.2),
+        ]
+        // fused(a) = 0.5*0.5 + 0.5*0.0 = 0.25; fused(b) = 0.25 + 0.5 = 0.75.
+        let fused = HybridIndex.fuse(
+            dense: dense, sparse: sparse,
+            strategy: .weightedSum(alpha: 0.5), k: 2
+        )
+        XCTAssertEqual(fused.map(\.id), [b, a],
+            "With the dense leg fully tied, the sparse leg must decide the order")
+    }
+
+    func testWeightedSumBothLegsFullyTiedYieldMidpointScores() {
+        // Both legs tied → every doc scores alpha*0.5 + (1-alpha)*0.5 = 0.5,
+        // i.e. fused distance is exactly -0.5 for all. Order among ties is
+        // unspecified, so assert the score values and membership, not order.
+        let a = UUID(), b = UUID()
+        let dense = [
+            SearchResult(id: a, distance: 1.0),
+            SearchResult(id: b, distance: 1.0),
+        ]
+        let sparse = [
+            SearchResult(id: a, distance: -2.0),
+            SearchResult(id: b, distance: -2.0),
+        ]
+        let fused = HybridIndex.fuse(
+            dense: dense, sparse: sparse,
+            strategy: .weightedSum(alpha: 0.3), k: 2
+        )
+        XCTAssertEqual(Set(fused.map(\.id)), [a, b])
+        for result in fused {
+            XCTAssertEqual(result.distance, -0.5,
+                "Fully tied legs must fuse to the 0.5 midpoint, not NaN/0/1")
+        }
+    }
+
+    func testWeightedSumSingleElementLegNormalizesToMidpoint() {
+        // A single-element leg has min == max → range 0 → midpoint 0.5,
+        // regardless of how large its raw distance is. The raw 42.0 must NOT
+        // leak into the fused score.
+        let x = UUID(), y = UUID(), z = UUID()
+        let dense = [SearchResult(id: x, distance: 42.0)]
+        let sparse = [
+            SearchResult(id: y, distance: -3.0),
+            SearchResult(id: z, distance: -1.0),
+        ]
+        // alpha = 0.5:
+        //   x = 0.5 * 0.5             = 0.25
+        //   y = 0.5 * 1.0 (sparse-best) = 0.5
+        //   z = 0.5 * 0.0             = 0.0
+        let fused = HybridIndex.fuse(
+            dense: dense, sparse: sparse,
+            strategy: .weightedSum(alpha: 0.5), k: 3
+        )
+        XCTAssertEqual(fused.map(\.id), [y, x, z],
+            "Single-element dense leg should contribute the 0.5 midpoint, ranking x between y and z")
+    }
 }

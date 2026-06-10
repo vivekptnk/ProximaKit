@@ -61,13 +61,12 @@ jobs:
 
       - name: Run Tests
         run: swift test --skip RecallBenchmarkTests
-        # RecallBenchmarkTests skipped in CI (take 2+ minutes, need large datasets).
-        # TODO(audit/tests-wave): `--skip RecallBenchmarkTests` matches the whole
-        # class, which also skips the fast functional tests that currently live
-        # there (testLiveCountAfterRemovals, testCompaction, testAutoCompaction*,
-        # testNonisolatedDimension/Configuration). Relocating those into
-        # HNSWCompactionTests is owned by the tests wave; once they move, this
-        # skip will only exclude the genuinely slow recall sweeps.
+        # RecallBenchmarkTests skipped in CI (take 2+ minutes, need large
+        # datasets) and is benchmarks-only: the fast functional tests that
+        # used to live there (testLiveCountAfterRemovals, testCompaction,
+        # testAutoCompaction*, testNonisolated*) moved to CompactionTests
+        # (CHA-201), which this unskipped run executes on every PR. Keep new
+        # functional tests out of RecallBenchmarkTests or CI won't run them.
 
       - name: Build Demo App
         run: swift build --target ProximaDemo

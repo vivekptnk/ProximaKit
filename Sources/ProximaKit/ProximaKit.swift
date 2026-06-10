@@ -4,7 +4,7 @@
 // - Vector type with Accelerate-powered math
 // - Distance metrics (cosine, L2, dot product)
 // - Index structures (BruteForce, HNSW)
-// - Persistence (memory-mapped binary files)
+// - Persistence (versioned binary files)
 //
 // Imports: Foundation + Accelerate ONLY. No third-party dependencies.
 

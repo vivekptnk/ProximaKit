@@ -3,7 +3,7 @@
 //
 // Binary persistence for trained product quantizers.
 //
-// Format: 16-byte header + codebook data.
+// Format: 24-byte header (six UInt32 fields, little-endian) + codebook data.
 //   Magic:         0x50515454 ("PQTT")
 //   Version:       1
 //   Dimension:     UInt32

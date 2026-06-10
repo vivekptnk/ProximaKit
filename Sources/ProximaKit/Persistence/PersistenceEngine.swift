@@ -3,7 +3,9 @@
 //
 // Binary persistence for ProximaKit indices.
 // Format: 64-byte header + UUIDs + raw Float32 vectors + graph + metadata.
-// Vectors are memory-mapped on load for fast cold starts.
+// Files are read with `.mappedIfSafe` (the OS maps rather than copies the
+// raw bytes during parsing), but every section is then decoded into Swift
+// arrays — a loaded index is fully memory-resident, not paged on demand.
 // See ADR-003 for design rationale.
 
 import Foundation
@@ -60,7 +62,10 @@ public struct HNSWSnapshot: Sendable {
 /// Binary persistence for ProximaKit indices.
 ///
 /// Saves indices to a compact binary format. Vectors are stored as contiguous
-/// Float32 values, enabling memory-mapped loading for fast cold starts.
+/// Float32 values for fast bulk decoding. Loading reads the file with
+/// `.mappedIfSafe` — which avoids an up-front copy of the raw bytes — but all
+/// sections are copied into Swift arrays during parsing, so the loaded index
+/// is fully resident in memory (no OS paging of vector data after load).
 ///
 /// ```swift
 /// // Save

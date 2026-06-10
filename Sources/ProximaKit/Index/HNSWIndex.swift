@@ -37,11 +37,20 @@ public struct HNSWConfiguration: Sendable {
     /// Default: `0.7` (compact when fewer than 70% of slots are live).
     public let autoCompactionThreshold: Double?
 
+    /// Seeds the random layer-assignment draw so graph construction is
+    /// reproducible: the same insertion sequence yields the same topology.
+    ///
+    /// `nil` (the default) uses the system RNG. The seed is a build-time
+    /// knob only — it is NOT persisted, because it affects how a graph is
+    /// constructed, never how an existing graph is searched.
+    public let levelSeed: UInt64?
+
     public init(
         m: Int = 16,
         efConstruction: Int = 200,
         efSearch: Int = 50,
-        autoCompactionThreshold: Double? = 0.7
+        autoCompactionThreshold: Double? = 0.7,
+        levelSeed: UInt64? = nil
     ) {
         // m == 1 would make levelMultiplier = 1/ln(1) = +inf, which traps on
         // the first add() when assignLevel() converts the level to Int.
@@ -57,6 +66,25 @@ public struct HNSWConfiguration: Sendable {
         self.efConstruction = efConstruction
         self.efSearch = efSearch
         self.autoCompactionThreshold = autoCompactionThreshold
+        self.levelSeed = levelSeed
+    }
+}
+
+/// SplitMix64 — deterministic generator for seeded layer assignment.
+/// Not cryptographic; reproducible-construction use only.
+struct SplitMix64: RandomNumberGenerator {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        self.state = seed
+    }
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
     }
 }
 
@@ -72,7 +100,7 @@ public struct HNSWConfiguration: Sendable {
 /// ```swift
 /// let index = HNSWIndex(dimension: 384, metric: CosineDistance())
 /// try await index.add(vector, id: UUID())
-/// let results = try await index.search(query: queryVec, k: 10)
+/// let results = await index.search(query: queryVec, k: 10)  // search doesn't throw
 /// ```
 public actor HNSWIndex: VectorIndex {
 
@@ -90,6 +118,10 @@ public actor HNSWIndex: VectorIndex {
 
     /// Level multiplier: mL = 1/ln(M). Used for exponential layer assignment.
     private let levelMultiplier: Double
+
+    /// Seeded generator for layer assignment when `config.levelSeed` is set;
+    /// `nil` means draw from the system RNG (the default, non-reproducible).
+    private var levelRNG: SplitMix64?
 
     // ── Node Storage ──────────────────────────────────────────────────
     //
@@ -154,6 +186,7 @@ public actor HNSWIndex: VectorIndex {
         self.metric = metric
         self.config = config
         self.levelMultiplier = 1.0 / log(Double(config.m))
+        self.levelRNG = config.levelSeed.map(SplitMix64.init(seed:))
     }
 
     // ── VectorIndex: Add (Algorithm 1 from paper) ─────────────────────
@@ -406,6 +439,10 @@ public actor HNSWIndex: VectorIndex {
         self.metric = snapshot.metricType.makeMetric()
         self.config = snapshot.config
         self.levelMultiplier = 1.0 / log(Double(snapshot.config.m))
+        // levelSeed is a build-time knob and is not persisted; a snapshot's
+        // config carries nil, so restored indexes use the system RNG for any
+        // post-load insertions.
+        self.levelRNG = snapshot.config.levelSeed.map(SplitMix64.init(seed:))
         self.layers = snapshot.layers
         self.nodeLevels = snapshot.nodeLevels
         self.vectors = snapshot.vectors
@@ -466,7 +503,7 @@ public actor HNSWIndex: VectorIndex {
     /// ratio `liveCount / count` drops below your acceptable threshold (e.g., 0.7).
     ///
     /// ```swift
-    /// await index.compact()
+    /// try await index.compact()
     /// // Now count == liveCount
     /// ```
     public func compact() throws {
@@ -506,7 +543,13 @@ public actor HNSWIndex: VectorIndex {
     // and each upper layer has ~1/M as many nodes.
 
     private func assignLevel() -> Int {
-        let random = Double.random(in: Double.leastNonzeroMagnitude...1.0)
+        let random: Double
+        if var rng = levelRNG {
+            random = Double.random(in: Double.leastNonzeroMagnitude...1.0, using: &rng)
+            levelRNG = rng // write the advanced state back
+        } else {
+            random = Double.random(in: Double.leastNonzeroMagnitude...1.0)
+        }
         return Int(floor(-log(random) * levelMultiplier))
     }
 

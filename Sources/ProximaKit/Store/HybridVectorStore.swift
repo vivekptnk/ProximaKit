@@ -24,6 +24,7 @@ import Foundation
 ///     embedder: myEmbedder,
 ///     storageDirectory: appSupportURL
 /// )
+/// try await store.loadDocumentMap()  // when reopening a persisted store
 /// try await store.addChunks(texts, metadata: metas)
 /// let hits = try await store.query("lanthanides", k: 10)
 /// try await store.save()
@@ -75,8 +76,21 @@ public actor HybridVectorStore {
 
     /// Creates (or restores) a hybrid vector store at the given storage directory.
     ///
-    /// If both `index.pxkt` and `index.pxbm` exist under `storageDirectory/name/`,
-    /// they are loaded. Otherwise fresh empty legs are constructed.
+    /// Each leg is restored **independently** from `storageDirectory/name/`:
+    /// the dense leg loads from `index.pxkt` if that file exists (otherwise a
+    /// fresh ``HNSWIndex`` is created), and the sparse leg loads from
+    /// `index.pxbm` if that file exists (otherwise a fresh ``SparseIndex`` is
+    /// created). If only one file is present, that leg is restored and the
+    /// other starts empty.
+    ///
+    /// - Important: This initializer restores **only the index legs**. The
+    ///   document → UUID map is persisted separately (`hybrid.json`) and is
+    ///   NOT loaded here — call ``loadDocumentMap()`` after init when
+    ///   reopening a persisted store. Until then, ``documentIds`` and
+    ///   ``chunkCount(forDocument:)`` report an empty map, and
+    ///   ``removeDocument(id:)`` throws
+    ///   ``VectorStoreError/documentNotFound(_:)`` for documents that are
+    ///   present in the legs. Vector-level queries work immediately.
     public init(
         name: String,
         embedder: any TextEmbedder,

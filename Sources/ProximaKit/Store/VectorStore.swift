@@ -19,6 +19,7 @@ import Foundation
 ///     embedder: myEmbedder,
 ///     storageDirectory: appSupportURL
 /// )
+/// try await store.loadDocumentMap()  // when reopening a persisted store
 /// let ids = try await store.addChunks(texts, metadata: metas)
 /// let results = try await store.query("key findings", k: 5)
 /// try await store.save()
@@ -63,6 +64,16 @@ public actor VectorStore {
     ///
     /// If a persisted index exists at the storage path, it is loaded.
     /// Otherwise, a fresh index is created with the given configuration.
+    ///
+    /// - Important: This initializer restores **only the index**. The
+    ///   document → UUID map is persisted separately (`docmap.json`) and is
+    ///   NOT loaded here — call ``loadDocumentMap()`` after init when
+    ///   reopening a persisted store. Until then, ``documentIds`` and
+    ///   ``chunkCount(forDocument:)`` report an empty map, and
+    ///   ``removeDocument(id:)`` throws
+    ///   ``VectorStoreError/documentNotFound(_:)`` for documents that are
+    ///   present in the index. Vector-level operations (``query(_:k:efSearch:filter:)``)
+    ///   work immediately.
     ///
     /// - Parameters:
     ///   - name: The collection name (used as the directory name within `storageDirectory`).
