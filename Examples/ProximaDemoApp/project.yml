@@ -3,6 +3,8 @@ options:
   bundleIdPrefix: com.vivekptnk
   deploymentTarget:
     macOS: "14.0"
+    iOS: "17.0"
+    visionOS: "1.0"
   createIntermediateGroups: true
 packages:
   ProximaKit:
@@ -10,7 +12,7 @@ packages:
 targets:
   ProximaDemoApp:
     type: application
-    platform: macOS
+    supportedDestinations: [macOS, iOS, visionOS]
     sources:
       - path: Sources
     dependencies:
@@ -21,6 +23,8 @@ targets:
     settings:
       base:
         SWIFT_VERSION: "5.9"
+        # iPhone, iPad, Vision
+        TARGETED_DEVICE_FAMILY: "1,2,7"
     info:
       path: Info.plist
       properties:
@@ -28,3 +32,10 @@ targets:
         CFBundleShortVersionString: "1.1.0"
         CFBundleVersion: "1"
         LSMinimumSystemVersion: "14.0"
+        # iOS/iPadOS: opt into the modern launch screen so the app renders
+        # full-bleed instead of letterboxed.
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight

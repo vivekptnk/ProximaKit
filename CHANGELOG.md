@@ -11,6 +11,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Correctness fixes from a multi-agent audit (every fix reproduced before patching, re-verified after), INT8 scalar quantization, three new distance metrics, reproducible graph construction, and a CI overhaul.
 
 ### Added
+- **Multiplatform demo app**: `ProximaDemoApp` now targets iPhone, iPad,
+  macOS, and visionOS from one SwiftUI target (compact widths get a
+  search-first tab layout; AppKit image loading replaced with ImageIO).
+  The persisted demo index is validated against the current embedder's
+  dimension before reuse — NLEmbedding can pin sentence (512d) or
+  word-averaging (300d) mode depending on which language assets the OS
+  has, and a stale-dimension index made every search silently empty.
+  Dimension mismatches now surface as an actionable error instead.
+  A `-demoQuery` launch argument supports screenshot automation.
 - **INT8 scalar quantization (ADR-007).** `ScalarQuantizer` — symmetric
   per-vector scaling (`scale = maxAbs / 127`, explicit zero-vector handling)
   — plus the `ScalarQuantizedHNSWIndex` actor. ~4× vector-storage reduction

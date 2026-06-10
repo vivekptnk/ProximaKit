@@ -7,58 +7,112 @@ struct MainView: View {
     @State private var searchText = ""
     @State private var newNote = ""
     @State private var showImagePicker = false
+    #if !os(macOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
 
     var body: some View {
+        layout
+            .task {
+                // Screenshot/UI-test hook: `simctl launch <sim> <bundle-id>
+                // -demoQuery "..."` pre-fills the search field (launch
+                // arguments of the -key value form land in UserDefaults).
+                if let demo = UserDefaults.standard.string(forKey: "demoQuery"),
+                   searchText.isEmpty {
+                    // Wait for the index build to have started AND finished —
+                    // checking isIndexing alone races the buildIndex() task
+                    // and can fire the query against an empty index.
+                    var ticks = 0
+                    while (engine.isIndexing || engine.indexedCount == 0) && ticks < 300 {
+                        try? await Task.sleep(for: .milliseconds(100))
+                        ticks += 1
+                    }
+                    searchText = demo
+                }
+            }
+            .onChange(of: searchText) {
+                Task { await engine.search(searchText) }
+            }
+            .fileImporter(
+                isPresented: $showImagePicker,
+                allowedContentTypes: [.image],
+                allowsMultipleSelection: true
+            ) { result in
+                guard let urls = try? result.get() else { return }
+                Task { await engine.addImages(urls) }
+            }
+    }
+
+    // Compact widths (iPhone, narrow iPad splits) lead with search in a tab
+    // bar; regular widths (macOS, iPad full-screen, visionOS) keep the
+    // sidebar + detail split.
+    @ViewBuilder
+    private var layout: some View {
+        #if os(macOS)
+        splitLayout
+        #else
+        if horizontalSizeClass == .compact {
+            TabView {
+                NavigationStack {
+                    searchPane.navigationTitle("Search")
+                }
+                .tabItem { Label("Search", systemImage: "magnifyingglass") }
+
+                NavigationStack {
+                    sidebar.navigationTitle("Index")
+                }
+                .tabItem { Label("Index", systemImage: "slider.horizontal.3") }
+            }
+        } else {
+            splitLayout
+        }
+        #endif
+    }
+
+    private var splitLayout: some View {
         NavigationSplitView {
             sidebar
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260)
         } detail: {
-            VStack(spacing: 0) {
-                // Search bar
-                HStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                    TextField("Search by meaning...", text: $searchText)
-                        .textFieldStyle(.plain)
-                        .font(.title3)
-                    if !searchText.isEmpty {
-                        Button { searchText = ""; engine.results = [] } label: {
-                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                        }.buttonStyle(.plain)
-                    }
+            searchPane
+        }
+    }
+
+    private var searchPane: some View {
+        VStack(spacing: 0) {
+            // Search bar
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search by meaning...", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.title3)
+                if !searchText.isEmpty {
+                    Button { searchText = ""; engine.results = [] } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }.buttonStyle(.plain)
                 }
-                .padding(12)
-
-                Divider()
-
-                // Content
-                if engine.isIndexing {
-                    Spacer()
-                    ProgressView("Indexing \(engine.indexedCount) / \(SampleData.sentences.count)...")
-                    Spacer()
-                } else if engine.results.isEmpty && searchText.isEmpty {
-                    welcomeView
-                } else if engine.results.isEmpty {
-                    Spacer()
-                    Text("No results for \"\(searchText)\"").foregroundStyle(.secondary)
-                    Spacer()
-                } else {
-                    resultsList
-                }
-
-                Divider()
-                statusBar
             }
-        }
-        .onChange(of: searchText) {
-            Task { await engine.search(searchText) }
-        }
-        .fileImporter(
-            isPresented: $showImagePicker,
-            allowedContentTypes: [.image],
-            allowsMultipleSelection: true
-        ) { result in
-            guard let urls = try? result.get() else { return }
-            Task { await engine.addImages(urls) }
+            .padding(12)
+
+            Divider()
+
+            // Content
+            if engine.isIndexing {
+                Spacer()
+                ProgressView("Indexing \(engine.indexedCount) / \(SampleData.sentences.count)...")
+                Spacer()
+            } else if engine.results.isEmpty && searchText.isEmpty {
+                welcomeView
+            } else if engine.results.isEmpty {
+                Spacer()
+                Text("No results for \"\(searchText)\"").foregroundStyle(.secondary)
+                Spacer()
+            } else {
+                resultsList
+            }
+
+            Divider()
+            statusBar
         }
     }
 

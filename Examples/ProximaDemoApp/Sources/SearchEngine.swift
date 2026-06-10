@@ -1,4 +1,6 @@
-import AppKit
+import CoreGraphics
+import Foundation
+import ImageIO
 import Foundation
 import ProximaKit
 import ProximaEmbeddings
@@ -114,11 +116,16 @@ final class SearchEngine {
             let emb = try setupEmbedder()
             self.embedder = emb
 
-            // Try loading from disk first
+            // Try loading from disk first — but only if its dimension matches
+            // the CURRENT embedder. NLEmbedding picks sentence (512d) or
+            // word-averaging (300d) mode per provider instance depending on
+            // which language assets the OS has, and that can change between
+            // launches while assets download. A stale-dimension index would
+            // make every search silently return [] (dimension-mismatch guard).
             if FileManager.default.fileExists(atPath: Self.indexURL.path) {
                 let loaded = try HNSWIndex.load(from: Self.indexURL)
                 let count = await loaded.count
-                if count > 0 {
+                if count > 0 && loaded.dimension == emb.dimension {
                     self.index = loaded
                     self.indexedCount = count
                     self.loadedFromDisk = true
@@ -210,8 +217,10 @@ final class SearchEngine {
             defer { url.stopAccessingSecurityScopedResource() }
 
             do {
-                guard let nsImage = NSImage(contentsOf: url),
-                      let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                // ImageIO instead of NSImage/UIImage: identical code path on
+                // macOS, iOS, iPadOS, and visionOS.
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                     continue
                 }
 
@@ -247,6 +256,13 @@ final class SearchEngine {
         do {
             let start = DispatchTime.now()
             let qv = try await embedder.embed(trimmed)
+            // Surface a dimension mismatch instead of the index's documented
+            // silent-[] behavior — it means the index needs a rebuild.
+            guard qv.dimension == index.dimension else {
+                errorMessage = "Query dimension (\(qv.dimension)d) doesn't match the index (\(index.dimension)d) — tap Rebuild Index."
+                results = []
+                return
+            }
             let sr = await index.search(query: qv, k: 10, efSearch: Int(efSearch))
             lastQueryTimeMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
 

@@ -198,10 +198,18 @@ All of this happens **on your device**, using Apple's Accelerate framework for S
 
 **ProximaDemoApp** is a macOS SwiftUI app that ships with the repo. It indexes 48 sample documents at startup and lets you search by meaning in real time, tune `efSearch` with a slider, add your own notes to the live index, and persist across app launches.
 
-The animated terminal at the top of this README replays a real `swift run ProximaDemo` CLI session. The GUI app is illustrated below (mock-up, not a screenshot — build the real thing in one command):
+The app now runs on **iPhone, iPad, macOS, and visionOS** from a single SwiftUI target. Real simulator screenshots (semantic search — note zero keyword overlap between query and results):
 
 <p align="center">
-  <img src="docs/assets/demo-app.svg" alt="Illustrative mock-up of ProximaDemoApp: sidebar with corpus stats and an efSearch slider, results panel ranking space-exploration documents by distance" width="760" />
+  <img src="docs/assets/screenshot-iphone.png" alt="ProximaDemoApp on iPhone: query 'cozy rainy day reading' returns snow-covered mountains, warm soup, and gentle rain results with distance chips, 6.1 ms search time" width="280" />
+  &nbsp;&nbsp;
+  <img src="docs/assets/screenshot-ipad.png" alt="ProximaDemoApp on iPad: query 'machine learning on device' returns technology results led by machine-learning and cloud-computing sentences, 5.5 ms search time" width="430" />
+</p>
+
+The animated terminal at the top of this README replays a real `swift run ProximaDemo` CLI session, and the desktop layout looks like this (illustrative mock-up):
+
+<p align="center">
+  <img src="docs/assets/demo-app.svg" alt="Illustrative mock-up of ProximaDemoApp on macOS: sidebar with corpus stats and an efSearch slider, results panel ranking space-exploration documents by distance" width="760" />
 </p>
 
 Open in Xcode: `open Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj`
