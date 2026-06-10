@@ -90,27 +90,18 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
 
-      - name: Ensure iOS platform runtime
-        # macos-15 runner images vary: some ship without the iOS simulator
-        # runtime for the pinned Xcode and the build dies with "iOS 18.2 is
-        # not installed". Download is a no-op when already present.
-        run: sudo xcodebuild -downloadPlatform iOS
-
-      - name: Build ProximaKit for iOS Simulator
+      - name: Build for iOS Simulator (SDK-only)
+        # xcodebuild needs an installed simulator RUNTIME to resolve a
+        # destination, and macos-15 images ship inconsistent runtime sets
+        # for pinned Xcodes ("iOS 18.2 is not installed"; and
+        # -downloadPlatform itself flakes with "Unable to connect to
+        # simulator"). Building against the iphonesimulator SDK with an
+        # explicit triple compiles every target with zero runtime
+        # dependency — same per-platform availability checking, no 6 GB
+        # download, deterministic on every runner image.
         run: |
-          set -o pipefail
-          xcodebuild build \
-            -skipPackagePluginValidation \
-            -scheme ProximaKit \
-            -destination 'generic/platform=iOS Simulator'
-
-      - name: Build ProximaEmbeddings for iOS Simulator
-        run: |
-          set -o pipefail
-          xcodebuild build \
-            -skipPackagePluginValidation \
-            -scheme ProximaEmbeddings \
-            -destination 'generic/platform=iOS Simulator'
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          swift build --sdk "$SDK" --triple arm64-apple-ios17.0-simulator
 
   lint:
     name: SwiftLint
