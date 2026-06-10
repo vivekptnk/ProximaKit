@@ -116,9 +116,14 @@ jobs:
         # Pinned: a floating `brew install` tracks latest, and new default
         # rules in a future SwiftLint release could break the strict gate
         # with no code change. Bump deliberately.
+        # gh release download authenticates with the workflow token —
+        # unauthenticated curl of release assets gets rate-limited on
+        # shared runners (served an HTML error page instead of the zip).
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -sSL -o /tmp/swiftlint.zip \
-            https://github.com/realm/SwiftLint/releases/download/0.63.2/portable_swiftlint.zip
+          gh release download 0.63.2 --repo realm/SwiftLint \
+            --pattern portable_swiftlint.zip --output /tmp/swiftlint.zip
           unzip -o /tmp/swiftlint.zip -d /tmp/swiftlint
           sudo cp /tmp/swiftlint/swiftlint /usr/local/bin/swiftlint
           swiftlint version
