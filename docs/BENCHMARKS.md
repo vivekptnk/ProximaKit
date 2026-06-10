@@ -276,6 +276,35 @@ swift test --filter ScalarQuant
 
 ---
 
+## Reranked PQ Recall
+
+**What it measures:** How much of the recall lost to PQ quantization error is recovered by full-precision reranking ([ADR-012](adr/ADR-012-pq-reranking.md)): `QuantizedHNSWIndex` built with `retainOriginals: true` re-scores the top `rerankDepth` ADC candidates with exact Euclidean distance before truncating to k.
+
+All numbers below are **asserted test thresholds**, not point measurements — runs that dip below fail CI. Fixture (`PQRerankTests`): 1,000 clustered 64d vectors in 10 clusters, M = 16 subspaces, k = 10, 30 queries, `efSearch = 200`, `rerankDepth = 4·k`, brute-force Euclidean ground truth. Data, graph topology, and queries are pinned (`SeededRandom` + `levelSeed`).
+
+| Configuration | Recall@10 | Asserted bound |
+|---------------|-----------|----------------|
+| Pure ADC (no originals) | observed band 0.667–0.717 (`PQBenchmarkTests`) | ≥ 0.55 floor |
+| Pure ADC, same fixture shape (`PQRerankTests`) | observed 0.667–0.730 over 5 local runs | — (baseline for the margin assertion) |
+| Reranked, depth 4·k | observed 0.990–1.000 over 5 local runs | **≥ 0.90 absolute**, and ≥ pure-ADC + 0.15 |
+
+The observed bands are documented in the test sources next to the thresholds; the asserted bounds sit deliberately below them with margin. No rerank latency figures are published — reranking adds O(`rerankDepth` · d) exact distance computations per query, and that cost has not been measured under the [ADR-005](adr/ADR-005-benchmark-methodology.md) harness yet.
+
+**Memory honesty:** retaining originals pays the full `4·d` bytes/vector again on top of the codes, so a reranking index has *no* compression win — `memorySavingsRatio` drops below 1.0 and `originalStorageBytes` reports the cost. Reranking trades PQ's 32× memory story for recall (ADR-012).
+
+### PQ Training Determinism
+
+`PQConfiguration.seed` pins the k-means centroid-initialization draws: the same seed and training vectors produce **byte-identical codebooks and codes**, asserted in `PQDeterminismTests`. The seed is a training-time knob only (not persisted, mirroring `levelSeed`). The CHA-91 memory-vs-recall fixture (`PQBenchmarkTests.testQuantizedHNSWMemoryVsRecall`) now seeds data, graph topology, *and* PQ training, so it measures a single deterministic value (inside the historical 0.667–0.717 band) instead of a band.
+
+**Run the rerank and determinism tests:**
+
+```bash
+swift test --filter PQRerankTests
+swift test --filter PQDeterminismTests
+```
+
+---
+
 ## Compaction
 
 When vectors are removed from `HNSWIndex`, they are tombstoned (marked deleted but still occupying memory). The `compact()` method reclaims this space.

@@ -8,7 +8,89 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **Full-precision reranking for `QuantizedHNSWIndex`
+  ([ADR-012](docs/adr/ADR-012-pq-reranking.md)).** `build(...)` gains an
+  opt-in `retainOriginals: Bool = false` that keeps the Float32 vectors
+  alongside the PQ codes; a new throwing overload
+  `search(query:k:efSearch:rerankDepth:filter:)` overscans the ADC beam and
+  re-scores the top `rerankDepth` candidates with exact Euclidean distance
+  before truncating to `k`. When originals are retained, the existing
+  non-throwing `search` reranks by default at depth `4·k`; indexes without
+  originals produce search results byte-identical to before. Requesting `rerankDepth > 0`
+  without retained originals throws the new typed
+  `QuantizedIndexError.originalsNotRetained` (fail-fast, never a silent
+  ~30%-recall fallback). On the seeded clustered fixture, reranked recall@10
+  is asserted ≥ 0.90 — vs the 0.667–0.717 pure-ADC band — in
+  `PQRerankTests`. Honest cost: retention pays the full `4·d` bytes/vector
+  again, so a retaining index has no compression story
+  (`memorySavingsRatio` drops below 1.0; the new `originalStorageBytes`
+  reports the cost). Reranking trades PQ's 32× memory win for recall.
+- **Graph-aware filtered search for `HNSWIndex`
+  ([ADR-008 addendum](docs/adr/ADR-008-filtered-search.md)).** Filtered
+  queries now apply the predicate *during* the layer-0 beam with adaptive
+  `ef` widening — rejected nodes still route the beam but never occupy
+  result slots — so selective filters fill `k` instead of under-filling.
+  API shape is unchanged (`search(query:k:efSearch:filter:)`); unfiltered
+  queries run the original code path untouched. The selectivity acceptance
+  suite (`FilteredSearchSelectivityTests`, seeded corpus) asserts
+  recall@10 ≥ 0.9 with a full `k` results at ~10% and ~1% predicate pass
+  rates and exact set-and-order equality at ~0.1%, plus a control showing
+  the retired post-filter pipeline returning 0–1 results at 1% selectivity.
+  `QuantizedHNSWIndex`, `ScalarQuantizedHNSWIndex`, and `SparseIndex` keep
+  the post-filter strategy for now.
+- **`PQConfiguration.seed`** — seeds the PQ k-means centroid-initialization
+  draws so training is reproducible: same seed + same vectors →
+  byte-identical codebooks and codes (`PQDeterminismTests`). A
+  training-time knob like `HNSWConfiguration.levelSeed`: deliberately not
+  persisted by the codecs and excluded from `Codable`.
+- **`MetalBatchDistance` ([ADR-009](docs/adr/ADR-009-metal-backend.md), v1
+  scope).** A standalone GPU utility for one-query-to-N batch distances
+  (squared L2 and cosine) over the same flat row-major layout as the vDSP
+  batch paths. Inline-MSL compute kernel, lazily compiled and cached; vDSP
+  numerical parity asserted to 1e-4 in tests; automatic CPU (vDSP) fallback
+  on any runtime Metal failure; `init?` returns `nil` where no GPU exists
+  and a same-API stub compiles on non-Metal platforms. **Scope honesty: v1
+  is a batch utility only — it is not wired into `HNSWIndex` build or
+  search, and no speedup numbers are claimed until measured.**
+- **On-device RAG example + tutorial.** `swift run OnDeviceRAG`
+  ([`Examples/OnDeviceRAG/`](Examples/OnDeviceRAG/)) answers questions over
+  20 built-in notes entirely on-device: NLEmbedding embeddings →
+  `HNSWIndex` retrieval → a 2-requirement `LanguageModel` seam with a
+  deterministic `TemplateLLM` everywhere and `FoundationModelsLLM` (Apple's
+  on-device LLM) where the OS provides one. Supports interactive and
+  scripted (`-question`, `-llm template`) modes. The walkthrough lives in
+  [`docs/RAG-TUTORIAL.md`](docs/RAG-TUTORIAL.md).
+- **Interactive DocC tutorial.** A `@Tutorials` catalog ("Meet ProximaKit")
+  with the step-by-step *Build On-Device Semantic Search* tutorial — create
+  an `HNSWIndex`, embed text with `NLEmbeddingProvider`, persist and reload
+  — linked from the DocC landing page and Getting Started.
+- **[ADR-013](docs/adr/ADR-013-streaming-persistence.md) (Proposed):
+  streaming persistence.** A worked design — WAL incremental saves plus a
+  memory-mapped, demand-paged vector region — for saves proportional to the
+  change and corpora larger than RAM. Design only; **not implemented**, and
+  it makes no performance claims.
+
+### Changed
+- **`HNSWIndex.remove(id:)` repairs dangling incoming edges in
+  O(in-degree).** A maintained reverse-adjacency map replaces the previous
+  sweep of every layer's edge lists. The map is derived state: rebuilt from
+  the snapshot on load, never persisted (on-disk format unchanged), and
+  equivalence-tested against brute force through
+  add/remove/compact/save/load churn (`ReverseAdjacencyTests`).
+- **`PQHW` on-disk format v2 ([ADR-010](docs/adr/ADR-010-format-evolution.md)
+  rules).** A previously reserved header field becomes an `originalsPresent`
+  flag; when set, a slot-aligned Float32 originals section follows metadata
+  (compacted on save like every other per-slot section, corruption-tested).
+  v1 files load unchanged (`retainOriginals = false`). **Migration:**
+  writers always write v2 now, so files saved by this version — even
+  without originals — are rejected by v1.5.0-and-older readers with
+  `unsupportedVersion`.
+- **CI:** SIFT1M dataset verification now pins SHA-256 digests (recorded
+  from a trusted CI run) in addition to byte-size and record-header checks;
+  the benchmark smoke and nightly-full jobs are deduplicated through a
+  reusable `workflow_call` workflow
+  ([`benchmark-core.yml`](.github/workflows/benchmark-core.yml)).
 
 ---
 

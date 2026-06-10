@@ -234,8 +234,9 @@ final class PQBenchmarkTests: XCTestCase {
         }
         let ids = (0..<n).map { _ in UUID() }
 
-        // levelSeed pins the graph topology; remaining run-to-run variance
-        // comes only from PQ's k-means centroid initialization.
+        // levelSeed pins the graph topology; the PQ training seed below pins
+        // k-means centroid initialization (PQConfiguration.seed), so the
+        // whole build — data, graph, codebooks — is deterministic run to run.
         let hnswConfig = HNSWConfiguration(
             m: 16, efConstruction: 200, efSearch: 100, levelSeed: 0x5EED_0091
         )
@@ -269,7 +270,9 @@ final class PQBenchmarkTests: XCTestCase {
             ids: ids,
             dimension: dim,
             hnswConfig: hnswConfig,
-            pqConfig: PQConfiguration(subspaceCount: 16, trainingIterations: 15)
+            pqConfig: PQConfiguration(
+                subspaceCount: 16, trainingIterations: 15, seed: 0x5EED_0092
+            )
         )
 
         var pqRecall: Float = 0
@@ -297,12 +300,18 @@ final class PQBenchmarkTests: XCTestCase {
         // Recall floor. CHA-91's aspirational "<5% recall loss" does NOT hold
         // for end-to-end ADC graph search and never has on this fixture
         // (measured loss ~28-33%): searchLayerADC both NAVIGATES and SCORES
-        // with quantized distances, and QuantizedHNSWIndex stores no
-        // originals, so it cannot rerank its way back (ADR-011 documents the
-        // recall-for-32x-memory trade; "<5%" describes reranked pipelines).
-        // Assert the honest floor with margin below the observed 0.667-0.717
-        // band; graph topology is pinned by levelSeed, with PQ k-means init
-        // the remaining variance source.
+        // with quantized distances, and this index retains no originals, so
+        // it cannot rerank its way back (ADR-011 documents the
+        // recall-for-32x-memory trade; the opt-in rerank recovery is
+        // measured separately in PQRerankTests, ADR-012).
+        // Data (SeededRandom), graph topology (levelSeed), and PQ k-means
+        // initialization (PQConfiguration.seed) are now all pinned, so this
+        // fixture measures a single deterministic value inside the band
+        // observed before training was seeded (0.667-0.717). The floor stays
+        // at the pre-seed 0.55 margin: tightening it toward the pinned value
+        // first requires observing the seeded result across CI
+        // environments/architectures (Float reduction order can differ),
+        // not just locally.
         XCTAssertGreaterThanOrEqual(pqRecall, 0.55,
             "PQ+HNSW recall@10 must stay >= 0.55 (observed band 0.667-0.717; got \(String(format: "%.1f%%", pqRecall * 100)))")
     }

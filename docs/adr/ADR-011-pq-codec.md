@@ -25,6 +25,7 @@ Per-subspace k-means with random initialization (k distinct sampled vectors, not
 ## Consequences
 - Memory: D × 4 bytes → M bytes per vector (384d: 1536 B → 48 B at M=48, 32×). Codebook overhead is fixed at M · K · ds · 4 = D · 1024 bytes (~384 KB at 384d), amortized across the index; HNSW graph overhead (~200 B/node at M=16) is unchanged.
 - Recall tradeoff: quantization error lowers recall vs full-precision HNSW. The acceptance test (`testRecallAtClusteredData`) requires > 50% recall@10 on clustered data, with > 80% typically observed. No PQ recall numbers are published in `docs/BENCHMARKS.md` yet — that gap should close before claiming "moderate recall cost" externally.
+  - *Pointer (post-1.5.0):* [ADR-012](ADR-012-pq-reranking.md) addresses this consequence — opt-in `retainOriginals` + rerank recovers the recall (asserted ≥ 0.90 reranked recall@10 vs the 0.667–0.717 pure-ADC band) at the cost of storing the originals again, and the asserted pure-ADC and reranked floors are now published in `docs/BENCHMARKS.md` ("Reranked PQ Recall").
 - The codec is L2-only: encoding and distance tables use squared L2; cosine/dot ADC is not supported as shipped.
 - `PQHW` removal is tombstone-only with no neighbor reconnection (the full vectors needed for the diversity heuristic were discarded at build time); heavy removal workloads should rebuild.
 - `PQHW` does not persist `autoCompactionThreshold` (restored as `nil`), unlike `.pxkt` v2.

@@ -1,7 +1,7 @@
 # ProximaKit Roadmap
 
-**Updated:** 2026-06-09
-**Current release:** v1.4.0
+**Updated:** 2026-06-10
+**Current release:** v1.5.0
 
 This document tracks planned improvements across the library, benchmarking harness, and demo experience. Items are grouped by theme, not by release, because ordering depends on dependencies and measured impact.
 
@@ -45,27 +45,31 @@ Divide each vector into `M` sub-vectors, each quantized to a `K`-centroid codebo
 
 Implemented in `ProductQuantizer` + `QuantizedHNSWIndex` (asymmetric distance computation, codebook persistence in `ProductQuantizerPersistence`). The codec format is documented in [ADR-011](adr/ADR-011-pq-codec.md).
 
+**Reranking option (post-1.5.0):** ADC quantization error costs ~30% recall@10 on the clustered acceptance fixture. Building with `retainOriginals: true` keeps the Float32 vectors alongside the codes, and search re-scores the top quantized candidates with exact distances (`rerankDepth`, default `4·k` when originals are retained) — reranked recall@10 is asserted ≥ 0.90 in `PQRerankTests`. The trade is explicit: retention pays the full `4·d` bytes/vector again, so a retaining index has no compression story. Training is also seedable now (`PQConfiguration.seed` → byte-identical codebooks). Design in [ADR-012](adr/ADR-012-pq-reranking.md); [ADR-013](adr/ADR-013-streaming-persistence.md) sketches the on-disk-originals follow-up that would restore the memory story.
+
 ### Status
 
 - PQ: **shipped** — `QuantizedHNSWIndex` with ADC and persistence; retrospective ADR accepted ([ADR-011](adr/ADR-011-pq-codec.md))
+- PQ reranking: **shipped** — opt-in `retainOriginals` + `rerankDepth` with PQHW v2 persistence; ADR accepted ([ADR-012](adr/ADR-012-pq-reranking.md))
 - INT8 scalar quantization: **shipped** — `ScalarQuantizer` + `ScalarQuantizedHNSWIndex` with persistence and acceptance tests; ADR accepted ([ADR-007](adr/ADR-007-int8-scalar-quantization.md))
 
 ---
 
 ## GPU Acceleration
 
-### Batch Index Build
+### Batch Distance Kernel — v1 Shipped ([ADR-009](adr/ADR-009-metal-backend.md))
 
-Building a 100K-vector HNSW index on CPU (M-series) currently takes ~30–60 s. The bottleneck is repeated pairwise distance computation during insertion. Porting the distance kernel to a Metal compute shader would parallelize across GPU cores.
+Building a 100K-vector HNSW index on CPU (M-series) currently takes ~30–60 s. The bottleneck is repeated one-query-to-N distance computation during insertion — exactly the shape where a GPU dispatch amortizes its launch overhead.
 
-**Plan:**
-1. Instrument and confirm the distance kernel is the dominant cost via `Instruments.app`.
-2. Write a Metal `.metal` shader implementing the same vDSP-equivalent distance ops.
-3. Add a `MetalDistanceBackend` conforming to `DistanceBackend` (new internal protocol).
-4. Gate behind `#if canImport(Metal)` so the package remains buildable on Linux and CI.
-5. Benchmark: target 5–10× build speedup on M2 for 100K × 128d vectors.
+**What v1 ships:** `MetalBatchDistance`, a standalone utility computing one-query-to-N squared-L2 and cosine distances over the same flat row-major layout as the vDSP batch paths. Inline-MSL kernel (SwiftPM can't build `.metal` files portably), lazily compiled and cached; vDSP numerical parity asserted to 1e-4; automatic CPU fallback on any runtime Metal failure; clean `XCTSkip` on GPU-less CI runners.
 
-**Dependencies:** ADR for backend abstraction layer must be accepted first.
+**Deliberately NOT in v1** (the original plan's remaining steps, gated on measurement):
+- Integration into the `HNSWIndex` insert loop — follow-up, contingent on benchmarking the utility against vDSP at realistic build batch sizes. No speedup is claimed until measured.
+- The `DistanceBackend` abstraction protocol — premature with a single GPU consumer; extract it when integration lands.
+- Per-query search latency — at efSearch-scale candidate counts, kernel-launch overhead dominates and vDSP wins (ADR-001's verdict stands for search).
+- Zero-copy buffers (`makeBuffer(bytesNoCopy:)`) — belongs in the integration follow-up.
+
+No performance numbers are published in `docs/BENCHMARKS.md` for the GPU path yet, by design: measured build-speedup numbers are a prerequisite for the integration follow-up, not a consequence of it.
 
 ### Batch Embedding
 
@@ -75,20 +79,20 @@ Building a 100K-vector HNSW index on CPU (M-series) currently takes ~30–60 s. 
 
 ## Filtered Search
 
-`VectorIndex.search(query:k:efSearch:filter:)` ships with a **post-filter** strategy across all index types (HNSW, BruteForce, QuantizedHNSW, Sparse, Hybrid, and the stores). Two strategies were considered:
+`VectorIndex.search(query:k:efSearch:filter:)` takes a `@Sendable` predicate on every index type. Strategy by index:
 
-| Strategy | Recall | Latency | Status |
-|----------|--------|---------|--------|
-| Post-filter | Lower (may return < k) | Fast | **Shipped** — predicate applied during candidate traversal |
-| Graph-aware filter | Higher | Slower build | Planned — requires filter-aware neighbour selection in HNSW |
+| Strategy | Recall | Status |
+|----------|--------|--------|
+| Graph-aware filter | Higher — selective filters still fill `k` | **Shipped** for `HNSWIndex` — predicate applied during the layer-0 beam with adaptive `ef` widening; acceptance gated by the selectivity suite (`FilteredSearchSelectivityTests`: recall@10 ≥ 0.9 with full `k` at ~10% and ~1% pass rates, exact set-and-order match at ~0.1%, plus a post-filter under-fill control) |
+| Post-filter | Lower (may return < k under selective filters) | **Shipped** — still the strategy on `QuantizedHNSWIndex`, `ScalarQuantizedHNSWIndex`, and `SparseIndex`; `BruteForceIndex` is exact under any filter; `HybridIndex` inherits graph-aware behavior on its dense leg |
 
-The post-filter decision and the graph-aware upgrade path (with the selectivity benchmark at 10%, 1%, 0.1% pass rates as acceptance criteria) are documented in [ADR-008](adr/ADR-008-filtered-search.md).
+Extending the graph-aware beam to the quantized indexes is the remaining gap. The original post-filter decision and the implemented upgrade are documented in [ADR-008](adr/ADR-008-filtered-search.md) (see its addendum).
 
 ---
 
 ## HNSW Graph Improvements
 
-- **Incremental delete:** current `remove(id:)` marks nodes as deleted (tombstone). A background compaction pass to physically remove tombstoned nodes and relink the graph is deferred; it requires an ADR on compaction policy.
+- **Incremental delete:** current `remove(id:)` marks nodes as deleted (tombstone). Dangling-incoming-edge repair is now O(in-degree) via a maintained reverse-adjacency map (post-1.5.0; map rebuilt on load, format unchanged). A background compaction pass to physically remove tombstoned nodes and relink the graph is still deferred; it requires an ADR on compaction policy.
 - **Hierarchical NSW variant with dynamic `M`:** vary the number of connections per layer based on layer height to improve recall at low `efSearch` values.
 - **Serialisation versioning:** a magic number (`PXKT`) and format version field are already written and validated on load (`PersistenceError.unsupportedVersion`). The format-evolution policy (monotonic version bumps, N-1 reads, documented defaults, mandatory corruption tests) is settled in [ADR-010](adr/ADR-010-format-evolution.md); format v2 shipped under it.
 
@@ -100,10 +104,12 @@ The post-filter decision and the graph-aware upgrade path (with the selectivity 
 |-----|-------|--------|
 | ADR-006 | Lumen integration (ProximaKit as KV-store backend) | Draft (in `docs/adr/`) |
 | ADR-007 | INT8 scalar quantization: dequantization policy + codec format | Accepted |
-| ADR-008 | Filtered search: post-filter shipped; document decision + graph-aware upgrade path | Accepted (retrospective) |
-| ADR-009 | Metal backend abstraction layer | Not started |
+| ADR-008 | Filtered search: post-filter decision + graph-aware addendum (implemented for `HNSWIndex`) | Accepted (retrospective + addendum) |
+| ADR-009 | Metal batch distance — v1 scoped to a standalone build-phase utility (`MetalBatchDistance`); `DistanceBackend` protocol and insert-loop integration deferred | Accepted |
 | ADR-010 | Serialisation format evolution policy (version field already shipped) | Accepted |
 | ADR-011 | Product quantization codec format (`PQTT` / `PQHW`, ADC, K=256) | Accepted (retrospective) |
+| ADR-012 | Full-precision reranking for quantized HNSW (`retainOriginals` + `rerankDepth`, PQHW v2) | Accepted |
+| ADR-013 | Streaming persistence: WAL incremental saves + paged vector region | Proposed (design only — not implemented) |
 
 ---
 
@@ -129,7 +135,8 @@ Flagged during the documentation audit as out of scope for the initial documenta
 - CONTRIBUTING.md — polish onboarding flow, add `scripts/check-imports.sh` usage note
 - CHANGELOG.md — backfill pre-v1.0 history (Keep-a-Changelog format already adopted)
 - Demo app README — expand with CoreML model install instructions
-- DocC Getting Started tutorial — interactive tutorial linked from the docc catalog
+- DocC Getting Started tutorial — **shipped** (post-1.5.0): interactive "Build On-Device Semantic Search" tutorial in the docc catalog, linked from the landing page and Getting Started
+- On-device RAG example + tutorial — **shipped** (post-1.5.0): `swift run OnDeviceRAG` (`Examples/OnDeviceRAG/`) with the walkthrough in `docs/RAG-TUTORIAL.md`
 
 ---
 
