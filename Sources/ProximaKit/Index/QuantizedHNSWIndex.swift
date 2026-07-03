@@ -290,7 +290,8 @@ public actor QuantizedHNSWIndex {
     ///   - query: The full-precision query vector.
     ///   - k: Number of results to return.
     ///   - efSearch: Beam width override. Defaults to the HNSW config value.
-    ///   - filter: Optional predicate to exclude vectors by ID.
+    ///   - filter: Optional predicate to exclude vectors by ID. Applied
+    ///     graph-aware DURING the layer-0 ADC beam (ADR-008 second addendum).
     /// - Returns: Up to `k` results, sorted by ascending distance.
     ///
     /// - Important: If `query.dimension` does not match the index dimension,
@@ -344,8 +345,12 @@ public actor QuantizedHNSWIndex {
     ///     byte-identical to the pure-ADC path. A common starting point is
     ///     `4 * k`.
     ///   - filter: Optional predicate to exclude vectors by ID. Applied
-    ///     before candidates count toward `rerankDepth` (post-filter,
-    ///     ADR-008).
+    ///     graph-aware DURING the layer-0 ADC beam (ADR-008 second addendum):
+    ///     the beam routes through non-matching nodes and adaptively widens so
+    ///     selective filters still surface enough matching candidates. Only
+    ///     live, filter-passing candidates count toward `rerankDepth`, which
+    ///     the exact re-score then honours — composing with `rerankDepth`
+    ///     exactly as the retired post-filter path did.
     /// - Returns: Up to `k` results, sorted by ascending distance.
     /// - Throws: `QuantizedIndexError.originalsNotRetained` if a positive
     ///   `rerankDepth` is requested but the index was built without
@@ -405,11 +410,35 @@ public actor QuantizedHNSWIndex {
         }
 
         // Phase 2: Full beam search on layer 0.
-        let candidates = searchLayerADC(
-            distTable: distTable, entryPoint: currentEntry, ef: ef, layer: 0
-        )
+        //
+        // Filtered queries take the graph-aware path (ADR-008 second
+        // addendum): the predicate is applied DURING the beam, so rejected
+        // nodes route but never occupy result candidacy, and the beam width
+        // adapts to the observed acceptance rate so selective filters still
+        // surface enough live, matching candidates. Unfiltered queries keep
+        // the original filter-blind ADC beam below — that path is unchanged
+        // (zero overhead). When reranking, the adaptive target is
+        // `rerankDepth`, not `k`: the filtered beam surfaces up to
+        // `rerankDepth` accepted candidates so the exact re-score below sees
+        // the same depth the retired post-filter pipeline fed it — composing
+        // with `rerankDepth` exactly as post-filter did, on filtered
+        // candidates only (ADR-012 × ADR-008).
+        let candidates: [(node: Int, distance: Float)]
+        if let filter = filter {
+            candidates = searchLayer0FilteredADC(
+                distTable: distTable, entryPoint: currentEntry, ef: ef,
+                target: reranking ? rerankDepth : k, filter: filter
+            )
+        } else {
+            candidates = searchLayerADC(
+                distTable: distTable, entryPoint: currentEntry, ef: ef, layer: 0
+            )
+        }
 
-        // Build results.
+        // Build results. The materialization loops below re-apply the
+        // identity-liveness gate and the predicate; for filtered candidates
+        // those are already satisfied (idempotent), so a single, unchanged
+        // materialization path serves both beams.
         var results: [SearchResult] = []
         if reranking, let originals {
             // Phase 3 (rerank): candidates arrive sorted by ascending ADC
@@ -546,6 +575,136 @@ public actor QuantizedHNSWIndex {
                     if results.count > ef {
                         results.pop()
                     }
+                }
+            }
+        }
+
+        var output: [(node: Int, distance: Float)] = []
+        output.reserveCapacity(results.count)
+        while let item = results.pop() {
+            output.append(item)
+        }
+        output.reverse()
+        return output
+    }
+
+    // ── Liveness ──────────────────────────────────────────────────────
+
+    /// A slot is live iff its UUID still maps back to it (a re-added UUID
+    /// maps to a newer node, tombstoning the old slot). Mirrors
+    /// `HNSWIndex.isLiveNode` so the filtered beam's liveness gate matches
+    /// the full-precision port and the post-filter materialization contract.
+    private func isLiveNode(_ node: Int) -> Bool {
+        uuidToNode[nodeToUUID[node]] == node
+    }
+
+    // ── Core: Graph-Aware Filtered Beam on Layer 0 (ADR-008 2nd addendum) ─
+    //
+    // Ports `HNSWIndex.searchLayer0Filtered` onto the ADC scoring path.
+    // Differs from `searchLayerADC` in two ways:
+    //   1. Result candidacy: only live, predicate-passing nodes enter the
+    //      result heap. Rejected nodes (tombstoned or filtered out) still
+    //      join the candidate frontier, so the beam routes THROUGH them
+    //      toward matching regions instead of spending result slots on them.
+    //   2. Adaptive widening: the effective ef is recomputed from the
+    //      acceptance rate observed so far — roughly target / rate, add-one
+    //      smoothed, clamped to [ef, efCap] — so selective predicates keep
+    //      the beam exploring until `target` matching results are plausible.
+    //      `target` is `k` for the pure-ADC path and `rerankDepth` when
+    //      reranking, so the exact re-score is fed the same candidate depth
+    //      post-filter fed it. When (nearly) every node passes, the
+    //      recomputed value stays at `ef` and the beam behaves like the
+    //      unfiltered one.
+    //
+    // Liveness is checked BEFORE the predicate (the filter is never invoked
+    // for tombstoned slots), matching the post-filter path's contract.
+    //
+    // Termination: the beam stops early only once the result heap holds
+    // `effectiveEf` ACCEPTED nodes and the nearest frontier candidate is
+    // farther than the worst of them. With fewer matching nodes reachable
+    // than `effectiveEf`, the beam explores the whole connected component —
+    // selective filters trade latency for filled, high-recall results
+    // (worst case O(liveCount) ADC evaluations), the same trade the
+    // full-precision port makes.
+
+    private func searchLayer0FilteredADC(
+        distTable: ProductQuantizer.DistanceTable,
+        entryPoint: Int,
+        ef: Int,
+        target: Int,
+        filter: (UUID) -> Bool
+    ) -> [(node: Int, distance: Float)] {
+        let efCap = max(ef, min(liveCount, 16 * max(ef, target)))
+        var effectiveEf = ef
+
+        // Acceptance bookkeeping counts predicate *evaluations*, not visits:
+        // far nodes that never pass frontier admission are never evaluated.
+        var evaluated = 0
+        var accepted = 0
+
+        func acceptsIntoResults(_ node: Int) -> Bool {
+            evaluated += 1
+            guard isLiveNode(node) else { return false }
+            guard filter(nodeToUUID[node]) else { return false }
+            accepted += 1
+            return true
+        }
+
+        // effectiveEf ≈ target / acceptance-rate, add-one smoothed so an
+        // early run of rejections widens gradually rather than jumping to the
+        // cap. Recomputed (not monotonic): the estimate self-corrects.
+        func rewiden() {
+            let rate = Double(accepted + 1) / Double(evaluated + 1)
+            let needed = Int((Double(target) / rate).rounded(.up))
+            effectiveEf = min(efCap, max(ef, needed))
+        }
+
+        let epDist = quantizer.asymmetricDistance(table: distTable, codes: codes[entryPoint])
+
+        var candidates = Heap<(node: Int, distance: Float)>(comparator: { $0.distance < $1.distance })
+        candidates.push((entryPoint, epDist))
+
+        var results = Heap<(node: Int, distance: Float)>(comparator: { $0.distance > $1.distance })
+        if acceptsIntoResults(entryPoint) {
+            results.push((entryPoint, epDist))
+        }
+        rewiden()
+
+        var visited = Set<Int>([entryPoint])
+
+        while !candidates.isEmpty {
+            let nearest = candidates.pop()!
+
+            // Early exit only once the (widened) beam is full of accepted
+            // nodes — an under-filled beam keeps routing through rejects.
+            if results.count >= effectiveEf,
+               let furthest = results.peek(), nearest.distance > furthest.distance {
+                break
+            }
+
+            for neighbor in layers[0][nearest.node] {
+                guard !visited.contains(neighbor) else { continue }
+                visited.insert(neighbor)
+
+                let dist = quantizer.asymmetricDistance(table: distTable, codes: codes[neighbor])
+
+                let shouldExplore: Bool
+                if results.count < effectiveEf {
+                    shouldExplore = true
+                } else if let furthest = results.peek(), dist < furthest.distance {
+                    shouldExplore = true
+                } else {
+                    shouldExplore = false
+                }
+                guard shouldExplore else { continue }
+
+                candidates.push((neighbor, dist))
+                if acceptsIntoResults(neighbor) {
+                    results.push((neighbor, dist))
+                }
+                rewiden()
+                while results.count > effectiveEf {
+                    results.pop()
                 }
             }
         }

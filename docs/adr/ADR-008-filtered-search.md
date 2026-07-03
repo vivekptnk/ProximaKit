@@ -52,3 +52,50 @@ Two claims above overstate what is actually tested or enforced.
 - **"re-running the suite against the pre-addendum implementation shows it returning 0–1 results" (Measured behavior, ~1% pass rate) is more specific than what `testOnePercentControlPostFilterUnderfillsK` asserts.** The committed assertion is `XCTAssertLessThan(survivors.count, Self.k)` — under-fill vs. `k = 10`, nothing tighter. "0–1" describes what was observed on the current seeded fixture when this addendum was written; no test pins that range, so a future change to the fixture (corpus, seed, or sampling stride) could shift the survivor count anywhere in `0..<10` without turning CI red.
 
 Both mechanisms remain correctly described above; only these two specific figures are corrected to what the code and committed tests actually guarantee.
+
+## Second Addendum: Graph-Aware Filtering Extended to the Quantized Indexes (2026-07, M3-F31)
+
+### Status
+Implemented for `QuantizedHNSWIndex` (ADC scoring path) and `ScalarQuantizedHNSWIndex` (dequantize scoring path), porting the layer-0 filtered beam from the first addendum. The public API is unchanged — `search(query:k:efSearch:filter:)` (and the PQ `rerankDepth:` overload) did not change shape.
+
+### Which index uses which strategy now
+
+| Index | Filtered-search strategy | Why |
+| --- | --- | --- |
+| `HNSWIndex` | **Graph-aware** (first addendum) | full-precision layer-0 beam |
+| `QuantizedHNSWIndex` | **Graph-aware** (this addendum) | ports the beam onto ADC scoring; composes with `rerankDepth` |
+| `ScalarQuantizedHNSWIndex` | **Graph-aware** (this addendum) | ports the beam onto dequantize scoring |
+| `HybridIndex` | **Graph-aware on its dense leg** | forwards the filter unchanged; inherits whichever dense index it wraps |
+| `BruteForceIndex` | **Exact** | filter applied across the full scan before top-k |
+| `SparseIndex` | **Post-filter (unchanged)** | see below |
+
+`SparseIndex` stays post-filter deliberately: it is a BM25 inverted index (term → postings lists), not an HNSW graph. There is no layer-0 beam and no `ef`-bounded frontier to route *through*, so the routing mechanism this ADR describes does not apply. Its candidate set is every document whose postings match a query term — an unbounded scan, not an `ef` truncation — so applying the predicate at scoring time does not structurally under-fill `k` the way an `ef`-bounded HNSW beam does. The post-filter contract there is honest and is retained.
+
+### Strategy (both quantized indexes)
+Identical to the first addendum's mechanics, re-verified on each scoring path:
+- **Unfiltered queries (`filter == nil`) are untouched.** They run the original filter-blind beam (`searchLayerADC` / `searchLayerSQ`) and materialization — the graph-aware path is a separate branch and adds zero work to the default case. Regression-pinned by `testQuantizedNilFilterMatchesAllTruePredicate` (nil path ≡ all-true graph-aware path, id- and distance-for-distance).
+- **Filtered queries apply the predicate during the layer-0 beam** (`searchLayer0FilteredADC` / `searchLayer0FilteredSQ`). Liveness (identity-based tombstone check) is evaluated **before** the predicate, so the filter never sees a deleted id — matching the post-filter contract and the HNSW port. Rejected nodes still join the candidate frontier (they route) but never enter the result heap. Upper-layer descent stays filter-blind.
+- **Adaptive ef widening** uses the same formula: `effectiveEf = clamp(ceil(target / rate), ef, efCap)`, add-one smoothed `rate = (accepted + 1) / (evaluated + 1)`, `efCap = max(ef, min(liveCount, 16 · max(ef, target)))`.
+- **Termination** is the same bounded exploration (early-exit only once the widened beam holds `effectiveEf` *accepted* nodes farther than the nearest frontier candidate; otherwise it explores the reachable component — worst case O(liveCount) scoring evaluations).
+
+### Rerank composition (`QuantizedHNSWIndex` only)
+When the index retains originals and reranks (ADR-012), the filtered beam's adaptive **target is `rerankDepth`, not `k`** — it surfaces up to `rerankDepth` *accepted* (live, filter-passing) candidates by ADC distance, and the exact re-score consumes those. This composes with `rerankDepth` **exactly as post-filter did**: only filtered candidates count toward the depth, ranked by ADC, then re-scored on the originals and truncated to `k`. At non-selective filters (≈100% acceptance) `effectiveEf` collapses to `ef` and the reranked result is identical to the retired post-filter-then-rerank pipeline. Pinned by `testQuantizedRerankComposesWithDepthLikePostFilter`, which asserts the index's rerank output equals an independent oracle (the pure-ADC filtered pool, top-`rerankDepth` re-scored exactly, top-`k`) id-for-id with exact L2 distances.
+
+### Measured behavior
+All numbers are asserted thresholds in `FilteredSearchSelectivityTests` (seeded corpus: 2000 vectors, 32d, Euclidean, `m = 16`, `efConstruction = 200`, `efSearch = 50`, `k = 10`, 20 seeded queries; PQ `subspaceCount = 8`, `trainingIterations = 20`, training `seed` pinned; SQ metric Euclidean). Data (`SeededRandom`), topology (`levelSeed`), and PQ training are all deterministic — **debug and release produced byte-identical recall**. Recall is measured against `BruteForceIndex` with the same filter (exact ground truth). No latency figures are claimed; as in the first addendum the beam trades latency for fill under selective filters.
+
+Recall floors are the honest measured values asserted **with margin** — they are NOT the full-precision `0.9` target. Pure-ADC PQ sits well below `0.9` (32×-lossy distances reorder near-ties); reranking recovers to the full-precision band; SQ (only ≈4×-lossy) sits just under it.
+
+| Selectivity (matches) | PQ pure-ADC recall@10 | PQ rerank recall@10 | SQ recall@10 | Fills `k`? |
+| --- | --- | --- | --- | --- |
+| ~10% (200) | 0.745 (floor 0.65) | 0.995 (floor 0.95) | 1.000 (floor 0.95) | yes, all three |
+| ~1% (20) | 0.870 (floor 0.78) | 1.000 (floor 0.95) | 1.000 (floor 0.95) | yes, all three |
+| ~0.1% (2) | returns exactly the 2-vector matching set | exact set, brute order | exact set | returns min(k, live matches) = 2 |
+
+*(PQ pure-ADC recall is higher at ~1% than ~10% because at ~1% only 20 vectors match, the widened beam exhausts their reachable support, and the k=10 ground truth is a subset of that recovered support; at ~10% the 200 matches leave more room for lossy-ADC reordering below the top-k cut.)*
+
+### Under-fill contract (the upgrade)
+The "approximate indexes may return fewer than `k` under selective filters" consequence no longer applies to `QuantizedHNSWIndex` or `ScalarQuantizedHNSWIndex`. `testQuantizedOnePercentControlPostFilterUnderfillsK` pins this on both: emulating the retired post-filter pipeline (the unfiltered `ef = 50` beam, predicate applied afterward) under-fills `k` on **every** seeded query at ~1% selectivity (survivors `< 10`), while the graph-aware beam fills all 10. The contract stays "up to `k` results": a predicate matching fewer than `k` live vectors still returns fewer than `k` (the ~0.1% row returns exactly 2).
+
+### Determinism
+Every threshold above is derived from a seeded, reproducible run recorded in the M3-F31 build output (`swift test -c release --filter FilteredSearchSelectivityTests`, cross-checked in debug). No system RNG is used anywhere in the fixture — `SeededRandom` for data/queries, `levelSeed` for topology, PQ `seed` for k-means.
