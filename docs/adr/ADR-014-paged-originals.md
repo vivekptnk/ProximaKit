@@ -594,3 +594,101 @@ Deliberately left to the implementer:
    a raw section byte-copy instead of a mapped read-back sweep.
 5. `snapshotGeneration` semantics if a PQ remove-journal is ever built (reserved,
    stamped 0 until then).
+
+## Implementation notes (Stage 1)
+
+Status stays **Proposed** — Stage 2 (the paged read path) is not built. This
+addendum records the decisions, deviations, and public API that Stage 1
+(formats + migration) actually shipped, plus a re-verification of the ADR's
+code citations against the current HEAD.
+
+### Decisions taken (resolving the open questions where Stage 1 forces a choice)
+
+- **Writer policy / open question 1 — the default `save(to:)` stays v2.**
+  `QuantizedHNSWIndex.save(to:)` is unchanged and byte-identical to prior
+  releases: it always stamps v2 (a retaining index still writes a v2 file with a
+  bare originals section — the `testOriginalsSectionSizeIsExactlyTheTrailer`
+  invariant is preserved). v3 is opt-in through the additive
+  `save(to:layout: .pagedV3)`, which stamps v3 with a 16 KiB-aligned originals
+  section **when originals are retained**, and falls back to v2 when there is
+  nothing to page ("v3 only when originals are retained, v2 otherwise"). This
+  honors the ADR's writer-policy section and the ADR-013 deviation-1
+  byte-identity ground rule while satisfying acceptance criterion 5.
+- **Version window.** `qhFormatVersion` split into `qhWriteVersionV2 = 2`
+  (default) and `qhWriteVersionV3 = 3` (opt-in); `qhMinSupportedVersion = 1`
+  unchanged; a new `qhMaxReadableVersion = 3`. v1/v2/v3 all load resident. As a
+  consequence of v3 becoming readable, the pre-existing over-version probe in
+  `PQRerankTests.testVersion1FileStillLoads` moved from `unsupportedVersion(3)`
+  to `unsupportedVersion(4)` — same coverage (an unsupported version throws the
+  typed error), retargeted to the new ceiling. This is the only existing test
+  edited; no test was weakened.
+- **Verification depth / open question 3 — full checksum.** Both upgraders write
+  a temp, then re-read it and assert every section payload is byte-identical to
+  the source before the atomic replace (`verifyPaddedV3Upgrade`). The O(n)
+  read-back is a documented on-device cost; a sampled mode is left to a future
+  option.
+- **Idempotence.** Upgrading an already-padded v3 base is a **no-op** (the file
+  is left byte-for-byte unchanged and the upgrader returns without rewriting).
+  A flag-0 (no-originals) v3 is likewise treated as already-migrated.
+- **metadataOffset ceiling — no `.pxkt` bump.** The v3 trailer's UInt64 metadata
+  offset is authoritative for both the resident (`loadHNSW`) and paged
+  (`loadHNSWPaged`) loaders; the legacy UInt32 header field @52 is written as the
+  sentinel `0xFFFF_FFFF` only when the true offset exceeds `UInt32.max` (a >4 GiB
+  base — unreachable by any file writable today, so every current file's bytes
+  are unchanged). The BruteForce consumer and the legacy v2 writer keep the
+  UInt32 ceiling (pre-existing, noted not fixed).
+
+### Public API added (all additive)
+
+- `enum PQHWSaveLayout { case resident; case pagedV3 }` and
+  `QuantizedHNSWIndex.save(to:layout:)`.
+- `static func QuantizedHNSWIndex.upgradeToV3(at: URL) throws` — PQHW M-A
+  rewriter (section-copy, temp + verify + atomic replace).
+- `static func PersistenceEngine.upgradeToV3(at: URL) throws` — `.pxkt` M-A
+  rewriter (HNSW bases only; BruteForce is rejected with a typed error).
+- `ProximaBench migrate --path PATH [--family pxkt|pqhw]` wraps both upgraders
+  (family auto-detected from the file magic; idempotent).
+
+Existing `save` / `load` / `search` / `build` signatures and on-disk output are
+unchanged.
+
+### PQHW v3 trailer (as built)
+
+`sectionCount: UInt32 = 7`, then 7 × (offset: UInt64, length: UInt64) for
+[codebooks, codes, uuids, nodeLevels, adjacency, metadata, originals], then
+`snapshotGeneration: UInt64` (reserved, 0), then `"PQH3" = 0x5051_4833`. Size =
+128 bytes. The 56-byte header is byte-for-byte identical to v2 (the flag @48
+stays authoritative); the body (codebooks…metadata) is byte-for-byte identical
+to v2; only the originals section gains 16 KiB padding (iff retained), and the
+trailer is appended. The originals entry is (0, 0) when the flag is 0. The
+trailer parser enforces bounds, no-overflow, `sectionCount == 7`, contiguity of
+sections 0…5, and originals-entry/flag consistency — every violation is a typed
+`PersistenceError`, never a trap (ADR-010 rule 5).
+
+### Corruption matrix delivered vs deferred
+
+Delivered as Stage-1 tests (`PQHWFormatV3CorruptionTests`): truncated trailer,
+bad trailer magic, `sectionCount ≠ 7`, section offset/length overflow or past
+EOF, broken contiguity (overlap / non-monotonic), flag/entry mismatch both
+directions, wrong originals length, and unaligned (unpadded) originals offset
+loading resident. **Deferred to Stage 2** (they require the paged-open entry
+point that Stage 2 introduces): the ADR's items 5-second-half and 10 — a
+`.paged` open of an unaligned base rejected with a typed error, and a `.paged`
+open of a v2 / flag-0 base rejected as "nothing to page".
+
+### Code-citation drift re-verified against HEAD
+
+`97a0107` (lazy `inEdges`) added ~187 lines to `QuantizedHNSWIndex.swift`,
+shifting every line citation in this ADR that points at that file. The drift is
+a **uniform downward shift; every underlying code fact still holds** (verified at
+HEAD `923d54e`): `var originals: [Vector]?` is now `:125` (ADR `:96`);
+`retainOriginals: Bool = false` is `:280` (ADR `:219`); `autoDepth` is `:377`
+(ADR `:316`); the `originalsNotRetained` throw is `:431` (ADR `:369–370`);
+`searchImpl` begins `:441` (ADR `:380`); the **single** rerank originals read
+`metric.distance(query, originals[node])` is `:522` (ADR `:461`); and
+`public func remove(id:)` is `:563` (ADR `:500`). The persistence-file citations
+the Stage-1 work relied on were **not** touched by `97a0107` and remain accurate:
+`QuantizedHNSWIndexPersistence.swift` format constants and the 56-byte header
+layout, and the `PersistenceEngine.swift` v3 machinery. The drift is flagged as
+non-substantive (line numbers only); the ADR body is left as authored (design
+document, still Proposed) rather than churned.

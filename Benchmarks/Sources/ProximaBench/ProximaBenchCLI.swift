@@ -30,6 +30,8 @@ struct ProximaBenchCLI {
                 try await runInsertShape(args: Array(args.dropFirst(2)))
             case "search-provider-bench":
                 try await runSearchProviderBench(args: Array(args.dropFirst(2)))
+            case "migrate":
+                try MigrateCommand.run(args: Array(args.dropFirst(2)))
             case "-h", "--help", "help":
                 usage()
             default:
@@ -183,6 +185,12 @@ struct ProximaBenchCLI {
                 [--metrics euclidean,cosine] [--m 16] [--efc 200]
                 [--seed 42] [--version 1.5.0-dev] [--notes TEXT]
                 Instruments HNSWIndex.add() distance-eval counts.
+
+          ProximaBench migrate                (ADR-014 v2 -> padded v3 upgrade)
+                --path PATH [--family pxkt|pqhw]
+                Section-copy upgrade of a `.pxkt` or PQHW base to a padded v3
+                base (no decode, payload bytes bit-identical). Family is
+                auto-detected from the magic when omitted. Idempotent.
 
         The hnsw / ground-truth subcommands emit documents following
         Benchmarks/JSON_SCHEMA.md.

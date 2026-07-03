@@ -51,9 +51,21 @@ private let v3VectorSectionIndex = 1
 /// Index of the node-levels section within the v3 section table (the first
 /// section after the vectors — where the paged loader resumes reading).
 private let v3NodeLevelsSectionIndex = 2
+/// Index of the metadata section within the v3 section table. The trailer's
+/// UInt64 offset is authoritative for v3 (the legacy UInt32 header field is
+/// clamped to a sentinel when the true offset exceeds `UInt32.max` — ADR-014).
+private let v3MetadataSectionIndex = 4
 /// 16 KiB — the Apple-Silicon page size the vector section start is padded to
 /// so it can be `mmap`-ed independently (ADR-013 Stage 2).
 private let vectorSectionAlignment = 16_384
+
+/// Sentinel written into the legacy UInt32 `metadataOffset` header field when
+/// the true metadata offset exceeds `UInt32.max` (a >4 GiB base). For v3 the
+/// trailer's UInt64 metadata offset is authoritative, so the header field is
+/// advisory only; the sentinel documents "look at the trailer" without a
+/// format bump (ADR-014 metadataOffset widening). Files writable today never
+/// reach it — the offset stays a faithful UInt32.
+private let metadataOffsetSentinel: UInt32 = 0xFFFF_FFFF
 
 /// The `HNSWConfiguration` default threshold, applied when loading v1 files
 /// that predate threshold serialization.
@@ -316,8 +328,10 @@ public enum PersistenceEngine {
         // there) and irrelevant to v1/v2 (no table). Everything after the
         // vector section stays contiguous with it, so the sequential graph
         // reader below resumes correctly.
+        var trailer: V3Trailer?
         if header.version >= v3FormatVersion {
-            offset = try readV3Trailer(fileData).sections[v3VectorSectionIndex].offset
+            trailer = try readV3Trailer(fileData)
+            offset = trailer!.sections[v3VectorSectionIndex].offset
         }
         let vectors: [Vector] = try (0..<count).map { _ in
             let floats = try readFloats(fileData, count: dimension, offset: &offset)
@@ -325,8 +339,13 @@ public enum PersistenceEngine {
         }
 
         // ── Graph + metadata + config (shared with the paged loader) ──
+        // For v3 the metadata offset comes from the trailer (UInt64,
+        // sentinel-proof); v1/v2 use the legacy UInt32 header field.
+        let metadataOffset = trailer?.sections[v3MetadataSectionIndex].offset
+            ?? Int(header.metadataOffset)
         let graph = try readHNSWGraph(
-            fileData, header: header, count: count, layerCount: layerCount, offset: &offset)
+            fileData, header: header, count: count, layerCount: layerCount,
+            offset: &offset, metadataOffset: metadataOffset)
 
         let snapshot = HNSWSnapshot(
             dimension: dimension,
@@ -395,7 +414,8 @@ public enum PersistenceEngine {
 
         // ── Graph + metadata + config (shared with the resident loader) ─
         let graph = try readHNSWGraph(
-            fileData, header: header, count: count, layerCount: layerCount, offset: &offset)
+            fileData, header: header, count: count, layerCount: layerCount,
+            offset: &offset, metadataOffset: trailer.sections[v3MetadataSectionIndex].offset)
 
         // ── Map the vector section read-only ──────────────────────────
         let region = try MappedVectorRegion(baseURL: url)
@@ -425,7 +445,8 @@ public enum PersistenceEngine {
     /// resident and paged loaders so the two never diverge. `offset` must enter
     /// positioned at the node-levels section.
     private static func readHNSWGraph(
-        _ fileData: Data, header: FileHeader, count: Int, layerCount: Int, offset: inout Int
+        _ fileData: Data, header: FileHeader, count: Int, layerCount: Int,
+        offset: inout Int, metadataOffset: Int
     ) throws -> (nodeLevels: [Int], layers: [[[Int]]], entryPointNode: Int?, maxLevel: Int,
                  metadata: [Data?], config: HNSWConfiguration) {
 
@@ -479,7 +500,7 @@ public enum PersistenceEngine {
         }
 
         // ── Metadata ──────────────────────────────────────────────────
-        var metaOffset = Int(header.metadataOffset)
+        var metaOffset = metadataOffset
         let metadata = try readMetadata(fileData, count: count, offset: &metaOffset)
 
         let config = HNSWConfiguration(
@@ -577,7 +598,13 @@ public enum PersistenceEngine {
                 }
             }
         }
-        let metadataOffset = UInt32(data.count)
+        // The legacy header field is UInt32; if the true metadata offset would
+        // exceed it (a >4 GiB base), write the documented sentinel and rely on
+        // the trailer's UInt64 offset — no format bump (ADR-014). Every file
+        // writable today stays a faithful UInt32, so its bytes are unchanged.
+        let metadataStart = data.count
+        let metadataOffset: UInt32 =
+            metadataStart <= Int(UInt32.max) ? UInt32(metadataStart) : metadataOffsetSentinel
         writeMetadataOffset(&data, offset: metadataOffset, at: metadataOffsetPosition)
         section {  // metadata
             appendMetadata(&data, snapshot.metadata)
@@ -641,6 +668,183 @@ public enum PersistenceEngine {
             vectorLength: vectorSection.length,
             fileSize: data.count
         )
+    }
+
+    // MARK: - Migration (ADR-014 M-A: offline section-copy rewrite)
+
+    /// Upgrades a `.pxkt` HNSW v1/v2 (or unpadded-v3) base at `url` in place to a
+    /// padded v3 base — so an existing base can adopt ADR-013 Stage-2 paging
+    /// without a journal or a full rebuild.
+    ///
+    /// The rewrite is a pure section-copy: every section payload in the output
+    /// is byte-identical to the input's, the vector section is pushed onto a
+    /// 16 KiB boundary, the version is stamped 3, and the WAL-binding trailer is
+    /// appended (generation preserved from a v3 input, 0 from a v1/v2 input).
+    /// No graph is decoded and no vector is materialized. Crash safety: the
+    /// image is written to a sibling temp and verified (full section checksum)
+    /// before an atomic replace, so an interrupted upgrade leaves the source
+    /// untouched.
+    ///
+    /// Migrating an already-padded v3 file is a no-op (clean success).
+    ///
+    /// - Throws: `PersistenceError` for a non-`.pxkt` file, a BruteForce base
+    ///   (nothing to page), an inconsistent header, or a failed verification —
+    ///   never traps.
+    public static func upgradeToV3(at url: URL) throws {
+        let source = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard let image = try buildPaddedV3Image(from: source) else {
+            return   // already a padded v3 base
+        }
+        let tmp = url.appendingPathExtension("pxktv3tmp")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try image.write(to: tmp, options: .atomic)
+        try verifyPaddedV3Upgrade(source: source, upgradedURL: tmp)
+        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+    }
+
+    /// Builds the padded-v3 image for a `.pxkt` HNSW `source`, or `nil` if it is
+    /// already a padded v3 base. Section payloads are byte-identical copies.
+    /// Testable seam for the migration + crash-safety suites.
+    static func buildPaddedV3Image(from source: Data) throws -> Data? {
+        let layout = try PXKTSectionLayout.parse(source)
+        if layout.version == v3FormatVersion, layout.vectors.offset % vectorSectionAlignment == 0 {
+            return nil   // already padded v3
+        }
+
+        var out = Data()
+        out.reserveCapacity(source.count + vectorSectionAlignment + v3TrailerSize)
+
+        // Header: copy the 64 bytes verbatim; version + metadataOffset patched
+        // after the body is laid out.
+        out.append(source[0..<headerSize])
+
+        // UUIDs (contiguous after the header).
+        let uuidsOut = out.count
+        out.append(source[layout.uuids.offset..<layout.uuids.end])
+        // Pad so the vector section lands on a 16 KiB boundary.
+        padToAlignment(&out, alignment: vectorSectionAlignment)
+        let vectorsOut = out.count
+        out.append(source[layout.vectors.offset..<layout.vectors.end])
+        let nodeLevelsOut = out.count
+        out.append(source[layout.nodeLevels.offset..<layout.nodeLevels.end])
+        let adjacencyOut = out.count
+        out.append(source[layout.adjacency.offset..<layout.adjacency.end])
+        let metadataOut = out.count
+        out.append(source[layout.metadata.offset..<layout.metadata.end])
+
+        // Patch header: version = 3, metadataOffset = new position (or sentinel).
+        withUnsafeBytes(of: v3FormatVersion.littleEndian) { out.replaceSubrange(4..<8, with: $0) }
+        let metaField: UInt32 =
+            metadataOut <= Int(UInt32.max) ? UInt32(metadataOut) : metadataOffsetSentinel
+        writeMetadataOffset(&out, offset: metaField, at: 52)
+
+        // Trailer.
+        let sections: [(offset: Int, length: Int)] = [
+            (uuidsOut, layout.uuids.length),
+            (vectorsOut, layout.vectors.length),
+            (nodeLevelsOut, layout.nodeLevels.length),
+            (adjacencyOut, layout.adjacency.length),
+            (metadataOut, layout.metadata.length),
+        ]
+        appendUInt32(&out, UInt32(v3SectionCount))
+        for s in sections {
+            appendUInt64(&out, UInt64(s.offset))
+            appendUInt64(&out, UInt64(s.length))
+        }
+        appendUInt64(&out, layout.generation)
+        appendUInt32(&out, v3TrailerMagic)
+        return out
+    }
+
+    /// Re-reads the upgraded temp and asserts every section payload is
+    /// byte-identical to the source's (ADR-014 fidelity gate; full-checksum).
+    static func verifyPaddedV3Upgrade(source: Data, upgradedURL: URL) throws {
+        let upgraded = try Data(contentsOf: upgradedURL)
+        let src = try PXKTSectionLayout.parse(source)
+        let dst = try PXKTSectionLayout.parse(upgraded)
+        guard dst.version == v3FormatVersion else {
+            throw PersistenceError.corruptedData("upgraded .pxkt base is not v3")
+        }
+        guard dst.vectors.offset % vectorSectionAlignment == 0 else {
+            throw PersistenceError.corruptedData("upgraded .pxkt vector section is not 16 KiB-aligned")
+        }
+        let pairs: [(String, PXKTSectionLayout.Section, PXKTSectionLayout.Section)] = [
+            ("uuids", src.uuids, dst.uuids),
+            ("vectors", src.vectors, dst.vectors),
+            ("nodeLevels", src.nodeLevels, dst.nodeLevels),
+            ("adjacency", src.adjacency, dst.adjacency),
+            ("metadata", src.metadata, dst.metadata),
+        ]
+        for (name, s, d) in pairs {
+            guard s.length == d.length else {
+                throw PersistenceError.corruptedData("upgraded .pxkt \(name) length drifted")
+            }
+            guard source[s.offset..<s.end] == upgraded[d.offset..<d.end] else {
+                throw PersistenceError.corruptedData("upgraded .pxkt \(name) payload not bit-identical")
+            }
+        }
+    }
+}
+
+/// The byte ranges of every `.pxkt` HNSW section, resolved for the migration
+/// rewriter without decoding the graph. v2 boundaries come from header counts
+/// plus the stored `metadataOffset`; v3 boundaries come from the trailer.
+struct PXKTSectionLayout {
+    struct Section { let offset: Int; let length: Int; var end: Int { offset + length } }
+
+    let version: UInt32
+    let generation: UInt64
+    let uuids: Section
+    let vectors: Section
+    let nodeLevels: Section
+    let adjacency: Section
+    let metadata: Section
+
+    static func parse(_ data: Data) throws -> PXKTSectionLayout {
+        let header = try readHeader(data)
+        guard header.indexType == indexTypeHNSW else {
+            throw PersistenceError.corruptedData(
+                "only HNSW `.pxkt` bases can be upgraded to v3 (BruteForce has nothing to page)")
+        }
+        let count = Int(header.count)
+        let dimension = Int(header.dimension)
+        guard dimension > 0, count >= 0 else {
+            throw PersistenceError.corruptedData(".pxkt header fields invalid for migration")
+        }
+
+        // v3 input: trust the validated trailer.
+        if header.version >= v3FormatVersion {
+            let trailer = try readV3Trailer(data)
+            func s(_ i: Int) -> Section {
+                Section(offset: trailer.sections[i].offset, length: trailer.sections[i].length)
+            }
+            return PXKTSectionLayout(
+                version: header.version, generation: trailer.generation,
+                uuids: s(0), vectors: s(1), nodeLevels: s(2), adjacency: s(3), metadata: s(4))
+        }
+
+        // v1/v2 input: fixed-size sections + stored metadataOffset.
+        func region(_ start: Int, _ elems: Int, _ unit: Int, _ what: String) throws -> Section {
+            let (bytes, ov) = elems.multipliedReportingOverflow(by: unit)
+            guard !ov, bytes >= 0, start <= data.count, bytes <= data.count - start else {
+                throw PersistenceError.corruptedData(".pxkt \(what) section out of bounds")
+            }
+            return Section(offset: start, length: bytes)
+        }
+        let uuids = try region(headerSize, count, 16, "uuids")
+        let vectors = try region(uuids.end, count, dimension * 4, "vectors")
+        let nodeLevels = try region(vectors.end, count, 4, "nodeLevels")
+        let metaOffset = Int(header.metadataOffset)
+        guard metaOffset >= nodeLevels.end, metaOffset <= data.count else {
+            throw PersistenceError.corruptedData(
+                ".pxkt metadataOffset \(metaOffset) inconsistent with the graph sections")
+        }
+        let adjacency = Section(offset: nodeLevels.end, length: metaOffset - nodeLevels.end)
+        let metadata = Section(offset: metaOffset, length: data.count - metaOffset)
+        return PXKTSectionLayout(
+            version: header.version, generation: 0,
+            uuids: uuids, vectors: vectors, nodeLevels: nodeLevels,
+            adjacency: adjacency, metadata: metadata)
     }
 }
 

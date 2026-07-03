@@ -580,11 +580,14 @@ final class PQRerankTests: XCTestCase {
         assertByteIdentical(fromV1, fromV2,
             "a v1 file must load to the same searchable state as its v2 twin")
 
-        // Over-version still throws the typed error.
-        try patch(url, at: 4, with: 3)
+        // Over-version still throws the typed error. v3 is now a readable
+        // format (ADR-014 paged-originals bump: v1…v3 all load), so the
+        // over-version probe moves to v4 — the coverage (an unsupported
+        // version throws the typed error, never traps) is unchanged.
+        try patch(url, at: 4, with: 4)
         XCTAssertThrowsError(try QuantizedHNSWIndex.load(from: url)) { error in
-            guard case PersistenceError.unsupportedVersion(3)? = error as? PersistenceError else {
-                XCTFail("Expected unsupportedVersion(3), got \(error)"); return
+            guard case PersistenceError.unsupportedVersion(4)? = error as? PersistenceError else {
+                XCTFail("Expected unsupportedVersion(4), got \(error)"); return
             }
         }
     }
