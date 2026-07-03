@@ -36,7 +36,10 @@ venv/
 docs/PRD.md
 docs/MODEL_GUIDE.md
 CLAUDE.md
-scripts/
+# scripts/ holds internal dev tooling by default, but check-imports.sh is a
+# public, CI-wired guard (the `lint` job runs it) and must be tracked.
+scripts/*
+!scripts/check-imports.sh
 
 # Benchmark artifacts — datasets and harness output, NOT the harness itself.
 # The Benchmarks/ source tree is tracked (see Benchmarks/README.md); these

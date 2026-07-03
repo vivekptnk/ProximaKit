@@ -47,6 +47,14 @@ swiftlint lint --strict
 
 [`.swiftlint.yml`](.swiftlint.yml) is a ratchet, not a cleanup mandate: it disables a fixed list of rules that the codebase violated at baseline (formatting, naming, force-unwrap, etc. — see the file's header comment), but every other default rule runs `--strict` in CI, so new code cannot introduce new classes of violation. Don't add new entries to `disabled_rules` to make an in-progress PR pass — fix the violation instead.
 
+The same `lint` CI job also runs an import-boundary guard that SwiftLint can't express — it enforces the [Module Rules](#module-rules) allowlist below. Run it locally before pushing:
+
+```bash
+scripts/check-imports.sh
+```
+
+It exits `0` when clean and nonzero — listing every `file:line: forbidden import …` — when a module imports outside its allowed set. The script's header comment carries the authoritative allowlist and the justification for each allowed import.
+
 ### Run the Demo
 
 ```bash
@@ -116,7 +124,7 @@ ProximaKit/
 | `ProximaKit` | Foundation, Accelerate | UIKit, SwiftUI, CoreML, NaturalLanguage, Vision |
 | `ProximaEmbeddings` | Foundation, ProximaKit, CoreML, NaturalLanguage, Vision | UIKit, SwiftUI |
 
-Enforcement today is manual: reviewers check the import list on every PR that touches `Sources/`. `import CoreML` inside `ProximaKit` would still compile — Apple's system frameworks are available to any target on the SDK, `Package.swift` declares no per-target framework linkage that would reject it — so this table is a convention the build does not enforce for you. There is no automated import-boundary linter in this repository — no `scripts/check-imports.sh` or SwiftLint custom rule exists to catch a violation before review. If you add one, wire it into the `lint` job in `.github/workflows/ci.yml` and update this section to point at it.
+Enforcement is automated: [`scripts/check-imports.sh`](scripts/check-imports.sh) checks every import under `Sources/` against the per-module allowlist and runs in the `lint` job of [`.github/workflows/ci.yml`](.github/workflows/ci.yml), failing the build on any violation (run it locally with `scripts/check-imports.sh`). It backstops human review, because `import CoreML` inside `ProximaKit` would otherwise still compile — Apple's system frameworks are available to any target on the SDK, and `Package.swift` declares no per-target framework linkage that would reject it, so the build alone does not enforce this table. The script's header comment carries the authoritative allowlist and the justification for each allowed import; treat it as the source of truth rather than duplicating those details here.
 
 ### Concurrency
 

@@ -21,7 +21,26 @@ import XCTest
 /// Fast functional compaction / auto-compaction / nonisolated-property tests
 /// were moved to `CompactionTests` (CHA-201) so CI runs them; do not add
 /// functional tests here.
+///
+/// **Local skip gate (belt and suspenders):** a class-level `setUpWithError`
+/// now requires `PROXIMA_RECALL_BENCH=1`, so a bare local `swift test` (without
+/// `--skip`) skips this class fast instead of running the 20+-minute sweeps; set
+/// `PROXIMA_RECALL_BENCH=1` to run them locally. CI's explicit
+/// `swift test --skip RecallBenchmarkTests` is untouched and remains the primary
+/// gate. This is the one place in the suite where a class is allowed a local
+/// skip gate, and it is acceptable ONLY because CI's behavior is completely
+/// unchanged: it weakens no assertion and does not change what CI verifies.
 final class RecallBenchmarkTests: XCTestCase {
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipIf(
+            ProcessInfo.processInfo.environment["PROXIMA_RECALL_BENCH"] != "1",
+            "recall benchmark sweeps are opt-in locally (10K-vector sweeps take "
+            + "20+ minutes); set PROXIMA_RECALL_BENCH=1 to run "
+            + "(CI excludes this class regardless via --skip RecallBenchmarkTests)"
+        )
+    }
 
     // ── Recall vs Dataset Size (Euclidean, scales reliably with random data) ────
 

@@ -148,7 +148,7 @@ The `ProximaDemoApp` (macOS SwiftUI) ships with the repo and demonstrates semant
 Flagged during the documentation audit as out of scope for the initial documentation push but tracked here for completeness:
 
 - CONTRIBUTING.md — **shipped** (post-1.5.0): onboarding flow polish
-- `scripts/check-imports.sh` guard — open idea: enforce ProximaKit Foundation+Accelerate-only imports (not yet created)
+- `scripts/check-imports.sh` guard — **shipped** (post-1.5.0): POSIX-sh import-boundary linter enforcing ProximaKit → Foundation/Accelerate/Metal/Darwin/Glibc (DocC catalog snippets excluded) and ProximaEmbeddings → additionally ProximaKit/CoreML/NaturalLanguage/Vision/CoreGraphics; wired into the `lint` CI job, with the authoritative allowlist + per-import justification in the script header
 - CHANGELOG.md — backfill pre-v1.0 history (Keep-a-Changelog format already adopted)
 - Demo app README — expand with CoreML model install instructions
 - DocC Getting Started tutorial — **shipped** (post-1.5.0): interactive "Build On-Device Semantic Search" tutorial in the docc catalog, linked from the landing page and Getting Started

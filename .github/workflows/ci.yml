@@ -127,3 +127,15 @@ jobs:
 
       - name: Lint
         run: swiftlint lint --strict --reporter github-actions-logging
+
+      # SwiftLint cannot see module import boundaries: a stray `import CoreML`
+      # inside ProximaKit compiles cleanly (Apple SDK frameworks link against
+      # any target, and Package.swift declares no per-target linkage that would
+      # reject it), so only review catches it today. This POSIX-sh guard
+      # enforces the CONTRIBUTING.md "Module Rules" allowlist — ProximaKit:
+      # Foundation/Accelerate/Metal/Darwin/Glibc; ProximaEmbeddings additionally
+      # CoreML/NaturalLanguage/Vision/CoreGraphics — and fails the job on any
+      # forbidden import. The authoritative allowlist + per-import justification
+      # live in the script's header comment.
+      - name: Check import policy
+        run: sh scripts/check-imports.sh
