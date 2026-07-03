@@ -33,6 +33,11 @@ public enum WALDurability: Sendable {
 
     /// `fsync` once per append call (the batch of records from one mutation).
     /// Default. On Darwin, reaches the drive cache once per mutation call.
+    /// "Batch" is the records appended by one mutation call, not a
+    /// caller-controlled group: every index mutation appends exactly one record
+    /// today, so `.everyBatch` and `.everyRecord` currently coincide. A future
+    /// batched-append surface (many records per mutation) must revisit whether
+    /// this per-write `fsync` is still the intended `.everyBatch` behavior.
     case everyBatch
 
     /// No `fsync` on append. Records reach the OS page cache only; a power loss

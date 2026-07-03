@@ -553,7 +553,11 @@ claims Stage 2 makes; both are reproducible from a seed.
   searches faulted only 0.2 MB** (bounded working set, not the corpus). The test
   asserts `residentDelta − pagedDelta ≥ 60%` of the payload (threshold derived
   from this measured baseline with margin). It is benchmark-class and
-  env-gated, excluded from the PR job like `RecallBenchmarkTests`.
+  env-gated, excluded from the PR job like `RecallBenchmarkTests`. This 64%
+  isn't a downward revision of the original design's 87% projection (1.536 GB
+  of 1.76 GB, above) — that figure was against total file bytes, while this
+  one isolates the vector-section payload alone (146.5 MB), a different and
+  much smaller denominator.
 - **4 (search parity): met.** `PagedVectorParityTests` proves `.paged` results
   are **byte-identical** to `.resident` on the same file — same ids AND
   bit-equal Float32 distances (raw bit patterns compared) — across seeded

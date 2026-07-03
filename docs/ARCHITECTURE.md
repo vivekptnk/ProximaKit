@@ -265,6 +265,18 @@ if await index.needsCheckpoint() {
   parent and asserting the same semantics — a 5-iteration smoke runs in
   every CI run, and a ≥100-iteration heavy class runs opt-in behind
   `PROXIMA_RUN_KILL_RIG` (`WALKillRecoveryTests`).
+- **Opt-in benchmark gates, one place.** Three env vars, each set to `1`,
+  unlock heavyweight test classes that stay out of default CI:
+  `PROXIMA_RUN_KILL_RIG` is the SIGKILL rig's ≥100-iteration heavy class
+  above; `PROXIMA_PAGED_BENCH` unlocks `PagedVectorMemoryTests` (a
+  release-build test), which measures `phys_footprint` (via `task_vm_info`)
+  memory deltas between `.paged` and `.resident` open modes on the same base
+  file and backs the ADR-013 Stage 2 memory claims; and `PROXIMA_GPU_BENCH`
+  unlocks `MetalBuildIntegrationDecisionTests`, an opt-in Metal build-scale
+  (N=100,000) GPU-vs-vDSP correctness/parity check behind the ADR-009
+  insert-loop integration NO-GO decision, skipped whenever no Metal device is
+  present or the variable isn't set. None of the three run by default; each
+  earns its opt-in cost only when its specific question is being asked.
 - **Scope, honestly stated.** This is **index-level only**. Wiring
   journaling into `VectorStore` / `HybridVectorStore` is a deferred,
   documented follow-up — `HybridVectorStore` freezes the `VectorStore` v1

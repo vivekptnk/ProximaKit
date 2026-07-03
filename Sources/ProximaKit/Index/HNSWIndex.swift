@@ -482,6 +482,15 @@ public actor HNSWIndex: VectorIndex {
     ///
     /// The slot itself is kept as a tombstone (`count` unchanged, `liveCount`
     /// decremented) until `compact()` or auto-compaction reclaims it.
+    ///
+    /// **Durability asymmetry** — `add` throws, so its `appendAdd` surfaces a
+    /// WAL write error on the same call; `remove` is non-throwing, so its
+    /// `appendRemove` can only *defer* a write failure into the journal's
+    /// `pendingError`, left for the next throwing journaled op (another `add`,
+    /// a checkpoint, or an explicit sync) to raise. If the process crashes
+    /// before any such op runs, a `remove` that already returned `true` was
+    /// never durably journaled: WAL replay on recovery omits it, so the
+    /// "removed" vector reappears.
     @discardableResult
     public func remove(id: UUID) -> Bool {
         let removed = primitiveRemove(id: id)

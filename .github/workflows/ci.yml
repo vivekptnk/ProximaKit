@@ -46,7 +46,7 @@ jobs:
           path: |
             .build
             ~/Library/Caches/org.swift.swiftpm
-          key: swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Tests/**/*.swift') }}
+          key: swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Tests/**/*.swift', 'Examples/**/*.swift') }}
           restore-keys: |
             swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-
 

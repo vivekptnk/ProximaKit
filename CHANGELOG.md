@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [1.6.0] — 2026-07-03
+
 ### Added
 - **WAL incremental saves for `HNSWIndex` ([ADR-013](docs/adr/ADR-013-streaming-persistence.md),
   Stage 1).** Opt-in journaling via
@@ -126,6 +132,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   byte-identical codebooks and codes (`PQDeterminismTests`). A
   training-time knob like `HNSWConfiguration.levelSeed`: deliberately not
   persisted by the codecs and excluded from `Codable`.
+- **`JensenShannonDistance`** — a true distance metric computing `sqrt` of
+  the base-2 Jensen-Shannon divergence: unlike raw JSD (a dissimilarity
+  only), the square root is symmetric *and* satisfies the triangle
+  inequality. Range `[0, 1]` — 0 for identical distributions, 1 for disjoint
+  support — with inputs treated as unnormalized finite non-negative
+  distributions and L1-normalized internally before comparison. Domain
+  handling is bounded-sentinel, never a trap: negative or non-finite input
+  components, and non-finite intermediate results (overflow/NaN during
+  normalization or the divergence sum), both return `1` (maximal
+  dissimilarity) rather than a precondition failure. Serializable as
+  `DistanceMetricType.jensenShannon` (raw value 7); 13 tests in
+  `NewMetricsTests.swift` exercise it — identity/symmetry, triangle
+  inequality, and scalar/batch parity through the shared metric-testing
+  harness (`assertIdentityAndSymmetry`, `assertTriangleInequality`,
+  `assertBatchMatchesScalar`), plus disjoint-support, zero/negative/
+  non-finite/denormal edge cases and `DistanceMetricType` + `BruteForceIndex`
+  round-trips.
 - **`MetalBatchDistance` ([ADR-009](docs/adr/ADR-009-metal-backend.md), v1
   scope).** A standalone GPU utility for one-query-to-N batch distances
   (squared L2 and cosine) over the same flat row-major layout as the vDSP
@@ -148,12 +171,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with the step-by-step *Build On-Device Semantic Search* tutorial — create
   an `HNSWIndex`, embed text with `NLEmbeddingProvider`, persist and reload
   — linked from the DocC landing page and Getting Started.
-- **[ADR-013](docs/adr/ADR-013-streaming-persistence.md) Stage 2 (paged
-  vector region): still proposed, design only.** Stage 1 (WAL incremental
-  saves) has since shipped — see above. Stage 2 — a memory-mapped,
-  demand-paged vector region for corpora larger than RAM — remains a worked
-  design, **not implemented**, and makes no performance claims.
-
 - **Apple-grade visual system** for all README/docs assets: SF Pro outline
   logo and restyled animated diagram family per `docs/assets/DESIGN.md`.
 
