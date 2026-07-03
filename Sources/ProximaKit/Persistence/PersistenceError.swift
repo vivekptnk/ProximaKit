@@ -47,6 +47,13 @@ public enum PersistenceError: Error, LocalizedError {
     /// (ADR-013).
     case walMetricMismatch(expected: UInt32, found: UInt32)
 
+    /// A v2→v3 migration (`upgradeToV3`) could not write its temporary image or
+    /// atomically replace the source — a filesystem error such as a full disk or
+    /// a permission denial. The `detail` preserves the underlying error's
+    /// description so the failure is diagnosable; the source file is left
+    /// untouched (the temp/rename discipline, ADR-014).
+    case migrationFailed(String)
+
     public var errorDescription: String? {
         switch self {
         case .invalidMagic:
@@ -72,6 +79,8 @@ public enum PersistenceError: Error, LocalizedError {
         case .walMetricMismatch(let expected, let found):
             return "Write-ahead log metric \(found) does not match "
                 + "base snapshot metric \(expected)"
+        case .migrationFailed(let detail):
+            return "Index migration failed: \(detail)"
         }
     }
 }

@@ -40,6 +40,67 @@ public enum QuantizedIndexError: Error, LocalizedError, Sendable, Equatable {
     }
 }
 
+/// Where a `QuantizedHNSWIndex`'s retained full-precision originals live
+/// (ADR-014 Stage 2).
+///
+/// Deliberately NOT `VectorProvider`: a quantized index is build-once (no `add`,
+/// no snapshot tail — see ADR-014), so every slot id is `< count` forever and a
+/// resident tail would be vacuous machinery a future reader could not tell from
+/// load-bearing state. Two cases, one copy-on-access accessor, nothing else.
+///
+/// Concurrency: the `.paged` case holds a `MappedVectorRegion` (`@unchecked
+/// Sendable`) that is created once and then confined to the owning
+/// `QuantizedHNSWIndex` actor; its raw pointer is dereferenced only inside
+/// synchronous actor-isolated calls (`vector(at:)`) and never crosses an
+/// `await`. Because the accessor returns a value-typed `Vector`, the public
+/// surface stays `Sendable` and `StrictConcurrency` holds at compile time.
+enum OriginalsStore {
+    /// Fully resident — byte-identical to the historical `[Vector]` (every
+    /// `retainOriginals: true` build and every v1/v2/v3 resident load).
+    case resident([Vector])
+
+    /// Served copy-on-access from a read-only mapping of the v3 originals
+    /// section (`.paged` open). The mapped payload stays on flash; only touched
+    /// pages fault in, and only the transient per-slot copy is heap-resident.
+    case paged(MappedVectorRegion)
+
+    /// Copy-on-access read of slot `node` — the single hot rerank read.
+    /// Resident: an array subscript. Paged: a scoped copy out of the mapping.
+    @inline(__always)
+    func vector(at node: Int) -> Vector {
+        switch self {
+        case .resident(let vectors): return vectors[node]
+        case .paged(let region): return region.vector(at: node)
+        }
+    }
+
+    /// Slot count (always equals the owning index's `count`).
+    var count: Int {
+        switch self {
+        case .resident(let vectors): return vectors.count
+        case .paged(let region): return region.count
+        }
+    }
+
+    /// Whether originals are served from a file mapping.
+    var isPaged: Bool {
+        if case .paged = self { return true }
+        return false
+    }
+
+    /// All originals as a resident array — for save-time compaction and test
+    /// introspection ONLY. Paged: faults and copies every slot (the documented
+    /// save-time readback sweep, ADR-014). Never call on the hot path.
+    func materialized() -> [Vector] {
+        switch self {
+        case .resident(let vectors):
+            return vectors
+        case .paged(let region):
+            return (0..<region.count).map { region.vector(at: $0) }
+        }
+    }
+}
+
 /// A memory-efficient HNSW index that stores PQ codes instead of full vectors.
 ///
 /// Build a quantized index from training data:
@@ -114,15 +175,30 @@ public actor QuantizedHNSWIndex {
 
     var codes: [[UInt8]]
 
-    // ── Original Vector Retention (ADR-012) ──────────────────────────
+    // ── Original Vector Retention (ADR-012 / ADR-014) ────────────────
     //
     // Present iff the index was built with retainOriginals: true (or loaded
-    // from a PQHW v2 file that carried originals). Slot-aligned with `codes`:
-    // originals[i] is the full-precision vector PQ-encoded into codes[i].
-    // Tombstoned slots keep their (never-read) original until save-time
-    // compaction drops them alongside every other per-slot section.
+    // from a PQHW v2/v3 file that carried originals). Slot-aligned with `codes`:
+    // slot i is the full-precision vector PQ-encoded into codes[i]. Tombstoned
+    // slots keep their (never-read) original until save-time compaction drops
+    // them alongside every other per-slot section.
+    //
+    // ADR-014 Stage 2: the originals may be RESIDENT (the historical `[Vector]`,
+    // every `retainOriginals: true` build and every resident load) or PAGED —
+    // served copy-on-access from a read-only mapping of the v3 originals section
+    // (`.paged` open). The single rerank read site goes through
+    // `originalsStore.vector(at:)`, which is bit-identical across both modes.
 
-    var originals: [Vector]?
+    var originalsStore: OriginalsStore?
+
+    /// Retained full-precision originals as a resident array, or `nil`.
+    ///
+    /// Backward-compatible accessor over ``originalsStore``. **Materializing**:
+    /// for a `.paged` index this faults in and copies the ENTIRE originals
+    /// section, so it is for save-time compaction and test introspection only —
+    /// the hot rerank path reads per slot through `originalsStore.vector(at:)`,
+    /// never this property.
+    var originals: [Vector]? { originalsStore?.materialized() }
 
     // ── ID & Metadata ────────────────────────────────────────────────
 
@@ -151,20 +227,49 @@ public actor QuantizedHNSWIndex {
     }
 
     /// Whether full-precision originals are retained for reranking (ADR-012).
-    public var retainsOriginals: Bool { originals != nil }
+    /// True for both resident and paged (`.paged` open) retention — both can
+    /// re-score exactly.
+    public var retainsOriginals: Bool { originalsStore != nil }
 
-    /// Approximate memory used by retained original vectors, in bytes.
-    /// Zero unless the index was built with `retainOriginals: true`.
+    /// Whether retained originals are served from a read-only file mapping
+    /// (`.paged` open, ADR-014) rather than the resident heap. Distinguishes the
+    /// two `retainsOriginals` modes for honest accounting.
+    public var originalsArePaged: Bool { originalsStore?.isPaged ?? false }
+
+    /// Bytes of retained original vectors that are **resident on the heap**.
+    ///
+    /// ADR-014 accounting (open question 2): a `.paged` index's originals live
+    /// on flash, not in resident memory, so this reports **0** for a paged index
+    /// — it MUST never count mapped originals as resident. A resident index
+    /// reports `count × dimension × 4` as before. The on-flash size of a paged
+    /// index's originals is reported separately by ``mappedOriginalStorageBytes``.
     public var originalStorageBytes: Int {
-        (originals?.count ?? 0) * dimension * MemoryLayout<Float>.size
+        switch originalsStore {
+        case .resident(let vectors):
+            return vectors.count * dimension * MemoryLayout<Float>.size
+        case .paged, .none:
+            return 0
+        }
     }
 
-    /// Memory savings ratio (full precision / actual vector storage).
+    /// Bytes of retained originals living **on flash** (memory-mapped, not
+    /// resident). Zero for a resident index; `count × dimension × 4` for a
+    /// `.paged` one. Kept separate from ``originalStorageBytes`` so a paged index
+    /// is never double-counted as resident (ADR-014 open question 2).
+    public var mappedOriginalStorageBytes: Int {
+        guard originalsArePaged else { return 0 }
+        return count * dimension * MemoryLayout<Float>.size
+    }
+
+    /// Memory savings ratio (full precision / actual **resident** vector storage).
     ///
-    /// Retained originals count against the savings: an index built with
-    /// `retainOriginals: true` stores originals **plus** codes, so this
-    /// drops below 1.0 — retention trades the compression story for
-    /// reranked recall (ADR-012).
+    /// A resident retaining index (`retainOriginals: true`) stores originals
+    /// **plus** codes, so this drops below 1.0 — retention trades the compression
+    /// story for reranked recall (ADR-012). A `.paged` retaining index keeps only
+    /// the codes resident (originals on flash), so this rises back to the full
+    /// PQ compression ratio: ADR-014 restores the 32× story on the vector payload
+    /// while keeping rerank exact. Because ``originalStorageBytes`` is 0 in paged
+    /// mode, the same formula reports the honest resident ratio for both.
     public var memorySavingsRatio: Float {
         let stored = codeStorageBytes + originalStorageBytes
         guard stored > 0 else { return 0 }
@@ -173,7 +278,9 @@ public actor QuantizedHNSWIndex {
 
     // ── Initialization ───────────────────────────────────────────────
 
-    /// Restores a quantized index from its components (used by persistence and build).
+    /// Restores a quantized index from its components (used by persistence and
+    /// build). Retained originals, if any, are resident. The paged variant is the
+    /// internal ``init(dimension:hnswConfig:quantizer:layers:nodeLevels:entryPointNode:maxLevel:codes:nodeToUUID:uuidToNode:metadata:originalsStore:)``.
     public init(
         dimension: Int,
         hnswConfig: HNSWConfiguration,
@@ -188,11 +295,39 @@ public actor QuantizedHNSWIndex {
         metadata: [Data?],
         originals: [Vector]? = nil
     ) {
-        if let originals {
-            precondition(originals.count == codes.count,
-                "originals must be slot-aligned with codes (\(originals.count) vs \(codes.count))")
-            precondition(originals.allSatisfy { $0.dimension == dimension },
-                "every retained original must have dimension \(dimension)")
+        self.init(
+            dimension: dimension, hnswConfig: hnswConfig, quantizer: quantizer,
+            layers: layers, nodeLevels: nodeLevels, entryPointNode: entryPointNode,
+            maxLevel: maxLevel, codes: codes, nodeToUUID: nodeToUUID,
+            uuidToNode: uuidToNode, metadata: metadata,
+            originalsStore: originals.map { .resident($0) })
+    }
+
+    /// Designated initializer: restores from components with the originals in
+    /// either residency mode (ADR-014). Resident originals are validated
+    /// slot-aligned and dimension-correct; a paged store is validated the same,
+    /// with its per-slot dimension already enforced by the layout resolver.
+    init(
+        dimension: Int,
+        hnswConfig: HNSWConfiguration,
+        quantizer: ProductQuantizer,
+        layers: [[[Int]]],
+        nodeLevels: [Int],
+        entryPointNode: Int?,
+        maxLevel: Int,
+        codes: [[UInt8]],
+        nodeToUUID: [UUID],
+        uuidToNode: [UUID: Int],
+        metadata: [Data?],
+        originalsStore: OriginalsStore?
+    ) {
+        if let originalsStore {
+            precondition(originalsStore.count == codes.count,
+                "originals must be slot-aligned with codes (\(originalsStore.count) vs \(codes.count))")
+            if case .resident(let vectors) = originalsStore {
+                precondition(vectors.allSatisfy { $0.dimension == dimension },
+                    "every retained original must have dimension \(dimension)")
+            }
         }
         self.dimension = dimension
         self.hnswConfig = hnswConfig
@@ -210,7 +345,7 @@ public actor QuantizedHNSWIndex {
         self.nodeToUUID = nodeToUUID
         self.uuidToNode = uuidToNode
         self.metadata = metadata
-        self.originals = originals
+        self.originalsStore = originalsStore
     }
 
     /// Builds the reverse-adjacency transpose of a layer set: for every edge
@@ -374,7 +509,7 @@ public actor QuantizedHNSWIndex {
     ) -> [SearchResult] {
         // Auto-rerank depth: 4*k when originals are retained, off otherwise.
         // Cannot throw — the rerank path only engages when originals exist.
-        let autoDepth = originals != nil ? 4 * max(k, 0) : 0
+        let autoDepth = originalsStore != nil ? 4 * max(k, 0) : 0
         return searchImpl(
             query: query, k: k, efSearch: efSearch,
             rerankDepth: autoDepth, filter: filter
@@ -427,7 +562,7 @@ public actor QuantizedHNSWIndex {
         filter: (@Sendable (UUID) -> Bool)? = nil
     ) throws -> [SearchResult] {
         let depth = rerankDepth ?? 0
-        if depth > 0, originals == nil {
+        if depth > 0, originalsStore == nil {
             throw QuantizedIndexError.originalsNotRetained
         }
         return searchImpl(
@@ -449,7 +584,7 @@ public actor QuantizedHNSWIndex {
         guard let ep = entryPointNode else { return [] }
         guard k > 0 else { return [] }
 
-        let reranking = rerankDepth > 0 && originals != nil
+        let reranking = rerankDepth > 0 && originalsStore != nil
 
         // Overscan: the layer-0 beam must surface at least rerankDepth
         // candidates for the exact re-scoring pass to choose from.
@@ -501,11 +636,18 @@ public actor QuantizedHNSWIndex {
         // those are already satisfied (idempotent), so a single, unchanged
         // materialization path serves both beams.
         var results: [SearchResult] = []
-        if reranking, let originals {
+        if reranking, let originalsStore {
             // Phase 3 (rerank): candidates arrive sorted by ascending ADC
             // distance, so the first rerankDepth live, filter-passing entries
             // are the ADC top-N. Re-score those exactly on the originals;
             // the final sort below then ranks by exact distance.
+            //
+            // ADR-014: `originalsStore.vector(at:)` is the SINGLE originals read
+            // in the whole search path, and it runs AFTER the ADC beam completes.
+            // In `.paged` mode it copies the slot out of the mapping inside this
+            // synchronous scope (no pointer escapes the actor step); the liveness
+            // and filter gates below precede it, so a tombstoned or filtered slot
+            // never faults a page — bit-identical to resident by construction.
             let metric = EuclideanDistance()
             var taken = 0
             for (node, _) in candidates {
@@ -519,7 +661,7 @@ public actor QuantizedHNSWIndex {
                 taken += 1
                 results.append(SearchResult(
                     id: uuid,
-                    distance: metric.distance(query, originals[node]),
+                    distance: metric.distance(query, originalsStore.vector(at: node)),
                     metadata: metadata[node]
                 ))
             }

@@ -37,9 +37,12 @@ import Darwin
 import Glibc
 #endif
 
-/// A read-only memory mapping over the fixed-stride vector section of a `.pxkt`
-/// v3 base. Vector `i` lives at `vectorSectionStart + i × dimension × 4`, so
-/// access is O(1) with no decode — the OS faults pages in on demand.
+/// A read-only memory mapping over a fixed-stride Float32 section of a v3 base —
+/// a `.pxkt` HNSW vector section (ADR-013) or a PQHW originals section
+/// (ADR-014). Vector `i` lives at `sectionStart + i × dimension × 4`, so access
+/// is O(1) with no decode — the OS faults pages in on demand. The section
+/// placement is resolved by a format-specific layout resolver and handed to
+/// `init(baseURL:layout:)`; the mapping/stride/SIGBUS machinery is shared.
 final class MappedVectorRegion: @unchecked Sendable {
 
     /// The byte alignment the v3 writer pads the vector section to, and which a
@@ -60,12 +63,25 @@ final class MappedVectorRegion: @unchecked Sendable {
     /// `VectorProvider`, not here.
     let count: Int
 
-    /// Opens `baseURL` read-only and maps its vector section. Throws a typed
-    /// `PersistenceError` (never traps) for a non-v3 base, a mis-sized or
+    /// Opens `baseURL` read-only and maps the HNSW `.pxkt` vector section. Throws
+    /// a typed `PersistenceError` (never traps) for a non-v3 base, a mis-sized or
     /// out-of-bounds section table, a vector section that is not page-aligned
     /// (an unpadded base — re-checkpoint to enable paging), or an mmap failure.
-    init(baseURL: URL) throws {
+    convenience init(baseURL: URL) throws {
         let layout = try PersistenceEngine.pagedVectorLayout(of: baseURL)
+        try self.init(baseURL: baseURL, layout: layout)
+    }
+
+    /// Maps a pre-resolved fixed-stride Float32 section of `baseURL`, read-only.
+    ///
+    /// This is the format-agnostic core (ADR-014 Stage 2): the caller resolves
+    /// the section placement — `PersistenceEngine.pagedVectorLayout` for a
+    /// `.pxkt` HNSW vector section, `QuantizedHNSWIndex.pagedOriginalsLayout` for
+    /// a PQHW v3 originals section — and this maps it. Both sections are
+    /// dimension × Float32, so the same stride math and SIGBUS contract serve
+    /// both. Throws a typed `PersistenceError` (never traps) for a section that
+    /// is not page-aligned, runs past EOF, or fails to `mmap`.
+    init(baseURL: URL, layout: PagedVectorLayout) throws {
         guard layout.vectorOffset % Self.requiredAlignment == 0 else {
             throw PersistenceError.corruptedData(
                 "vector section offset \(layout.vectorOffset) is not "

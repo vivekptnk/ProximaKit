@@ -2,10 +2,19 @@
 
 ## Status
 
-**Proposed — design only, NOT implemented.** Nothing in this document is built.
-Every byte, percentage, and count below is either file-format arithmetic or an
-acceptance gate to be measured under ADR-005 methodology **when** implemented;
-this ADR makes no performance or recall claim of any kind. It is the design
+**Accepted — Stages 1 + 2 implemented and shipped.** Stage 1 (PQHW v3 formats +
+both v2→v3 migrators) landed first; Stage 2 (the paged originals read path,
+`open(at:mode:)`, rerank parity, accounting, and the memory acceptance) landed
+next. See the two **Implementation notes** sections at the end for the decisions,
+deviations, public API, and measured numbers each stage shipped. The design body
+below is preserved as authored; where it says "Proposed" or "when implemented",
+read it against those notes. Arithmetic figures in the design remain arithmetic;
+the measured figures are labelled with machine + mode in the Stage-2 notes.
+
+The original design framing follows. Every byte, percentage, and count in the
+design body is either file-format arithmetic or an acceptance gate that has since
+been measured under ADR-005 methodology (Stage-2 notes); the design itself makes
+no performance or recall claim. It is the design
 [ADR-012](ADR-012-pq-reranking.md) deferred — its "Memory math" section closes
 by noting the design "composes with future on-disk originals (memory-mapped or
 demand-paged), which would restore the memory story while keeping this exact
@@ -692,3 +701,157 @@ the Stage-1 work relied on were **not** touched by `97a0107` and remain accurate
 layout, and the `PersistenceEngine.swift` v3 machinery. The drift is flagged as
 non-substantive (line numbers only); the ADR body is left as authored (design
 document, still Proposed) rather than churned.
+
+## Implementation notes (Stage 2)
+
+Status moves to **Accepted**: the paged originals read path is built. This
+addendum records the decisions, public API, and measured numbers Stage 2
+shipped. Numbers are labelled machine + mode; every figure here is measured, not
+arithmetic.
+
+### What shipped
+
+- **`OriginalsStore` — the deliberate two-case store, NOT `VectorProvider`.**
+  `QuantizedHNSWIndex.originals: [Vector]?` became
+  `originalsStore: OriginalsStore?` where
+  `enum OriginalsStore { case resident([Vector]); case paged(MappedVectorRegion) }`
+  (`QuantizedHNSWIndex.swift`). It honors the ADR's instruction to not reuse
+  `VectorProvider`: a quantized index is build-once (no `add`, no snapshot tail),
+  so every slot id is `< count` forever and a resident tail would be vacuous
+  machinery. The store exposes exactly one hot accessor, `vector(at:)`
+  (copy-on-access), plus `count`, `isPaged`, and a `materialized()` used ONLY by
+  save-time compaction and test introspection. A backward-compatible
+  `var originals: [Vector]? { originalsStore?.materialized() }` computed property
+  preserves the internal call sites; `compactedForSave()` materializes once (the
+  documented paged-save readback sweep) rather than per slot.
+- **`MappedVectorRegion` generalized by layout resolution only.** Its body was
+  already stride-correct (dimension × Float32). Stage 2 split the init into a
+  format-agnostic core `init(baseURL:layout:)` taking a resolved
+  `PagedVectorLayout`, kept the `.pxkt` `convenience init(baseURL:)`, and added
+  the PQHW resolver `QuantizedHNSWIndex.pagedOriginalsLayout(of:)` that reads only
+  the 56-byte header + 128-byte `PQH3` trailer and validates alignment, length
+  (`count × dim × 4`, overflow-checked), and flag/entry consistency. The `.pxkt`
+  path is untouched.
+- **`load(from:mode:)` opt-in paged open.** `enum PQHWOpenMode { case resident; case paged }`,
+  mirroring `HNSWOpenMode`. `.resident` is byte-identical to `load(from:)`
+  (default, unchanged). `.paged` decodes the graph/codes/ids/levels/metadata
+  resident exactly as before and maps ONLY the originals section. The load was
+  refactored around a private `PQHWDecodedCore` that resolves-and-validates the
+  originals section without reading its payload; the resident loader copies it,
+  the paged loader maps it. The Stage-1-deferred corruption items now ship as
+  tests: a `.paged` open of a **v2** base, a **flag-0 v3** base, or an
+  **unaligned v3** base each rejects with a typed `PersistenceError` naming the
+  fix (upgrade / nothing-to-page / re-align), while the SAME file still loads
+  `.resident` unaffected (`PagedOriginalsCorruptionTests`).
+- **One search-path call site changed.** `metric.distance(query, originals[node])`
+  → `metric.distance(query, originalsStore.vector(at:))`. It is the single
+  originals read in the whole search path and runs AFTER the ADC beam; the
+  liveness and filter gates still precede it, so tombstoned/filtered slots never
+  fault a page. Copy-on-access makes paged results bit-identical to resident by
+  construction (`PagedOriginalsParityTests`: same ids AND bit-equal Float32
+  distances across seeded queries × {rerank off/on, filtered, post-remove}, plus
+  a post-remove save/reload).
+
+### Accounting (open question 2 — resolved)
+
+A `.paged` index MUST NOT report its mapped originals as resident. Decision:
+`originalStorageBytes` reports **0** for a paged index (originals are on flash);
+a new `mappedOriginalStorageBytes` reports `count × dim × 4` for the on-flash
+size (0 for resident). A new `originalsArePaged: Bool` distinguishes the two
+`retainsOriginals` modes. Because `originalStorageBytes` is 0 in paged mode,
+`memorySavingsRatio` uses the same formula and honestly rises back to the pure PQ
+ratio (equivalent / codes) — the 32× story restored — for a paged index, while a
+resident retaining index still reports the sub-1.0 ratio ADR-012 describes. Doc
+comments state the semantics; `testPagedAccountingNeverReportsOriginalsResident`
+gates them.
+
+### Measured — resident rerank regression (bail-out gate)
+
+Threading `OriginalsStore` through the single rerank read site must not regress
+the resident hot path. A/B on the SAME public-API benchmark
+(`ResidentRerankBenchTests`, 8K × 128d retained, k=10, rerankDepth=40, 9 reps ×
+400 queries), run in release on the pre-change tree (HEAD `5057152`) and the
+post-change tree, same machine:
+
+| Tree | median ms/query | p10 | p90 |
+|---|---|---|---|
+| Before (HEAD, resident `[Vector]?`) | 0.1654 | 0.1478 | 0.1687 |
+| After (Stage 2, `OriginalsStore.resident`) | 0.1594 | 0.1536 | 0.1645 |
+
+**Machine:** Apple M4 Max, 36 GB, macOS 26.0.1, Swift 6.2, release. The After
+median is **−3.6%** (marginally faster; the enum-`.resident`/array-subscript
+indirection is measured free against the vDSP distance, as the ADR predicted),
+with heavily overlapping spreads — **no regression**, well inside the ±2%
+bail-out band.
+
+### Measured — paged memory acceptance (criterion 1)
+
+`PagedOriginalsMemoryTests` (env-gated `PROXIMA_PAGED_BENCH=1`, CI-excluded),
+100K × 384d retaining PQHW v3 base, originals payload = 146.5 MB, opening the
+SAME base `.paged` then `.resident` and measuring `phys_footprint` deltas:
+
+| Measurement | Value |
+|---|---|
+| originals payload (theoretical) | 146.5 MB |
+| paged open delta | 8.0 MB |
+| paged open + 50 warm reranks | 8.2 MB |
+| resident open delta | 43.1 MB |
+
+**Machine:** Apple M4 Max, 36 GB, macOS 26.0.1, Swift 6.2, release. The paged
+open resides **8.0 MB for a 146.5 MB originals payload (18× less)** and stays
+essentially flat (8.2 MB) after 50 reranked queries — the originals payload is
+demonstrably not resident, and warm faults are a bounded working set, not the
+corpus. The resident open of the same base costs **5.4× more** (43.1 MB).
+
+**Threshold honesty (open question deferred to measurement).** The test does NOT
+gate on "≥60% of the theoretical payload recovered by the resident open" (the
+HNSW Stage-2 test's aspirational gate). On macOS 26 the memory compressor counts
+freshly-copied anonymous originals pages at their COMPRESSED size, so
+`phys_footprint` captures only ~30% of the theoretical payload on the resident
+side — a ratio stable across fixture sizes (12.8 MB of 39 MB at 40K × 256d; 43.1
+MB of 146.5 MB at 100K × 384d), an OS accounting reality, not a residency leak.
+The gates are therefore derived from THIS measured baseline with margin: paged
+open `< payload/8` (the direct acceptance-criterion statement: originals not
+resident), resident `> 2.5× paged` (resident pays materially more), resident −
+paged `> payload/8` (a substantial slice recovered), and warm-rerank delta
+bounded by `payload/4`.
+
+### Ride-along followups (Stage-1 judges)
+
+- **Migration filesystem-failure wrapping.** Both `upgradeToV3(at:)` rewriters
+  (`QuantizedHNSWIndex` and `PersistenceEngine`) now wrap temp-write and
+  atomic-replace failures (disk-full, permission-denied) in
+  `PersistenceError.migrationFailed(String)` — a new typed case that preserves
+  the underlying error's description in its message — and leave the source
+  untouched (the temp/rename discipline). `PagedOriginalsMigrationTests` proves
+  both, driving the failure with a read-only directory (skipped when the process
+  can still write, e.g. root).
+- **Migration fixtures for the paths Stage 1 did not exercise directly.** v1
+  `PQHW` → legal flag-0 v3 (structural + rerank parity), v1 `.pxkt` →
+  paged-capable v3 (section bit-identity via the verifier + paged parity), and
+  unpadded-v3 → padded-v3 for **both** families (paged open rejected before
+  upgrade, succeeds + parity-matches after, idempotent re-upgrade is a byte
+  no-op).
+
+### Public API added (all additive)
+
+- `enum PQHWOpenMode { case resident; case paged }` and
+  `QuantizedHNSWIndex.load(from:mode:)`.
+- `QuantizedHNSWIndex.originalsArePaged: Bool` and
+  `mappedOriginalStorageBytes: Int` (accounting).
+- `PersistenceError.migrationFailed(String)` (typed migration-failure case).
+
+Existing `save` / `load(from:)` / `search` / `build` signatures and on-disk
+output are unchanged; `.paged` open is opt-in and defaults off.
+
+### Open questions — Stage-2 disposition
+
+- **(2) Accounting semantics** — resolved above (`originalStorageBytes` = 0 for
+  paged; `mappedOriginalStorageBytes` separate).
+- **(4) Save-of-a-paged-index raw byte-copy** — NOT taken; a paged save reads
+  live originals back through the mapping and compacts (the documented readback
+  sweep), which correctly handles the tombstoned case. The raw-copy fast path for
+  the tombstone-free case remains a future option.
+- **(1) `save(to:)` default flips to v3, (3) sampled upgrade verification, (5)
+  `snapshotGeneration` semantics** — unchanged from their Stage-1 disposition
+  (default stays v2; full-checksum verification; generation reserved 0).

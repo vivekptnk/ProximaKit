@@ -697,9 +697,22 @@ public enum PersistenceEngine {
         }
         let tmp = url.appendingPathExtension("pxktv3tmp")
         defer { try? FileManager.default.removeItem(at: tmp) }
-        try image.write(to: tmp, options: .atomic)
+        // Filesystem errors (disk full, permission denied) are wrapped in a typed
+        // PersistenceError preserving the underlying cause; the source is left
+        // untouched (the temp is written and replaced, never the original).
+        do {
+            try image.write(to: tmp, options: .atomic)
+        } catch {
+            throw PersistenceError.migrationFailed(
+                "could not write the upgrade image to \(tmp.path): \(error)")
+        }
         try verifyPaddedV3Upgrade(source: source, upgradedURL: tmp)
-        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        do {
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        } catch {
+            throw PersistenceError.migrationFailed(
+                "could not atomically replace \(url.path) with the upgraded image: \(error)")
+        }
     }
 
     /// Builds the padded-v3 image for a `.pxkt` HNSW `source`, or `nil` if it is

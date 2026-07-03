@@ -97,6 +97,24 @@ public enum PQHWSaveLayout: Sendable {
     case pagedV3
 }
 
+/// How ``QuantizedHNSWIndex/load(from:mode:)`` materializes a base's retained
+/// originals section (ADR-014 Stage 2). Additive; `.resident` is the default and
+/// preserves the historical fully-resident behavior byte for byte. Mirrors
+/// `HNSWOpenMode`.
+public enum PQHWOpenMode: Sendable {
+    /// Decode every section (including the originals) into resident memory — the
+    /// original behavior. Fastest warm rerank, highest residency.
+    case resident
+
+    /// Serve the originals section from a read-only file mapping, faulted in on
+    /// demand, keeping the graph, codes, ids, levels, and metadata resident.
+    /// Requires a padded v3 base that retains originals (written by
+    /// `save(to:layout: .pagedV3)` or produced by `upgradeToV3(at:)`). Restores
+    /// the 32× compression story on the vector payload while keeping rerank
+    /// exact; the post-beam rerank reads are bit-identical to `.resident`.
+    case paged
+}
+
 extension QuantizedHNSWIndex {
 
     /// Live-only view of the index state for serialization.
@@ -113,11 +131,16 @@ extension QuantizedHNSWIndex {
         metadata: [Data?], layers: [[[Int]]], entryPoint: Int?, maxLevel: Int,
         originals: [Vector]?
     ) {
+        // Materialize the originals ONCE (a paged store faults its whole section
+        // back in here — the documented save-time readback sweep, ADR-014 — so
+        // this must not be re-evaluated per slot). Resident is a cheap COW share.
+        let liveOriginals: [Vector]? = originalsStore?.materialized()
+
         // Fast path: no tombstones — serialize state as-is (byte-identical
         // to the pre-compaction format, and no array copies).
         if uuidToNode.count == nodeToUUID.count {
             return (codes, nodeToUUID, nodeLevels, metadata,
-                    layers, entryPointNode, maxLevel, originals)
+                    layers, entryPointNode, maxLevel, liveOriginals)
         }
 
         // Dense renumbering of live slots (identity check, not presence).
@@ -130,15 +153,15 @@ extension QuantizedHNSWIndex {
         var newUUIDs: [UUID] = []
         var newLevels: [Int] = []
         var newMetadata: [Data?] = []
-        var newOriginals: [Vector]? = originals != nil ? [] : nil
+        var newOriginals: [Vector]? = liveOriginals != nil ? [] : nil
         for (node, uuid) in nodeToUUID.enumerated() where uuidToNode[uuid] == node {
             oldToNew[node] = newUUIDs.count
             newCodes.append(codes[node])
             newUUIDs.append(uuid)
             newLevels.append(nodeLevels[node])
             newMetadata.append(metadata[node])
-            if let originals {
-                newOriginals?.append(originals[node])
+            if let liveOriginals {
+                newOriginals?.append(liveOriginals[node])
             }
         }
 
@@ -318,13 +341,153 @@ extension QuantizedHNSWIndex {
         return data
     }
 
-    /// Loads a quantized index from a binary file.
+    /// Loads a quantized index from a binary file, fully resident.
     ///
     /// v1/v2 files load exactly as before (sequential cursor walk). v3 files
-    /// load resident too (Stage 1 has no paged reads): the body is walked
-    /// identically, and the originals section is read from the trailer's
-    /// recorded offset (jumping over the 16 KiB padding).
+    /// load resident too: the body is walked identically, and the originals
+    /// section is read from the trailer's recorded offset (jumping over the
+    /// 16 KiB padding). Byte-identical in behavior to prior releases.
     public static func load(from url: URL) throws -> QuantizedHNSWIndex {
+        let core = try decodeCore(from: url)
+        var store: OriginalsStore?
+        if core.hasOriginals {
+            store = .resident(try readResidentOriginals(core))
+        }
+        return makeIndex(core, originalsStore: store)
+    }
+
+    /// Loads a quantized index in the requested residency `mode` (ADR-014
+    /// Stage 2). `.resident` is byte-identical to ``load(from:)``; `.paged` serves
+    /// the retained originals from a read-only file mapping (`MappedVectorRegion`)
+    /// instead of copying them into `[Vector]`.
+    ///
+    /// - Throws: for `.paged`, a typed `PersistenceError` (never a trap) when the
+    ///   base is not a v3 file (upgrade it with ``upgradeToV3(at:)``), retains no
+    ///   originals (nothing to page), or has an unaligned originals section.
+    public static func load(from url: URL, mode: PQHWOpenMode) throws -> QuantizedHNSWIndex {
+        switch mode {
+        case .resident:
+            return try load(from: url)
+        case .paged:
+            return try loadPaged(from: url)
+        }
+    }
+
+    /// The `.paged` open path: decode the graph, codes, ids, levels, and metadata
+    /// resident exactly as ``load(from:)``, but map the originals section instead
+    /// of copying it. Requires a padded v3 base that retains originals.
+    static func loadPaged(from url: URL) throws -> QuantizedHNSWIndex {
+        let core = try decodeCore(from: url)
+        guard core.version >= qhWriteVersionV3 else {
+            throw PersistenceError.corruptedData(
+                "paged open requires a PQHW v3 base; upgrade it with "
+                + "QuantizedHNSWIndex.upgradeToV3(at:) to enable paging")
+        }
+        guard core.hasOriginals else {
+            throw PersistenceError.corruptedData(
+                "paged open has nothing to page: this PQHW base retains no originals (flag 0)")
+        }
+        // Resolve + validate the mapped section (alignment, length, bounds), then
+        // map it. The resolver's guards produce the actionable typed errors for
+        // the v2 / flag-0 / unaligned cases (ADR-014 Stage-1 deferred items).
+        let layout = try pagedOriginalsLayout(of: url)
+        let region = try MappedVectorRegion(baseURL: url, layout: layout)
+        return makeIndex(core, originalsStore: .paged(region))
+    }
+
+    /// Copies the resident originals section into `[Vector]` from the core's
+    /// validated read offset (the historical read loop, factored out).
+    private static func readResidentOriginals(_ core: PQHWDecodedCore) throws -> [Vector] {
+        var offset = core.originalsReadOffset
+        let fileData = core.fileData
+        let vectorBytes = core.dimension * MemoryLayout<Float>.size
+        var loaded = [Vector]()
+        loaded.reserveCapacity(core.nodeCount)
+        for _ in 0..<core.nodeCount {
+            var floats = [Float](repeating: 0, count: core.dimension)
+            fileData.withUnsafeBytes { buffer in
+                let src = buffer.baseAddress!.advanced(by: offset)
+                floats.withUnsafeMutableBytes { dest in
+                    dest.copyMemory(from: UnsafeRawBufferPointer(start: src, count: vectorBytes))
+                }
+            }
+            loaded.append(Vector(floats))
+            offset += vectorBytes
+        }
+        return loaded
+    }
+
+    /// Assembles the actor from a decoded core and a resolved originals store.
+    private static func makeIndex(
+        _ core: PQHWDecodedCore, originalsStore: OriginalsStore?
+    ) -> QuantizedHNSWIndex {
+        QuantizedHNSWIndex(
+            dimension: core.dimension,
+            hnswConfig: core.hnswConfig,
+            quantizer: core.quantizer,
+            layers: core.layers,
+            nodeLevels: core.nodeLevels,
+            entryPointNode: core.entryPoint,
+            maxLevel: core.maxLevel,
+            codes: core.codes,
+            nodeToUUID: core.nodeToUUID,
+            uuidToNode: core.uuidToNode,
+            metadata: core.metadata,
+            originalsStore: originalsStore)
+    }
+
+    /// Resolves the physical placement of a PQHW v3 base's originals section for
+    /// paged (`mmap`) open, reading only the 56-byte header + 128-byte trailer
+    /// (no payload copied). Every failure is a typed `PersistenceError`, never a
+    /// trap — this is where the ADR-014 Stage-1 deferred corruption items land:
+    /// a v2 base, a flag-0 v3 base, and an unaligned v3 originals section each
+    /// reject the paged open with an actionable message.
+    static func pagedOriginalsLayout(of url: URL) throws -> PagedVectorLayout {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard data.count >= qhHeaderSize else { throw PersistenceError.fileTooSmall }
+        guard data.loadLE(UInt32.self, at: 0) == qhMagic else { throw PersistenceError.invalidMagic }
+        let version = data.loadLE(UInt32.self, at: 4)
+        guard version >= qhMinSupportedVersion, version <= qhMaxReadableVersion else {
+            throw PersistenceError.unsupportedVersion(version)
+        }
+        guard version >= qhWriteVersionV3 else {
+            throw PersistenceError.corruptedData(
+                "paged open requires a PQHW v3 base; upgrade it with "
+                + "QuantizedHNSWIndex.upgradeToV3(at:) to enable paging")
+        }
+        let dim = Int(data.loadLE(UInt32.self, at: 8))
+        let nodeCount = Int(data.loadLE(UInt32.self, at: 12))
+        guard dim > 0, nodeCount >= 0 else {
+            throw PersistenceError.corruptedData("PQHW header fields invalid for paged open")
+        }
+        let flag = data.loadLE(UInt32.self, at: 48)
+        guard flag == 1 else {
+            throw PersistenceError.corruptedData(
+                "paged open has nothing to page: this PQHW base retains no originals (flag \(flag))")
+        }
+        let trailer = try PQHWTrailer.parse(data)
+        let entry = trailer.sections[qhOriginalsSectionIndex]
+        let (stride, ov1) = dim.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+        let (expected, ov2) = nodeCount.multipliedReportingOverflow(by: stride)
+        guard !ov1, !ov2, entry.length == expected else {
+            throw PersistenceError.corruptedData(
+                "PQHW v3 originals length \(entry.length) != \(nodeCount) × \(dim) × 4")
+        }
+        guard entry.offset % qhOriginalsAlignment == 0 else {
+            throw PersistenceError.corruptedData(
+                "PQHW v3 originals section offset \(entry.offset) is not "
+                + "\(qhOriginalsAlignment)-byte aligned; upgrade the base with "
+                + "QuantizedHNSWIndex.upgradeToV3(at:) to enable paging")
+        }
+        return PagedVectorLayout(
+            dimension: dim, count: nodeCount,
+            vectorOffset: entry.offset, vectorLength: entry.length, fileSize: data.count)
+    }
+
+    /// Decodes every PQHW section except the originals payload (resolved and
+    /// validated, but read by the caller — resident copy or paged map). Shared by
+    /// ``load(from:)`` and ``loadPaged(from:)``.
+    private static func decodeCore(from url: URL) throws -> PQHWDecodedCore {
         let fileData = try Data(contentsOf: url, options: .mappedIfSafe)
 
         guard fileData.count >= qhHeaderSize else {
@@ -556,8 +719,10 @@ extension QuantizedHNSWIndex {
         // Originals: nodeCount * dim Float32, slot-aligned with the PQ codes.
         // v1/v2 read from the post-metadata cursor; v3 reads from the trailer's
         // recorded offset (past the 16 KiB padding). Truncation, length, and
-        // flag/entry-consistency violations must all throw a typed error.
-        var originals: [Vector]? = nil
+        // flag/entry-consistency violations must all throw a typed error. This
+        // core RESOLVES and VALIDATES the section but does not read the payload:
+        // the resident loader copies it into `[Vector]`; the paged loader maps it
+        // (ADR-014 Stage 2). The read strategy lives in the caller.
         let originalsReadOffset: Int
         if let trailer {
             let entry = trailer.sections[qhOriginalsSectionIndex]
@@ -578,38 +743,30 @@ extension QuantizedHNSWIndex {
             originalsReadOffset = offset
         }
 
+        var originalsBytes = 0
         if hasOriginals {
             let (floatCount, floatOverflow) = nodeCount.multipliedReportingOverflow(by: dim)
-            let (originalsBytes, byteOverflow) =
+            let (bytes, byteOverflow) =
                 floatCount.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
             guard !floatOverflow, !byteOverflow else {
                 throw PersistenceError.corruptedData("Quantized index originals section truncated")
             }
+            originalsBytes = bytes
             // For v3, the trailer's recorded length must match exactly.
             if let trailer {
                 let entry = trailer.sections[qhOriginalsSectionIndex]
-                guard entry.length == originalsBytes else {
+                guard entry.length == bytes else {
                     throw PersistenceError.corruptedData(
                         "Quantized index originals length \(entry.length) != \(nodeCount) × \(dim) × 4")
                 }
             }
-            offset = originalsReadOffset
-            try requireBytes(originalsBytes, "originals section")
-            var loaded = [Vector]()
-            loaded.reserveCapacity(nodeCount)
-            let vectorBytes = dim * MemoryLayout<Float>.size
-            for _ in 0..<nodeCount {
-                var floats = [Float](repeating: 0, count: dim)
-                fileData.withUnsafeBytes { buffer in
-                    let src = buffer.baseAddress!.advanced(by: offset)
-                    floats.withUnsafeMutableBytes { dest in
-                        dest.copyMemory(from: UnsafeRawBufferPointer(start: src, count: vectorBytes))
-                    }
-                }
-                loaded.append(Vector(floats))
-                offset += vectorBytes
+            // The section must physically fit: the resident read copies from here
+            // and the paged mapping maps from here, so bounds-check once (never
+            // trap). Equivalent to the former `requireBytes` at the read site.
+            guard originalsReadOffset >= 0, originalsReadOffset <= fileData.count,
+                  bytes <= fileData.count - originalsReadOffset else {
+                throw PersistenceError.corruptedData("Quantized index originals section truncated")
             }
-            originals = loaded
         }
 
         let hnswConfig = HNSWConfiguration(
@@ -619,20 +776,24 @@ extension QuantizedHNSWIndex {
             autoCompactionThreshold: nil
         )
 
-        return QuantizedHNSWIndex(
+        return PQHWDecodedCore(
+            fileData: fileData,
+            version: version,
             dimension: dim,
-            hnswConfig: hnswConfig,
+            nodeCount: nodeCount,
             quantizer: quantizer,
-            layers: layers,
-            nodeLevels: nodeLevels,
-            entryPointNode: entryPoint,
-            maxLevel: maxLevel,
+            hnswConfig: hnswConfig,
             codes: pqCodes,
             nodeToUUID: nodeToUUID,
             uuidToNode: uuidToNode,
+            nodeLevels: nodeLevels,
+            layers: layers,
             metadata: metadata,
-            originals: originals
-        )
+            entryPoint: entryPoint,
+            maxLevel: maxLevel,
+            hasOriginals: hasOriginals,
+            originalsReadOffset: originalsReadOffset,
+            originalsBytes: originalsBytes)
     }
 
     // MARK: - Migration (ADR-014 M-A: offline section-copy rewrite)
@@ -659,11 +820,24 @@ extension QuantizedHNSWIndex {
         }
         let tmp = url.appendingPathExtension("pqhwv3tmp")
         defer { try? FileManager.default.removeItem(at: tmp) }
-        try image.write(to: tmp, options: .atomic)
+        // Filesystem errors (disk full, permission denied) are wrapped in a typed
+        // PersistenceError preserving the underlying cause; the source is left
+        // untouched (the temp is written and replaced, never the original).
+        do {
+            try image.write(to: tmp, options: .atomic)
+        } catch {
+            throw PersistenceError.migrationFailed(
+                "could not write the upgrade image to \(tmp.path): \(error)")
+        }
         // Full-checksum verification BEFORE the atomic replace: if the temp is
         // torn or a section drifted, throw and leave the source in place.
         try verifyPaddedV3Upgrade(source: source, upgradedURL: tmp)
-        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        do {
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        } catch {
+            throw PersistenceError.migrationFailed(
+                "could not atomically replace \(url.path) with the upgraded image: \(error)")
+        }
     }
 
     /// Builds the padded-v3 image for a v1/v2/unpadded-v3 PQHW `source`, or
@@ -747,6 +921,35 @@ extension QuantizedHNSWIndex {
             }
         }
     }
+}
+
+// MARK: - Decoded core (shared by resident + paged load)
+
+/// Everything a PQHW load decodes resident EXCEPT the originals payload, whose
+/// section is resolved and validated here but read by the caller — copied into
+/// `[Vector]` (resident) or mapped (`.paged`, ADR-014). `fileData` is the
+/// `.mappedIfSafe` file image the resident originals read copies from.
+private struct PQHWDecodedCore {
+    let fileData: Data
+    let version: UInt32
+    let dimension: Int
+    let nodeCount: Int
+    let quantizer: ProductQuantizer
+    let hnswConfig: HNSWConfiguration
+    let codes: [[UInt8]]
+    let nodeToUUID: [UUID]
+    let uuidToNode: [UUID: Int]
+    let nodeLevels: [Int]
+    let layers: [[[Int]]]
+    let metadata: [Data?]
+    let entryPoint: Int?
+    let maxLevel: Int
+    let hasOriginals: Bool
+    /// Byte offset the resident originals read starts at (trailer offset for v3,
+    /// post-metadata cursor otherwise). Unused when `hasOriginals` is false.
+    let originalsReadOffset: Int
+    /// Expected originals section length (`nodeCount × dim × 4`); 0 when absent.
+    let originalsBytes: Int
 }
 
 // MARK: - v3 Trailer parsing

@@ -77,8 +77,17 @@ jobs:
       id-token: write
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment2.outputs.page_url }}
     steps:
+      # deploy-pages has flaked repeatedly (4x in 24h) with a transient
+      # "Deployment failed, try again later" error, even though the artifact
+      # itself is always fine — a rerun always heals it. Retry automatically
+      # instead of requiring a human to run `gh run rerun --failed`.
       - name: Deploy
         id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Deploy (retry)
+        id: deployment2
+        if: failure()
         uses: actions/deploy-pages@v4
