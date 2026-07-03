@@ -124,6 +124,7 @@ Delivered: the `.pxwal` v1 sidecar (CRC-framed records, deterministic replay via
 | ADR-011 | Product quantization codec format (`PQTT` / `PQHW`, ADC, K=256) | Accepted (retrospective) |
 | ADR-012 | Full-precision reranking for quantized HNSW (`retainOriginals` + `rerankDepth`, PQHW v2) | Accepted |
 | ADR-013 | Streaming persistence: WAL incremental saves (Stage 1) + paged vector region (Stage 2) | Accepted — both stages shipped |
+| ADR-014 | Paged originals for quantized reranking — PQHW v3 section table + 16 KiB-padded originals, mapped rerank reads, and the v2→v3 upgrade path for both format families ([ADR-014](adr/ADR-014-paged-originals.md)) | Proposed — design only, not implemented |
 
 ---
 
