@@ -45,6 +45,7 @@ let results = await index.search(query: queryVector, k: 10)
 - ``HammingDistance``
 - ``ChebyshevDistance``
 - ``BrayCurtisDistance``
+- ``JensenShannonDistance``
 - ``MahalanobisDistance``
 
 ### Index Protocol
@@ -101,3 +102,16 @@ let results = await index.search(query: queryVector, k: 10)
 - ``BruteForceSnapshot``
 - ``SparseIndexSnapshot``
 - ``DistanceMetricType``
+
+### Streaming Persistence (WAL, opt-in)
+
+- ``HNSWIndex/open(baseURL:walURL:durability:)``
+- ``HNSWIndex/checkpoint(baseURL:walURL:durability:)``
+- ``HNSWIndex/syncJournal()``
+- ``HNSWIndex/needsCheckpoint(policy:)``
+- ``HNSWIndex/closeJournal()``
+- ``HNSWIndex/journalByteCount``
+- ``HNSWIndex/journalRecordCount``
+- ``HNSWIndex/currentGeneration``
+- ``WALDurability``
+- ``WALCheckpointPolicy``

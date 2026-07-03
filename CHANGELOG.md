@@ -9,6 +9,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **WAL incremental saves for `HNSWIndex` ([ADR-013](docs/adr/ADR-013-streaming-persistence.md),
+  Stage 1).** Opt-in journaling via
+  `HNSWIndex.open(baseURL:walURL:durability:)` turns saves from O(corpus) into
+  O(change): each `add`/`remove` appends a framed `PXWL` v1 record
+  (`[length][crc32][payload]`, little-endian) instead of rewriting the whole
+  snapshot — ≈1.6 KB per `add` at 384d versus the full-file rewrite `save(to:)`
+  still does. `add` records journal the assigned HNSW level so replay is
+  **deterministic end-to-end**, not merely valid — `WALRecoveryTests` asserts
+  exact structural equality (adjacency, levels, entry point, tombstones,
+  vectors, metadata) against the producing index, not just search validity.
+  The base format bumps to **`.pxkt` v3** (64-byte legacy header + section
+  table + `snapshotGeneration: UInt64`); `minSupportedVersion` stays 1, so v1/v2
+  files still load through the unchanged resident path, and the header binds
+  the WAL to its parent generation *and* dimension/metric so a stale or
+  mispaired sidecar is rejected with typed errors
+  (`PersistenceError.walGenerationMismatch` /
+  `.walDimensionMismatch` / `.walMetricMismatch`) rather than replayed into the
+  wrong base. `checkpoint(baseURL:walURL:durability:)` folds the WAL back into
+  a fresh base (atomic write, then `F_FULLFSYNC`) and resets the journal;
+  `needsCheckpoint(policy:)` reports when the configurable
+  `WALCheckpointPolicy` (WAL > 10% of base size, or > 10,000 ops by default) is
+  exceeded. Durability is a three-way dial —
+  `WALDurability.everyRecord` / `.everyBatch` (default) / `.manual` — with doc
+  comments stating the Darwin truth plainly: a plain `fsync(2)` reaches the
+  drive cache only, `F_FULLFSYNC` (always used at checkpoint commits) is what
+  forces media. Recovery is proven, not claimed: an in-process truncation
+  sweep across every byte boundary of the final record and every record
+  boundary of the WAL (`WALTruncationSweepTests`) plus an out-of-process
+  `SIGKILL` rig (`WALKillRecoveryTests`, `WALKillWriter` helper) assert
+  typed-errors-only, longest-valid-prefix recovery — 100/100 randomized-kill
+  recoveries opt-in via `PROXIMA_RUN_KILL_RIG`, with a 5-iteration smoke run in
+  every CI run. `save(to:)`/`load(from:)` are byte-identical to before and
+  still read/write v2; journaling is a strictly additive, opt-in surface.
+  **Store-level wiring (`VectorStore`/`HybridVectorStore`) is deferred, not
+  shipped** — `HybridVectorStore` froze the v1 store contract (CHA-107) and the
+  sparse leg has no WAL codec yet; this release is index-level only.
+- **Graph-aware filtered search extended to `QuantizedHNSWIndex` and
+  `ScalarQuantizedHNSWIndex` ([ADR-008 second
+  addendum](docs/adr/ADR-008-filtered-search.md)).** Both quantized indexes now
+  apply the search predicate inside the layer-0 beam — the strategy
+  `HNSWIndex` adopted in the first addendum — instead of post-filtering, ported
+  onto each index's own scoring path (ADC for PQ, dequantize for SQ) with the
+  same adaptive `ef` widening and `efCap` bound. `search(query:k:efSearch:filter:)`
+  (and PQ's `rerankDepth:` overload) is unchanged in shape, and unfiltered
+  queries are structurally untouched. On the PQ path with `retainOriginals`,
+  the filtered beam's target becomes `rerankDepth` rather than `k`, composing
+  with reranking exactly as post-filter did (only filter-passing candidates
+  count toward the depth). Measured recall floors from
+  `FilteredSearchSelectivityTests` (seeded 2000-vector/32d corpus, 20 seeded
+  queries) are honest about ADC error: pure-ADC recall@10 sits below the
+  full-precision 0.9 target (0.745 at ~10% selectivity, floor 0.65; 0.870 at
+  ~1%, floor 0.78), while rerank-enabled PQ and dequantized SQ both clear
+  ≥0.95 at both selectivities. A post-filter under-fill control
+  (`testQuantizedOnePercentControlPostFilterUnderfillsK`) proves the upgrade:
+  the retired post-filter pipeline under-fills `k` on every seeded query at
+  ~1% selectivity, while the graph-aware beam fills all 10. `SparseIndex`
+  keeps post-filter deliberately — it is a BM25 postings scan with no
+  `ef`-bounded beam to route through.
 - **Full-precision reranking for `QuantizedHNSWIndex`
   ([ADR-012](docs/adr/ADR-012-pq-reranking.md)).** `build(...)` gains an
   opt-in `retainOriginals: Bool = false` that keeps the Float32 vectors
@@ -37,8 +95,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   recall@10 ≥ 0.9 with a full `k` results at ~10% and ~1% predicate pass
   rates and exact set-and-order equality at ~0.1%, plus a control showing
   the retired post-filter pipeline returning 0–1 results at 1% selectivity.
-  `QuantizedHNSWIndex`, `ScalarQuantizedHNSWIndex`, and `SparseIndex` keep
-  the post-filter strategy for now.
+  (`QuantizedHNSWIndex` and `ScalarQuantizedHNSWIndex` have since adopted the
+  same strategy — see the second addendum entry above; `SparseIndex` keeps
+  post-filter.)
 - **`PQConfiguration.seed`** — seeds the PQ k-means centroid-initialization
   draws so training is reproducible: same seed + same vectors →
   byte-identical codebooks and codes (`PQDeterminismTests`). A
@@ -52,7 +111,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on any runtime Metal failure; `init?` returns `nil` where no GPU exists
   and a same-API stub compiles on non-Metal platforms. **Scope honesty: v1
   is a batch utility only — it is not wired into `HNSWIndex` build or
-  search, and no speedup numbers are claimed until measured.**
+  search, and no speedup numbers are claimed until measured** (since
+  measured — see the Metal NO-GO entry under Changed, below).
 - **On-device RAG example + tutorial.** `swift run OnDeviceRAG`
   ([`Examples/OnDeviceRAG/`](Examples/OnDeviceRAG/)) answers questions over
   20 built-in notes entirely on-device: NLEmbedding embeddings →
@@ -65,16 +125,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with the step-by-step *Build On-Device Semantic Search* tutorial — create
   an `HNSWIndex`, embed text with `NLEmbeddingProvider`, persist and reload
   — linked from the DocC landing page and Getting Started.
-- **[ADR-013](docs/adr/ADR-013-streaming-persistence.md) (Proposed):
-  streaming persistence.** A worked design — WAL incremental saves plus a
-  memory-mapped, demand-paged vector region — for saves proportional to the
-  change and corpora larger than RAM. Design only; **not implemented**, and
-  it makes no performance claims.
+- **[ADR-013](docs/adr/ADR-013-streaming-persistence.md) Stage 2 (paged
+  vector region): still proposed, design only.** Stage 1 (WAL incremental
+  saves) has since shipped — see above. Stage 2 — a memory-mapped,
+  demand-paged vector region for corpora larger than RAM — remains a worked
+  design, **not implemented**, and makes no performance claims.
 
 - **Apple-grade visual system** for all README/docs assets: SF Pro outline
   logo and restyled animated diagram family per `docs/assets/DESIGN.md`.
 
 ### Changed
+- **Metal insert-loop integration: measured NO-GO ([ADR-009
+  addendum](docs/adr/ADR-009-metal-backend.md)).** ADR-009 shipped
+  `MetalBatchDistance` as a standalone utility and deferred wiring it into the
+  `HNSWIndex` build path until someone measured it against vDSP at realistic
+  build shapes — that measurement now exists, and the answer is no. A new
+  `ProximaBench` subcommand, `insert-shape`, instruments the real `add()` path:
+  the insert loop contains **zero** batch-distance calls — 86–93% of build-time
+  distance evaluations are pairwise (heuristic neighbor selection and
+  pruning), and the largest batchable one-query-to-N unit is a single node
+  expansion (≤ `mMax0 = 32`), never a shape a GPU dispatch can amortize. A
+  `distance-kernel` GPU-vs-vDSP sweep (release build, N from 32 to 1M, d ∈
+  {384, 768}, cosine + euclidean, per-cell parity-checked) found vDSP (AMX)
+  winning at **every** measured N — ~215× faster at the real build shape
+  (N=32), still ~4.8× faster at N=1M, no crossover anywhere. `HNSWIndex` build
+  stays on vDSP unchanged; the "gated on measurement" deferral in ADR-009 is
+  now a settled decision, not open follow-up — reopenable only under the
+  concrete conditions the addendum lists (a batched-build design plus
+  zero-copy GPU dispatch, or hardware without AMX-class CPU matrix
+  acceleration). `docs/ROADMAP.md`'s GPU row is updated to match.
 - **`HNSWIndex.remove(id:)` repairs dangling incoming edges in
   O(in-degree).** A maintained reverse-adjacency map replaces the previous
   sweep of every layer's edge lists. The map is derived state: rebuilt from
@@ -94,6 +173,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the benchmark smoke and nightly-full jobs are deduplicated through a
   reusable `workflow_call` workflow
   ([`benchmark-core.yml`](.github/workflows/benchmark-core.yml)).
+
+### Fixed
+- **`QuantizedHNSWIndex` (PQHW) loader rejects a metadata-count/node-count
+  mismatch** with `PersistenceError.corruptedData`, mirroring the existing
+  SQHW guard. A crafted or corrupted file whose metadata array length
+  disagreed with `nodeCount` previously loaded without error and trapped on
+  the first `search()` or save-after-remove; a corruption regression test
+  proves the load returns before the fix and throws after
+  (`PersistenceCorruptionTests`).
+- **`ScalarQuantizer.encode` no longer spins on a non-finite vector
+  component.** A ±infinite component drove the overflow guard's
+  `scale.nextDown` step ~58.6M times (measured: 0.73s in a debug test run)
+  trying to step down from infinity toward a finite scale it could never
+  reach. Non-finite `maxAbs` now takes the existing zero-vector fallback
+  immediately, same as the zero and subnormal-underflow cases; regression-
+  pinned in `ScalarQuantizerTests`.
 
 ---
 
@@ -312,6 +407,13 @@ Hybrid BM25 + dense retrieval, product quantization, the `VectorStore` document 
 ## [1.0.0] — 2026-03-16
 
 Initial public release of ProximaKit — pure-Swift vector search for Apple platforms.
+
+> No tags predate v1.0.0. Pre-release development (tickets `PK-001`–`PK-013`:
+> package scaffolding, the `Vector` type, distance metrics, `BruteForceIndex`,
+> single- then multi-layer HNSW, compaction and recall benchmarks,
+> persistence, NLEmbedding/Vision/CoreML embedding providers, and the demo
+> app) merged straight to `main` with no version tags cut along the way —
+> v1.0.0 is both the first tag and this changelog's earliest entry.
 
 ### Core Library (`ProximaKit`)
 

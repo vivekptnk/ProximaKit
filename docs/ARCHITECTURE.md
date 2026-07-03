@@ -83,17 +83,24 @@ both paths).
 
 All dense indexes support **filtered search** (ADR-008): an optional
 `@Sendable (UUID) -> Bool` predicate, with default overloads supplied by
-protocol extension. Strategy differs by index: `HNSWIndex` applies the
-predicate **during** the layer-0 beam with adaptive `ef` widening (ADR-008
-addendum) — rejected nodes still route the beam toward matching regions but
-never occupy result slots, so selective filters still fill `k` (acceptance
-gated by `FilteredSearchSelectivityTests`). `QuantizedHNSWIndex`,
-`ScalarQuantizedHNSWIndex`, and `SparseIndex` remain **post-filter** — the
-beam traversal itself is filter-blind, and the predicate is applied only as
-results are materialized, so a selective filter can return fewer than `k`.
-`BruteForceIndex` is exact under any filter (full scan). `HybridIndex.search`
-applies the filter to both legs before fusion, inheriting each leg's
-strategy — graph-aware on its dense leg if that leg is an `HNSWIndex`.
+protocol extension. Every HNSW-graph index now shares one strategy:
+`HNSWIndex` (ADR-008 first addendum), `QuantizedHNSWIndex`, and
+`ScalarQuantizedHNSWIndex` (ADR-008 second addendum) all apply the predicate
+**during** the layer-0 beam with the same adaptive `ef` widening formula
+(`effectiveEf = clamp(ceil(target / rate), ef, efCap)`) — rejected nodes
+(tombstoned, checked first, or filter-failing) still route the beam toward
+matching regions but never occupy result slots, so selective filters still
+fill `k` (acceptance gated by `FilteredSearchSelectivityTests` on all three
+indexes). On `QuantizedHNSWIndex` with `retainOriginals` reranking
+(ADR-012), the beam's adaptive target is `rerankDepth`, not `k`, composing
+exactly as post-filter used to. `SparseIndex` remains **post-filter** — it is
+a BM25 inverted index with an unbounded postings scan, not an `ef`-bounded
+beam to route through, so the graph-aware mechanism doesn't structurally
+apply (rationale in the ADR-008 second addendum); a selective filter can
+still return fewer than `k` there. `BruteForceIndex` is exact under any
+filter (full scan). `HybridIndex.search` applies the filter to both legs
+before fusion, inheriting each leg's strategy — graph-aware on its dense leg
+regardless of which of the three HNSW-family indexes it wraps.
 
 `Heap` is an internal support type (beam search priority queues), not public API.
 
@@ -158,11 +165,20 @@ magic + version headers (ADR-003, ADR-010):
 
 | Format | Magic | Current / min version | Codec | Used by |
 |--------|-------|-----------------------|-------|---------|
-| `.pxkt` | `PXKT` | 2 / 1 | `PersistenceEngine` | `HNSWIndex`, `BruteForceIndex` |
+| `.pxkt` | `PXKT` | 2 / 1 (v3 max-readable¹) | `PersistenceEngine` | `HNSWIndex`, `BruteForceIndex` |
+| `.pxwal` (sidecar) | `PXWL` | 1 / 1 | `WALFormat` / `WALJournal` | `HNSWIndex`, opt-in journaling only |
 | `.pxbm` | `PXBM` | 2 / 1 | `SparseIndexPersistence` | `SparseIndex` |
 | quantized HNSW | `PQHW` | 2 / 1 | `QuantizedHNSWIndexPersistence` | `QuantizedHNSWIndex` |
 | scalar-quantized HNSW | `SQHW` | 1 | `ScalarQuantizedHNSWIndexPersistence` | `ScalarQuantizedHNSWIndex` |
 | PQ codebooks | `PQTT` | 1 | `ProductQuantizerPersistence` | `ProductQuantizer` |
+
+¹ `.pxkt` v3 (ADR-013) appends a fixed trailer — a per-section offset/length
+table plus a `snapshotGeneration: UInt64` — after the same v2 body. It is
+written **only** by the streaming-persistence `checkpoint(...)` API below;
+the legacy `save(to:)` keeps writing v2 byte-for-byte, unchanged. The
+sequential loader stops after the metadata section, so v3 files load through
+the identical resident path as v2 — only the WAL layer reads the trailer.
+`minSupportedVersion` stays 1: v1/v2 files load exactly as before.
 
 Shared invariants:
 
@@ -179,6 +195,85 @@ Shared invariants:
 - **Loading**: files are read with `.mappedIfSafe` to make the decode pass
   cheap, but loaded indexes are *fully resident* — floats are copied into
   Swift arrays during decode. See the 2026-06 correction in ADR-003.
+
+### Streaming persistence: WAL incremental saves (ADR-013 Stage 1, opt-in)
+
+The default path above (`save(to:)` / `load(from:)`) is untouched: every call
+still serializes and atomically rewrites the entire snapshot, exactly as
+before. `HNSWIndex` additionally exposes an **opt-in** journaled path so
+routine mutations no longer cost a full rewrite:
+
+```swift
+// Establish (or re-open) a journaled index bound to a base + sidecar file.
+let index = try await HNSWIndex.open(
+    baseURL: base, walURL: wal, durability: .everyBatch
+)
+try await index.add(vector, id: id)              // appends one WAL record
+if await index.needsCheckpoint() {
+    try await index.checkpoint(baseURL: base, walURL: wal)
+}
+```
+
+- **Journal binding and cross-check.** Each `.pxwal` header binds a
+  `parentGeneration: UInt64`, `dimension`, and metric raw value to the base
+  it was written against. `open` validates all three against the *loaded*
+  index: a generation mismatch throws `PersistenceError.walGenerationMismatch`
+  (stale or checkpointed-past WAL), a dimension mismatch throws
+  `.walDimensionMismatch`, and a metric mismatch throws `.walMetricMismatch`
+  — a crafted or mispaired sidecar is rejected before a single record
+  replays, rather than feeding mismatched-length vectors past `add`'s
+  dimension guard.
+- **Snapshot generation.** `.pxkt` v3's trailer carries the
+  `snapshotGeneration` a WAL is bound to (see the persistence-format table
+  above); `checkpoint` bumps it by one on every base rewrite.
+- **Deterministic replay.** An `add` record journals the vector's
+  **assigned HNSW level**, not just its UUID and components — insertion
+  normally draws the level from an RNG, so replaying a bare `add` would
+  produce a *valid but different* graph on every recovery. With the level
+  recorded, replay reproduces the exact producing state — asserted
+  structurally (adjacency, levels, entry point, tombstones, vectors,
+  metadata), not merely by search validity, in `WALRecoveryTests`.
+- **Checkpoint policy.** `checkpoint(baseURL:walURL:durability:)` compacts
+  first if any tombstones are pending, writes a fresh v3 base with the
+  generation bumped, `F_FULLFSYNC`s it, and resets the WAL to a new empty
+  journal bound to that generation.
+  `needsCheckpoint(policy:)` reports when to call it, per
+  `WALCheckpointPolicy(walBytesFractionOfBase: 0.10, maxOps: 10_000)` —
+  both bounds configurable; either being exceeded triggers a checkpoint.
+- **fsync levels — Darwin honesty.** `WALDurability` offers `.everyRecord`,
+  `.everyBatch` (default, one `fsync` per mutation's record), and `.manual`
+  (no `fsync` on append; a power loss before the next checkpoint can lose
+  the unsynced tail). On Darwin, `fsync(2)` only pushes writes to the
+  **drive cache**, not the physical media — these levels do **not**
+  guarantee media durability. Only `fcntl(_:F_FULLFSYNC)`, which
+  `checkpoint` always calls on the base file, forces a media write. Choose
+  the durability level knowing which guarantee it does and doesn't give.
+- **Recovery is prefix-tolerant, not silently lossy.** Records are
+  CRC-framed; the decoder stops at the first torn or bit-damaged record and
+  returns the longest intact prefix — a torn tail from a crash mid-append is
+  *expected* and recovers cleanly, never throwing. Only a damaged WAL
+  *header* or a stale generation throws. This is proven, not just designed:
+  an in-process sweep truncates at every byte boundary of the final record
+  and every record boundary of the whole WAL and asserts exact-prefix
+  recovery (`WALTruncationSweepTests`), and an out-of-process rig spawns a
+  writer process and `SIGKILL`s it at randomized points, reopening in the
+  parent and asserting the same semantics — a 5-iteration smoke runs in
+  every CI run, and a ≥100-iteration heavy class runs opt-in behind
+  `PROXIMA_RUN_KILL_RIG` (`WALKillRecoveryTests`).
+- **Scope, honestly stated.** This is **index-level only**. Wiring
+  journaling into `VectorStore` / `HybridVectorStore` is a deferred,
+  documented follow-up — `HybridVectorStore` freezes the `VectorStore` v1
+  contract (CHA-107), the sparse leg has no WAL codec, and none of the
+  Stage 1 acceptance criteria required it. Auto-compaction is suppressed
+  while a journal is attached (compaction changes `count` in a way an
+  append-only WAL can't replay) and deferred to the next `checkpoint`.
+  Checkpoint itself has one narrow crash window: the base rename is the
+  commit point, so a crash after it but before the WAL reset leaves a
+  complete new base beside a stale WAL — the next `open` surfaces that as a
+  typed `walGenerationMismatch`, not silent data loss (the new base already
+  holds every committed record). Stage 2 of ADR-013 (paged, on-demand vector
+  loading) remains **design-only** — nothing described in this section pages
+  vectors; every journaled index is still fully resident.
 
 ## Store Layer
 

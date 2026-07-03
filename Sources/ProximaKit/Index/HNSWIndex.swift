@@ -743,7 +743,7 @@ public actor HNSWIndex: VectorIndex {
     ///
     /// Crash-safety note (Stage 1): the base rename is the commit point. A
     /// crash after the new base is renamed but before the WAL is reset leaves a
-    /// complete new base beside a stale WAL; the next ``open(baseURL:walURL:)``
+    /// complete new base beside a stale WAL; the next ``open(baseURL:walURL:durability:)``
     /// surfaces that as a typed `walGenerationMismatch` (no silent loss, no
     /// corruption) — the operator can delete the stale WAL to recover, since
     /// the new base already holds every committed record.

@@ -18,12 +18,7 @@ This document tracks planned improvements across the library, benchmarking harne
 - Chebyshev (L∞) distance
 - Bray-Curtis dissimilarity
 - Mahalanobis distance (covariance- or inverse-covariance-initialised; search-only — not serialisable via `DistanceMetricType`, so indices built with it cannot be persisted)
-
-### Planned
-
-| Metric | Use Case | Status |
-|--------|----------|--------|
-| Jensen-Shannon divergence | Probability distribution comparison | Considering |
+- Jensen-Shannon distance (sqrt of base-2 JSD; serializable, DistanceMetricType raw value 7)
 
 All new metrics must satisfy the `DistanceMetric` protocol and pass the existing symmetry + triangle-inequality tests before merge.
 
@@ -89,10 +84,22 @@ Build-phase GPU latency is recorded in the ADR-009 addendum / the `distance-kern
 
 | Strategy | Recall | Status |
 |----------|--------|--------|
-| Graph-aware filter | Higher — selective filters still fill `k` | **Shipped** for `HNSWIndex` — predicate applied during the layer-0 beam with adaptive `ef` widening; acceptance gated by the selectivity suite (`FilteredSearchSelectivityTests`: recall@10 ≥ 0.9 with full `k` at ~10% and ~1% pass rates, exact set-and-order match at ~0.1%, plus a post-filter under-fill control) |
-| Post-filter | Lower (may return < k under selective filters) | **Shipped** — still the strategy on `QuantizedHNSWIndex`, `ScalarQuantizedHNSWIndex`, and `SparseIndex`; `BruteForceIndex` is exact under any filter; `HybridIndex` inherits graph-aware behavior on its dense leg |
+| Graph-aware filter | Higher — selective filters still fill `k` | **Shipped** for `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` — predicate applied during the layer-0 beam with the same adaptive `ef` widening formula on all three; acceptance gated by the selectivity suite (`FilteredSearchSelectivityTests`: HNSW recall@10 ≥ 0.9 with full `k` at ~10%/~1% pass rates and exact set-and-order match at ~0.1%; quantized-index recall floors at each selectivity published in `docs/BENCHMARKS.md`; a post-filter under-fill control on every index) |
+| Post-filter | Lower (may return < k under selective filters) | **Shipped, and now a deliberate choice rather than a gap** — the only index still using it is `SparseIndex` (a BM25 postings scan has no `ef`-bounded beam to route through, so the graph-aware mechanism doesn't structurally apply; rationale in the ADR-008 second addendum); `BruteForceIndex` is exact under any filter; `HybridIndex` inherits graph-aware behavior on its dense leg regardless of which HNSW-family index it wraps |
 
-Extending the graph-aware beam to the quantized indexes is the remaining gap. The original post-filter decision and the implemented upgrade are documented in [ADR-008](adr/ADR-008-filtered-search.md) (see its addendum).
+Graph-aware filtering now covers every HNSW-graph index — the "extend to the quantized indexes" gap this section used to call out is closed. The post-filter decision, the `HNSWIndex` upgrade, and the quantized-index upgrade (with its measured recall table) are documented in [ADR-008](adr/ADR-008-filtered-search.md) (see both addenda).
+
+---
+
+## Persistence
+
+### Streaming Persistence — WAL Incremental Saves, Stage 1 Shipped ([ADR-013](adr/ADR-013-streaming-persistence.md))
+
+Every save through the default API still rewrites the entire index snapshot — ADR-013 works out the arithmetic at ≈1.76 GB per save for a 1M × 384d index, regardless of how many vectors actually changed. **Stage 1 (the write-ahead log, "Option A") is shipped**: `HNSWIndex` now has an additive, opt-in journaled path — `open(baseURL:walURL:durability:)` / `checkpoint(baseURL:walURL:durability:)` — that appends a `.pxwal` mutation record (file-format arithmetic: ~1.6 KB per `add` at 384d, per ADR-013 — see `docs/BENCHMARKS.md`) instead of a full rewrite. The existing `save(to:)`/`load(from:)` API is untouched and byte-identical; journaling changes nothing for callers who don't opt in.
+
+Delivered: the `.pxwal` v1 sidecar (CRC-framed records, deterministic replay via journaled HNSW levels so recovered state is asserted byte-exact, not merely valid), `.pxkt` v3 (a section table plus a snapshot-generation binding; `minSupportedVersion` stays 1), a configurable checkpoint policy and fsync dial (`.everyRecord` / `.everyBatch` / `.manual`, with the Darwin `fsync`-vs-`F_FULLFSYNC` distinction documented rather than glossed over), and recovery proven rather than merely designed — an in-process truncation sweep across every WAL byte/record boundary plus an out-of-process `SIGKILL` rig (100/100 recoveries opt-in via `PROXIMA_RUN_KILL_RIG`, a 5-iteration smoke in every CI run). Full design in `docs/ARCHITECTURE.md`; the ADR's "Stage 1 implementation notes" addendum records the built format bytes and every documented deviation (store-level `VectorStore`/`HybridVectorStore` wiring deferred; auto-compaction suppressed while a journal is attached; one narrow checkpoint crash window that surfaces as a typed error, never silent data loss).
+
+**Stage 2 (paged, on-demand vector loading over a memory-mapped region, "Option C") remains design-only.** Nothing shipped pages vectors — every journaled or plain-loaded index today is still fully resident. Stage 2 rides the same `.pxkt` v3 bump Stage 1 already forced (its section table gives Stage 2 an offset to align the vector section to a page boundary without another format bump). Estimated at ~2–3 additional engineering weeks per the ADR's cost breakdown.
 
 ---
 
@@ -111,12 +118,12 @@ Extending the graph-aware beam to the quantized indexes is the remaining gap. Th
 |-----|-------|--------|
 | ADR-006 | Lumen integration (ProximaKit as KV-store backend) | Draft (in `docs/adr/`) |
 | ADR-007 | INT8 scalar quantization: dequantization policy + codec format | Accepted |
-| ADR-008 | Filtered search: post-filter decision + graph-aware addendum (implemented for `HNSWIndex`) | Accepted (retrospective + addendum) |
+| ADR-008 | Filtered search: post-filter decision + graph-aware addenda, now implemented for `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` (`SparseIndex` stays post-filter by design) | Accepted (retrospective + two addenda; first amended by a correction) |
 | ADR-009 | Metal batch distance — v1 shipped a standalone build-phase utility (`MetalBatchDistance`); insert-loop integration was benchmarked and settled **NO-GO** (vDSP wins at every measured N, no crossover — see the ADR-009 addendum), so the `DistanceBackend` protocol stays unextracted | Accepted (amended) |
 | ADR-010 | Serialisation format evolution policy (version field already shipped) | Accepted |
 | ADR-011 | Product quantization codec format (`PQTT` / `PQHW`, ADC, K=256) | Accepted (retrospective) |
 | ADR-012 | Full-precision reranking for quantized HNSW (`retainOriginals` + `rerankDepth`, PQHW v2) | Accepted |
-| ADR-013 | Streaming persistence: WAL incremental saves + paged vector region | Proposed (design only — not implemented) |
+| ADR-013 | Streaming persistence: WAL incremental saves (Stage 1) + paged vector region (Stage 2) | Accepted — Stage 1 (WAL) shipped; Stage 2 (paged vectors) remains design-only |
 
 ---
 
@@ -139,7 +146,8 @@ The `ProximaDemoApp` (macOS SwiftUI) ships with the repo and demonstrates semant
 
 Flagged during the documentation audit as out of scope for the initial documentation push but tracked here for completeness:
 
-- CONTRIBUTING.md — polish onboarding flow, add `scripts/check-imports.sh` usage note
+- CONTRIBUTING.md — **shipped** (post-1.5.0): onboarding flow polish
+- `scripts/check-imports.sh` guard — open idea: enforce ProximaKit Foundation+Accelerate-only imports (not yet created)
 - CHANGELOG.md — backfill pre-v1.0 history (Keep-a-Changelog format already adopted)
 - Demo app README — expand with CoreML model install instructions
 - DocC Getting Started tutorial — **shipped** (post-1.5.0): interactive "Build On-Device Semantic Search" tutorial in the docc catalog, linked from the landing page and Getting Started

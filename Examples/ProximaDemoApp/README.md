@@ -74,26 +74,39 @@ open ProximaDemoApp.xcodeproj
 ### Startup
 
 1. `SearchEngine.buildIndex()` checks for a persisted index on disk.
-2. If none found, it embeds 46 sample sentences (see `SampleData.swift`) using `NLEmbeddingProvider` and builds an `HNSWIndex`.
+2. If none found, it embeds 46 sample sentences (see `SampleData.swift`) using the selected embedding provider — `CoreMLEmbeddingProvider` if a model is found (see below), otherwise `NLEmbeddingProvider` — and builds an `HNSWIndex`.
 3. The index is saved to `~/Library/Application Support/ProximaDemoApp/` for next launch.
 
 ### Search
 
 1. User types a query in the search bar.
-2. The query is embedded using the same `NLEmbeddingProvider`.
+2. The query is embedded using the same provider that built the index (whichever `setupEmbedder()` selected at startup).
 3. `HNSWIndex.search(query:k:)` returns the nearest neighbors.
 4. Results are color-coded by distance: green (<0.55), orange (<0.68), red (>0.68).
 
 ### CoreML Model (Optional)
 
-The app automatically looks for a MiniLM-L6-v2 CoreML model in these locations:
+By default the app embeds with `NLEmbeddingProvider` — it ships with the OS and needs zero setup. Drop in a converted MiniLM model and `SearchEngine` switches to `CoreMLEmbeddingProvider` for higher-quality 384-dimensional embeddings automatically, with no rebuild.
 
-1. `Models/` directory in the ProximaKit repo root
-2. `~/Documents/ProximaKit-Models/`
-3. App bundle resources
-4. App's Application Support directory
+**Where the app looks.** `SearchEngine.findModelFiles()` scans, in order, for a file named exactly `MiniLM-L6-v2.mlmodel` *and* a `vocab.txt` sitting together in the same directory:
 
-If found, it uses `CoreMLEmbeddingProvider` for higher-quality 384-dimensional embeddings. Otherwise it falls back to `NLEmbeddingProvider`.
+1. The `Models/` directory at the ProximaKit repo root — the easiest option when running via `swift run ProximaDemo` or Xcode against a source checkout.
+2. The current working directory, or its `Models/` subdirectory, when launching the built executable directly.
+3. The directory containing the built `.app` bundle, or its `Models/` subdirectory — drop the two files next to a built app.
+
+Both files must be present together. If either is missing, the app falls back to `NLEmbeddingProvider` silently — no error, no crash. Check which provider is active in the sidebar: it reads `"CoreML (MiniLM-L6-v2, 384d)"` or `"NLEmbedding (…d) — add Models/ for better quality"`.
+
+**Getting a model.** ProximaKit doesn't ship a converted model or a conversion script — bring your own with [coremltools](https://github.com/apple/coremltools), the same tool the root [`README.md`](../../README.md#use-a-custom-ai-model-coreml) points to:
+
+```bash
+pip install coremltools transformers torch
+```
+
+Convert `sentence-transformers/all-MiniLM-L6-v2` (or any BERT-family sentence-transformer) to a Core ML model whose inputs are `input_ids` and `attention_mask` (`MLMultiArray<Int32>`) and whose output is a float `MLMultiArray` embedding — that is the exact contract `CoreMLEmbeddingProvider` expects (see its doc comment in `Sources/ProximaEmbeddings/CoreMLEmbeddingProvider.swift`). Save the result as `MiniLM-L6-v2.mlmodel`, and save the tokenizer's vocabulary as `vocab.txt` (one WordPiece token per line — `WordPieceTokenizer` reads it directly; `AutoTokenizer.save_vocabulary()` in the `transformers` library writes this format). Place both files together in one of the three locations above.
+
+`CoreMLEmbeddingProvider` itself is more flexible than the demo's auto-discovery — its `init(modelAt:vocabURL:)` also accepts a `.mlpackage`, and `init(compiledModelURL:vocabURL:)` takes a pre-compiled `.mlmodelc`. The demo specifically looks for the legacy `.mlmodel` extension under that exact filename, so if you only have a `.mlpackage`, either re-export to `.mlmodel` or use `CoreMLEmbeddingProvider` directly in your own code instead of relying on the demo's file scan.
+
+**Planned, not yet built:** an in-app model browser that lists models from the HuggingFace Hub and downloads a `.mlpackage` without leaving the app is tracked in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) as a demo-app improvement. Today, installing a model means placing the two files yourself as described above.
 
 ---
 

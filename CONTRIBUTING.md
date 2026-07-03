@@ -32,6 +32,21 @@ swift test --skip RecallBenchmarkTests
 swift test
 ```
 
+### Run Lint
+
+CI pins an exact SwiftLint version — a floating `brew install swiftlint` tracks latest, and a future default-rule change could fail the strict gate with no code change on your end:
+
+```bash
+# Match CI's pin exactly (see .github/workflows/ci.yml, `lint` job):
+gh release download 0.63.2 --repo realm/SwiftLint --pattern portable_swiftlint.zip --output /tmp/swiftlint.zip
+unzip -o /tmp/swiftlint.zip -d /tmp/swiftlint
+sudo cp /tmp/swiftlint/swiftlint /usr/local/bin/swiftlint
+
+swiftlint lint --strict
+```
+
+[`.swiftlint.yml`](.swiftlint.yml) is a ratchet, not a cleanup mandate: it disables a fixed list of rules that the codebase violated at baseline (formatting, naming, force-unwrap, etc. — see the file's header comment), but every other default rule runs `--strict` in CI, so new code cannot introduce new classes of violation. Don't add new entries to `disabled_rules` to make an in-progress PR pass — fix the violation instead.
+
 ### Run the Demo
 
 ```bash
@@ -57,20 +72,27 @@ ProximaKit/
 ├── Sources/
 │   ├── ProximaKit/             # Core: vectors, indices, persistence
 │   │   ├── Distance/           # DistanceMetric protocol + implementations
-│   │   ├── Index/              # VectorIndex protocol, HNSW, BruteForce
-│   │   ├── Persistence/        # Binary save/load with mmap
+│   │   ├── Index/              # VectorIndex protocol, HNSW, BruteForce, quantized/hybrid/sparse indexes
+│   │   ├── Quantization/       # Product + scalar quantization codecs
+│   │   ├── Persistence/        # Binary save/load with mmap, WAL sidecar journaling
 │   │   ├── Query/              # SearchResult type
-│   │   └── Documentation.docc/ # DocC catalog
+│   │   ├── Store/              # VectorStore / HybridVectorStore document-level API
+│   │   └── Documentation.docc/ # DocC catalog + interactive tutorials
 │   ├── ProximaEmbeddings/      # Text/image → vector providers
 │   └── ProximaDemo/            # CLI demo executable
 ├── Tests/
 │   ├── ProximaKitTests/        # Core unit + benchmark tests
 │   └── ProximaEmbeddingsTests/ # Embedding provider tests
+├── Benchmarks/                 # Separate SPM package: cross-library recall/latency harness
 ├── Examples/
-│   └── ProximaDemoApp/         # macOS SwiftUI demo app
+│   ├── ProximaDemoApp/         # macOS/iOS/visionOS SwiftUI demo app
+│   └── OnDeviceRAG/            # CLI RAG example (see docs/RAG-TUTORIAL.md)
 ├── docs/
 │   ├── ARCHITECTURE.md         # System design document
 │   ├── BENCHMARKS.md           # Performance methodology
+│   ├── ROADMAP.md              # Planned work + ADR backlog
+│   ├── HYBRID.md               # BM25 + dense fusion guide
+│   ├── RAG-TUTORIAL.md         # On-device RAG walkthrough
 │   └── adr/                    # Architecture Decision Records
 ├── Models/                     # CoreML model files (not tracked)
 └── Package.swift
@@ -87,12 +109,14 @@ ProximaKit/
 - **Imports**: Group by (1) Foundation/Accelerate, (2) ProximaKit modules, (3) Apple frameworks, separated by blank lines.
 - **Access control**: Default to `internal`. Use `public` only for the intended API surface. Use `private` for implementation details.
 
-### Module Rules (Enforced)
+### Module Rules
 
 | Module | May Import | Must Not Import |
 |--------|------------|-----------------|
 | `ProximaKit` | Foundation, Accelerate | UIKit, SwiftUI, CoreML, NaturalLanguage, Vision |
 | `ProximaEmbeddings` | Foundation, ProximaKit, CoreML, NaturalLanguage, Vision | UIKit, SwiftUI |
+
+Enforcement today is manual: reviewers check the import list on every PR that touches `Sources/`. `import CoreML` inside `ProximaKit` would still compile — Apple's system frameworks are available to any target on the SDK, `Package.swift` declares no per-target framework linkage that would reject it — so this table is a convention the build does not enforce for you. There is no automated import-boundary linter in this repository — no `scripts/check-imports.sh` or SwiftLint custom rule exists to catch a violation before review. If you add one, wire it into the `lint` job in `.github/workflows/ci.yml` and update this section to point at it.
 
 ### Concurrency
 
@@ -198,11 +222,24 @@ What becomes easier/harder?
 |----------|--------|--------|
 ```
 
-Current ADRs:
+### Prerequisite for Quantization, GPU, and Filtered-Search PRs
+
+For these three areas specifically, an ADR with an **accepted** decision is a prerequisite for a PR — open the ADR (or point to an existing accepted one that already covers your change) before writing code, per [`docs/ROADMAP.md`](docs/ROADMAP.md#contributing). Other areas don't require an ADR up front, but still get one for any decision that would be expensive to reverse later.
+
+Current ADRs (13 — see `docs/adr/` for full text):
 - [ADR-001](docs/adr/ADR-001-accelerate-for-math.md): Accelerate/vDSP for all vector math
 - [ADR-002](docs/adr/ADR-002-actor-isolation.md): Actor isolation for thread safety
 - [ADR-003](docs/adr/ADR-003-binary-persistence.md): Custom binary persistence format
 - [ADR-004](docs/adr/ADR-004-hnsw-heuristic-selection.md): Heuristic neighbor selection
+- [ADR-005](docs/adr/ADR-005-benchmark-methodology.md): Cross-library benchmark methodology (FAISS/ScaNN comparison harness)
+- [ADR-006](docs/adr/ADR-006-lumen-integration.md): ProximaKit ↔ Lumen RAG integration design (Draft — not yet accepted)
+- [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md): INT8 scalar quantization (dequantization policy + codec format)
+- [ADR-008](docs/adr/ADR-008-filtered-search.md): Post-filter strategy for filtered search, plus the graph-aware addendum
+- [ADR-009](docs/adr/ADR-009-metal-backend.md): Metal backend for batch distance (v1 shipped a standalone build-phase utility; insert-loop integration measured and settled NO-GO)
+- [ADR-010](docs/adr/ADR-010-format-evolution.md): Serialization format evolution policy
+- [ADR-011](docs/adr/ADR-011-pq-codec.md): Product quantization codec format
+- [ADR-012](docs/adr/ADR-012-pq-reranking.md): Full-precision reranking for quantized HNSW
+- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — WAL incremental saves (Stage 1 accepted and shipped); on-demand paged vectors (Stage 2) remains design-only
 
 ---
 
@@ -233,6 +270,7 @@ Before submitting, verify:
 
 - [ ] `swift build` succeeds with no warnings
 - [ ] `swift test --skip RecallBenchmarkTests` passes
+- [ ] `swiftlint lint --strict` passes (pinned to 0.63.2, matching CI — see [Run Lint](#run-lint))
 - [ ] New public APIs have `///` documentation
 - [ ] New features have corresponding tests
 - [ ] No new external dependencies added to `ProximaKit`

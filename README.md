@@ -33,10 +33,10 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 | **Hybrid retrieval** | BM25 + dense fusion (`HybridIndex`, `HybridVectorStore`) with Reciprocal Rank Fusion or weighted sum |
 | **Product quantization** | 32× vector compression with asymmetric distance computation, plus *(new)* opt-in exact reranking — retain the originals and `search` re-scores the top ADC candidates at full precision (`QuantizedHNSWIndex`, [ADR-011](docs/adr/ADR-011-pq-codec.md), [ADR-012](docs/adr/ADR-012-pq-reranking.md)) |
 | **INT8 scalar quantization** | ~4× less vector memory, **works with any metric**, no training phase (`ScalarQuantizedHNSWIndex`, [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md)) |
-| **Filtered search** | `@Sendable` predicate on every index and store; *(new)* graph-aware on `HNSWIndex` — the layer-0 beam applies the filter during traversal with adaptive widening, so selective filters still fill `k` ([ADR-008](docs/adr/ADR-008-filtered-search.md)) |
-| **GPU batch distance (v1)** *(new)* | `MetalBatchDistance` — standalone one-query-to-N squared-L2/cosine utility with automatic vDSP fallback. Not yet wired into index build or search; no speedup claimed until measured ([ADR-009](docs/adr/ADR-009-metal-backend.md)) |
+| **Filtered search** | `@Sendable` predicate on every index and store; graph-aware on `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` — the layer-0 beam applies the filter during traversal with adaptive widening, so selective filters still fill `k` (`SparseIndex` keeps post-filter — no beam to route through) ([ADR-008](docs/adr/ADR-008-filtered-search.md)) |
+| **GPU batch distance (v1)** | `MetalBatchDistance` — standalone one-query-to-N squared-L2/cosine utility with automatic vDSP fallback. Measured **NO-GO** on wiring it into `HNSWIndex` build/search — vDSP (AMX) wins at every tested scale, no crossover ([ADR-009 addendum](docs/adr/ADR-009-metal-backend.md)) |
 | **8 distance metrics** | Cosine, Euclidean, dot product, Manhattan, Hamming, Chebyshev, Bray-Curtis, Mahalanobis — all vDSP-accelerated where it pays |
-| **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)) |
+| **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)); *(new)* opt-in WAL incremental saves make mutations O(change) instead of O(corpus) ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
 | **Embedding providers** | Apple NaturalLanguage, Vision, and bring-your-own CoreML (BERT/MiniLM via WordPiece tokenizer) |
 | **Concurrency** | Every index is a Swift `actor`; `Sendable` API surface, built with `StrictConcurrency` |
 | **Proof** | 400+ tests, recall floors enforced in CI, cross-library benchmark harness vs FAISS/ScaNN running nightly |
@@ -272,7 +272,7 @@ Need to restrict results — say, to one user's documents? Every index takes a f
 let mine = await index.search(query: query, k: 3) { allowedIDs.contains($0) }
 ```
 
-On `HNSWIndex` the predicate is applied *during* graph traversal (with adaptive beam widening), so even highly selective filters return a full `k` results instead of under-filling ([ADR-008](docs/adr/ADR-008-filtered-search.md)).
+On `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` the predicate is applied *during* graph traversal (with adaptive beam widening), so even highly selective filters return a full `k` results instead of under-filling. `SparseIndex` (BM25) keeps a post-filter — it has no `ef`-bounded beam to route through, so under-filling doesn't apply to it the same way ([ADR-008](docs/adr/ADR-008-filtered-search.md)).
 
 
 ## Hybrid Search: Meaning + Keywords
@@ -334,6 +334,23 @@ let loaded = try HNSWIndex.load(from: fileURL)
 ```
 
 The format carries a magic number and version field; loaders validate graph structure before trusting it and throw typed `PersistenceError`s on corrupt input instead of crashing. Evolution policy: [ADR-010](docs/adr/ADR-010-format-evolution.md).
+
+### Incremental Saves (WAL)
+
+Full re-saves cost O(corpus) — fine occasionally, expensive on every mutation. `HNSWIndex` has an opt-in write-ahead log that makes saves O(change) instead:
+
+```swift
+// baseURL must already exist — create it with save(to:) or an initial checkpoint
+let index = try await HNSWIndex.open(baseURL: baseURL, walURL: walURL, durability: .everyBatch)
+
+try await index.add(newVector, id: UUID())  // appends a ~1.6 KB WAL record, not a full re-save
+
+if await index.needsCheckpoint() {
+    try await index.checkpoint(baseURL: baseURL, walURL: walURL)  // folds the WAL back into a fresh base
+}
+```
+
+Recovery is prefix-safe: a crash mid-write truncates to the longest valid WAL record and never corrupts the base — proven with an out-of-process `SIGKILL` rig, not just asserted in-process. `save(to:)`/`load(from:)` above are untouched; journaling is additive and opt-in. On Darwin, a plain `fsync(2)` only reaches the drive cache — checkpoint commits force media with `F_FULLFSYNC`, and the `durability` dial (`.everyRecord` / `.everyBatch` / `.manual`) documents exactly what each level guarantees. Store-level wiring (`VectorStore`/`HybridVectorStore`) isn't shipped yet — this is index-level only. Design and Stage 1 notes: [ADR-013](docs/adr/ADR-013-streaming-persistence.md).
 
 
 ## Use a Custom AI Model (CoreML)
@@ -543,12 +560,13 @@ try await index.add(newVector, id: UUID())
 | `VectorStore` | Document-level layer: chunks, metadata, saves. |
 | `HybridVectorStore` | Same, over a hybrid index. |
 | `ScalarQuantizer` / `ProductQuantizer` | The codecs behind the quantized indices. |
-| `MetalBatchDistance` | Standalone GPU one-query-to-N batch distances (vDSP fallback; not used by the indices yet). |
+| `MetalBatchDistance` | Standalone GPU one-query-to-N batch distances (vDSP fallback). Measured NO-GO on index integration — not used by the indices. |
 | `CosineDistance` … `MahalanobisDistance` | The 8 distance metrics. |
 | `SearchResult` | Result: `id`, `distance`, `metadata`. |
 | `HNSWConfiguration` | Tuning: `m`, `efConstruction`, `efSearch`, `autoCompactionThreshold`, `levelSeed`. |
 | `BM25Configuration` | Tuning: `k1`, `b`, `autoCompactionThreshold`. |
 | `PersistenceEngine` | Versioned binary save/load with memory mapping. |
+| `WALDurability` / `WALCheckpointPolicy` | Opt-in `HNSWIndex` journaling: fsync dial and checkpoint-trigger policy for `open`/`checkpoint`. |
 
 ### ProximaEmbeddings (content to vectors)
 
@@ -575,12 +593,12 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-004](docs/adr/ADR-004-hnsw-heuristic-selection.md): Why heuristic neighbor selection
 - [ADR-005](docs/adr/ADR-005-benchmark-methodology.md): Cross-library benchmark methodology
 - [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md): INT8 scalar quantization codec
-- [ADR-008](docs/adr/ADR-008-filtered-search.md): Filtered search (post-filter, plus the graph-aware addendum for `HNSWIndex`)
-- [ADR-009](docs/adr/ADR-009-metal-backend.md): Metal batch distance — v1 scoped to a standalone utility
+- [ADR-008](docs/adr/ADR-008-filtered-search.md): Filtered search (post-filter, plus the graph-aware addenda now covering `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex`; `SparseIndex` stays post-filter)
+- [ADR-009](docs/adr/ADR-009-metal-backend.md): Metal batch distance — v1 scoped to a standalone utility; insert-loop integration measured and decided NO-GO
 - [ADR-010](docs/adr/ADR-010-format-evolution.md): Persistence format evolution policy
 - [ADR-011](docs/adr/ADR-011-pq-codec.md): Product quantization codec
 - [ADR-012](docs/adr/ADR-012-pq-reranking.md): Full-precision reranking for quantized HNSW
-- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence (proposed — design only, not implemented)
+- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — Stage 1 (WAL incremental saves) shipped; Stage 2 (paged vectors) still design only
 
 
 ## Building & Testing
@@ -608,9 +626,9 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
 
 | Area | Status |
 |------|--------|
-| Graph-aware filtered search — higher recall under selective filters | **Shipped** for `HNSWIndex` ([ADR-008 addendum](docs/adr/ADR-008-filtered-search.md)); quantized and sparse indexes still post-filter |
-| GPU acceleration | v1 shipped: `MetalBatchDistance` batch utility ([ADR-009](docs/adr/ADR-009-metal-backend.md)). Index build/search integration still planned — gated on measured speedups |
-| Streaming persistence — incremental saves (WAL) + paged vectors | Proposed, design only ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
+| Graph-aware filtered search — higher recall under selective filters | **Shipped** for `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` ([ADR-008 addenda](docs/adr/ADR-008-filtered-search.md)); `SparseIndex` stays post-filter (no beam to route through) |
+| GPU acceleration | v1 shipped: `MetalBatchDistance` batch utility ([ADR-009](docs/adr/ADR-009-metal-backend.md)). Index build/search integration measured and decided **NO-GO** — vDSP (AMX) wins at every tested scale, no crossover |
+| Streaming persistence — incremental saves (WAL) + paged vectors | Stage 1 (WAL incremental saves) **shipped** ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)); Stage 2 (paged vectors) still design only |
 | Jensen-Shannon divergence metric | Considering |
 | Background HNSW compaction policy | Planned |
 | Demo app — CoreML model download UI, benchmark tab, result export | Planned |

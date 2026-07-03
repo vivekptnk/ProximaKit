@@ -239,6 +239,31 @@ See [ADR-003: Binary Persistence](adr/ADR-003-binary-persistence.md) for the for
 | JSON (rejected) | ~60 MB | ~3s |
 | Custom binary | ~58 MB | ~50ms (mmap) |
 
+### Incremental Saves (WAL, opt-in) — ADR-013 Stage 1
+
+The Save/Load Roundtrip numbers above describe the default `save(to:)` /
+`load(from:)` path, which is **unchanged**: every save still serializes and
+rewrites the full snapshot, and every load is fully resident. `HNSWIndex`
+additionally exposes an opt-in journaled path
+(`open(baseURL:walURL:durability:)` / `checkpoint(baseURL:walURL:durability:)`,
+see `docs/ARCHITECTURE.md`) that appends one `.pxwal` record per `add`/`remove`
+instead of rewriting the file.
+
+No benchmark harness has timed the journaled path yet — nothing below is a
+measurement. The only number is **file-format arithmetic**, derived from the
+record layout in `WALFormat.swift` (ADR-013), not a run:
+
+| Quantity | Arithmetic | Bytes |
+|---|---|---|
+| `add` payload, 384d, no metadata | opcode (1) + UUID (16) + level `Int32` (4) + vector (384 × 4) + metadata-length `UInt32` (4) | 1 + 16 + 4 + 1,536 + 4 = **1,561** |
+| Record frame overhead | `[payloadLength: UInt32][crc32: UInt32]` | 8 |
+| **Total per journaled `add`, 384d** | payload + frame | **1,569 bytes** |
+
+That is arithmetic against a fixed record shape, not a measured write
+latency, checkpoint cost, or replay cost — none of those have been run under
+the [ADR-005](adr/ADR-005-benchmark-methodology.md) harness. Do not read the
+byte count above as a throughput or latency claim.
+
 ---
 
 ## INT8 Scalar Quantization
@@ -301,6 +326,32 @@ The observed bands are documented in the test sources next to the thresholds; th
 ```bash
 swift test --filter PQRerankTests
 swift test --filter PQDeterminismTests
+```
+
+---
+
+## Filtered Search Recall — Graph-Aware Beam on Quantized Indexes
+
+**What it measures:** Recall@10 of `QuantizedHNSWIndex` (PQ, both pure-ADC and reranked) and `ScalarQuantizedHNSWIndex` (SQ) filtered search against `BruteForceIndex`-filtered ground truth, at three predicate selectivities, now that both indexes have adopted the graph-aware layer-0 beam `HNSWIndex` shipped first ([ADR-008](adr/ADR-008-filtered-search.md) addendum → second addendum).
+
+All numbers below are **asserted test thresholds** (the floors) alongside the **observed** point values from a seeded, reproducible run — not point measurements presented as guarantees. Fixture (`FilteredSearchSelectivityTests`): 2,000 vectors, 32d, Euclidean, `m = 16`, `efConstruction = 200`, `efSearch = 50`, `k = 10`, 20 seeded queries (`SeededRandom` data + `levelSeed` topology); PQ `subspaceCount = 8`, `trainingIterations = 20`, training `seed` pinned; SQ metric Euclidean. Debug and release runs produced byte-identical recall.
+
+| Selectivity (live matches) | PQ pure-ADC recall@10 | PQ rerank recall@10 | SQ recall@10 | Fills `k`? |
+|---|---|---|---|---|
+| ~10% (200) | 0.745 (asserted floor ≥ 0.65) | 0.995 (asserted floor ≥ 0.95) | 1.000 (asserted floor ≥ 0.95) | yes, all three |
+| ~1% (20) | 0.870 (asserted floor ≥ 0.78) | 1.000 (asserted floor ≥ 0.95) | 1.000 (asserted floor ≥ 0.95) | yes, all three |
+| ~0.1% (2 matches) | exact 2-vector matching set | exact set, brute-force order | exact set | returns `min(k, live matches)` = 2 |
+
+The floors sit deliberately below the observed values, and below `HNSWIndex`'s full-precision 0.9 recall target: pure-ADC PQ distances are 32×-lossy and reorder near-ties, so its floor is set well under that band; reranking (ADR-012) recovers to the full-precision band; SQ (only ~4×-lossy) sits just under it.
+
+**Under-fill control (the regression this upgrade fixes):** emulating the retired post-filter pipeline (predicate applied after the unfiltered `ef = 50` beam) under-fills `k` on every seeded query at ~1% selectivity for both quantized indexes (`testQuantizedOnePercentControlPostFilterUnderfillsK`), while the graph-aware beam fills all 10 on the same fixture.
+
+No latency figures are published here or in the ADR: the graph-aware beam trades latency for fill under selective filters via adaptive `ef` widening (bounded by `efCap`), and no equal-latency comparison against post-filter exists (see the ADR-008 Correction). Mechanism details and the `HNSWIndex`-only first-addendum numbers are in [ADR-008](adr/ADR-008-filtered-search.md).
+
+**Run the filtered-search selectivity tests:**
+
+```bash
+swift test --filter FilteredSearchSelectivityTests
 ```
 
 ---
