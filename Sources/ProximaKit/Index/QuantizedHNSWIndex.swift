@@ -74,6 +74,35 @@ public actor QuantizedHNSWIndex {
     // layers[l][n] = neighbor indices for node n on layer l.
 
     var layers: [[[Int]]]
+
+    /// Reverse adjacency: `inEdges[l][n]` is the set of nodes whose layer-`l`
+    /// neighbor list contains `n` — the exact transpose of `layers`. Maintained
+    /// so `remove(id:)` can delete every edge pointing INTO a node in
+    /// O(in-degree) instead of sweeping every edge list on the layer (O(E_l)).
+    ///
+    /// Derived state: NOT persisted (the on-disk format is unchanged, ADR-010)
+    /// and NOT built in the memberwise initializer. It is materialized lazily
+    /// by `ensureInEdges()` at first use — mirroring `HNSWIndex`, whose
+    /// transposing `init(restoring:)` only ever receives loader-validated
+    /// layers. The quantized memberwise initializer, by contrast, is the
+    /// documented entry point for arbitrary components (the persistence
+    /// corruption suite constructs indexes whose adjacency is deliberately out
+    /// of bounds to prove `load(from:)` rejects the saved bytes with a typed
+    /// `PersistenceError`). Transposing eagerly in the initializer would index
+    /// `layers` BEFORE that load-time gate and turn the contracted typed error
+    /// into a process trap. Lazily, the map is only ever built after the graph
+    /// is known well-formed: post-`build` (graph from a healthy `HNSWIndex`)
+    /// or post-`load` (every neighbor bounds-checked before construction).
+    ///
+    /// `nil` means "not yet materialized" — an Optional rather than an empty
+    /// array + flag because it is the honest representation AND because
+    /// reflection-based storage vetting (the scalar twin's
+    /// no-retained-vectors test) would false-positive on an empty array:
+    /// Swift's runtime lets an empty `[[Set<Int>]]` conditionally cast to any
+    /// array type, `[Vector]` included. Once materialized, `remove(id:)`
+    /// maintains the map incrementally.
+    private var inEdges: [[Set<Int>]]?
+
     var nodeLevels: [Int]
     var entryPointNode: Int?
     var maxLevel: Int
@@ -169,6 +198,11 @@ public actor QuantizedHNSWIndex {
         self.hnswConfig = hnswConfig
         self.quantizer = quantizer
         self.layers = layers
+        // `inEdges` is deliberately NOT built here: this initializer accepts
+        // arbitrary components (the corruption suite feeds it out-of-bounds
+        // adjacency to prove load(from:) throws typed), so any indexing of
+        // `layers` would trap before the load-time validation gate. The map
+        // is materialized lazily by `ensureInEdges()` — see its property doc.
         self.nodeLevels = nodeLevels
         self.entryPointNode = entryPointNode
         self.maxLevel = maxLevel
@@ -177,6 +211,33 @@ public actor QuantizedHNSWIndex {
         self.uuidToNode = uuidToNode
         self.metadata = metadata
         self.originals = originals
+    }
+
+    /// Builds the reverse-adjacency transpose of a layer set: for every edge
+    /// `u → v` on layer `l`, records `u` in the in-set of `v`. Strict by
+    /// design — an out-of-bounds neighbor traps, so callers must only pass
+    /// well-formed layers (see `ensureInEdges()`); tolerating bad indices here
+    /// would mask corruption instead of surfacing it at the load gate.
+    private static func transpose(of layers: [[[Int]]]) -> [[Set<Int>]] {
+        var result: [[Set<Int>]] = layers.map { Array(repeating: Set<Int>(), count: $0.count) }
+        for (l, layer) in layers.enumerated() {
+            for (from, neighbors) in layer.enumerated() {
+                for to in neighbors {
+                    result[l][to].insert(from)
+                }
+            }
+        }
+        return result
+    }
+
+    /// Materializes `inEdges` from `layers` on first use. Every caller sits
+    /// behind the graph-validity gates — `build(...)` produces a well-formed
+    /// graph and `load(from:)` bounds-checks every neighbor before
+    /// constructing the index — so the strict transpose is safe here even
+    /// though it is not safe in the memberwise initializer.
+    private func ensureInEdges() {
+        guard inEdges == nil else { return }
+        inEdges = Self.transpose(of: layers)
     }
 
     // ── Build ────────────────────────────────────────────────────────
@@ -490,14 +551,62 @@ public actor QuantizedHNSWIndex {
     /// Removes a vector by its ID (tombstone — graph edges are disconnected).
     ///
     /// The graph was built by a full-precision `HNSWIndex`, whose insertion-time
-    /// pruning is one-sided: a live node can hold an edge to this node without a
-    /// reciprocal edge. A full reverse-edge sweep — O(E_l) per layer — is therefore
-    /// required to leave no dangling references. Unlike `HNSWIndex.remove(id:)`,
-    /// no neighbor reconnection is performed (the full vectors needed for the
-    /// diversity heuristic were discarded at build time); heavy removal workloads
-    /// should rebuild the index for best recall.
+    /// pruning is one-sided: a live node can hold an edge INTO this node without
+    /// a reciprocal edge, so the removed node's own neighbor list does not name
+    /// every node pointing at it. The maintained reverse-adjacency map
+    /// (`inEdges`) lists exactly those nodes, so the incoming-edge cleanup is
+    /// O(in-degree) per layer instead of the former O(E_l) whole-layer sweep.
+    /// Unlike `HNSWIndex.remove(id:)`, no neighbor reconnection is performed (the
+    /// full vectors the diversity heuristic needs were discarded at build time);
+    /// heavy removal workloads should rebuild the index for best recall.
     @discardableResult
     public func remove(id: UUID) -> Bool {
+        guard let node = uuidToNode[id] else { return false }
+        let level = nodeLevels[node]
+        ensureInEdges()
+
+        for l in 0...level where l < layers.count {
+            // Step 1: reverse-adjacency cleanup. `inEdges[l][node]` is exactly
+            // the set of nodes whose layer-`l` list points at `node`, so only
+            // those lists are touched — O(in-degree), not a whole-layer sweep.
+            // (`inEdges!` is safe: `ensureInEdges()` above materialized it.)
+            for from in inEdges![l][node] {
+                layers[l][from].removeAll { $0 == node }
+            }
+            inEdges![l][node] = []
+            // Step 2: drop the node's own out-edges, keeping each target's
+            // in-set in sync so `inEdges` stays the exact transpose of `layers`.
+            for to in layers[l][node] {
+                inEdges![l][to].remove(node)
+            }
+            layers[l][node] = []
+        }
+
+        uuidToNode.removeValue(forKey: id)
+
+        if entryPointNode == node {
+            entryPointNode = nil
+            maxLevel = -1
+            for (n, nUUID) in nodeToUUID.enumerated() {
+                guard uuidToNode[nUUID] == n else { continue }
+                if nodeLevels[n] > maxLevel {
+                    maxLevel = nodeLevels[n]
+                    entryPointNode = n
+                }
+            }
+        }
+
+        return true
+    }
+
+    /// The pre-optimization O(E_l)-per-layer removal (a full reverse-edge
+    /// sweep), kept **internal** solely so the differential test harness can
+    /// prove the new `inEdges`-based `remove(id:)` produces byte-identical graph
+    /// state. It deliberately does NOT maintain `inEdges` (a control index that
+    /// uses only this method never has its map inspected). Not public API; do
+    /// not call on a production removal path.
+    @discardableResult
+    internal func removeUsingFullSweep(id: UUID) -> Bool {
         guard let node = uuidToNode[id] else { return false }
         let level = nodeLevels[node]
 
@@ -596,6 +705,72 @@ public actor QuantizedHNSWIndex {
     /// the full-precision port and the post-filter materialization contract.
     private func isLiveNode(_ node: Int) -> Bool {
         uuidToNode[nodeToUUID[node]] == node
+    }
+
+    // ── Test Hooks (internal) ─────────────────────────────────────────
+    //
+    // The reverse-adjacency map is derived state, so tests assert two things:
+    // (1) `inEdges` stays the exact transpose of `layers` through every remove
+    // and across a save/load rebuild, and (2) the O(in-degree) `remove(id:)`
+    // leaves the graph byte-identical to the retired O(E_l) full sweep
+    // (`removeUsingFullSweep`), which is kept solely to drive that proof.
+
+    /// Structural invariant: `inEdges` is exactly the transpose of `layers` —
+    /// every edge `u → v` on layer `l` is mirrored by `v`'s in-set containing
+    /// `u`, and nothing else. O(total edges). Materializes the map first, so
+    /// on a fresh index this checks `transpose(of:)` against the inline
+    /// expectation below; after removes it checks that the incremental
+    /// maintenance in `remove(id:)` kept the map in exact sync.
+    internal var reverseAdjacencyIsConsistent: Bool {
+        ensureInEdges()
+        guard let inEdges, inEdges.count == layers.count else { return false }
+        for l in layers.indices {
+            guard inEdges[l].count == layers[l].count else { return false }
+            var expected = Array(repeating: Set<Int>(), count: layers[l].count)
+            for (from, neighbors) in layers[l].enumerated() {
+                for to in neighbors {
+                    expected[to].insert(from)
+                }
+            }
+            if expected != inEdges[l] { return false }
+        }
+        return true
+    }
+
+    /// Whether any adjacency list still references a tombstoned slot — i.e.
+    /// `remove(id:)` left a dangling incoming edge. Proves the O(in-degree)
+    /// cleanup clears every edge the full sweep would have.
+    internal var hasDanglingEdges: Bool {
+        for layer in layers {
+            for neighbors in layer {
+                for neighbor in neighbors where !isLiveNode(neighbor) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// The graph state `remove(id:)` mutates, captured for exact differential
+    /// equality between the `inEdges` path and the retained full-sweep path.
+    internal struct GraphFingerprint: Equatable {
+        let layers: [[[Int]]]
+        let nodeLevels: [Int]
+        let entryPointNode: Int?
+        let maxLevel: Int
+        let nodeToUUID: [UUID]
+        let uuidToNode: [UUID: Int]
+    }
+
+    internal var graphFingerprint: GraphFingerprint {
+        GraphFingerprint(
+            layers: layers,
+            nodeLevels: nodeLevels,
+            entryPointNode: entryPointNode,
+            maxLevel: maxLevel,
+            nodeToUUID: nodeToUUID,
+            uuidToNode: uuidToNode
+        )
     }
 
     // ── Core: Graph-Aware Filtered Beam on Layer 0 (ADR-008 2nd addendum) ─

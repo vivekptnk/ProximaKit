@@ -308,6 +308,41 @@ final class ScalarQuantizationPersistenceTests: XCTestCase {
             try ScalarQuantizedHNSWIndex.load(from: url), "out-of-bounds neighbor")
     }
 
+    func testOutOfBoundsNeighborViaMemberwiseInitSaveThenLoadThrows() async throws {
+        // ADR-010 rule 5, mirroring PersistenceCorruptionTests'
+        // testQuantizedOutOfBoundsNeighborThrows: build the corrupt adjacency
+        // through the memberwise initializer (the fixture path — SQ has no
+        // inert snapshot struct, so a corrupt in-memory instance is the only
+        // way to produce these bytes), save it, and require load to reject the
+        // file with a typed PersistenceError. Unlike the byte-patching sibling
+        // above, this variant also proves the initializer itself never indexes
+        // the corrupt adjacency: eager derived-state computation there (e.g. a
+        // reverse-adjacency transpose) would trap the process on this line —
+        // exactly the regression the PQHW sibling caught — before load's typed
+        // rejection was ever exercised.
+        let url = tempURL()
+        defer { cleanup(url) }
+        let ids = [UUID(), UUID()]
+        let index = ScalarQuantizedHNSWIndex(
+            dimension: 4,
+            hnswConfig: HNSWConfiguration(m: 4, efConstruction: 20, efSearch: 10),
+            metricType: .euclidean,
+            layers: [[[9], [0]]],  // layer-0 adjacency references node 9 in a 2-node index
+            nodeLevels: [0, 0],
+            entryPointNode: 0,
+            maxLevel: 0,
+            codes: [[1, 2, 3, 4], [5, 6, 7, 8]],
+            scales: [0.5, 0.5],
+            nodeToUUID: ids,
+            uuidToNode: [ids[0]: 0, ids[1]: 1],
+            metadata: [nil, nil]
+        )
+        try await index.save(to: url)
+        assertThrowsPersistenceError(
+            try ScalarQuantizedHNSWIndex.load(from: url),
+            "out-of-bounds neighbor written by a corrupt in-memory index")
+    }
+
     func testGarbageMetadataThrows() async throws {
         let url = try await savedIndexFile()
         defer { cleanup(url) }
