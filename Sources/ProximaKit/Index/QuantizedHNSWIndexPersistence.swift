@@ -408,6 +408,10 @@ extension QuantizedHNSWIndex {
         } catch {
             throw PersistenceError.corruptedData("Quantized index metadata is not valid JSON")
         }
+        guard decodedMetadata.count == nodeCount else {
+            throw PersistenceError.corruptedData(
+                "Quantized index metadata count \(decodedMetadata.count) != node count \(nodeCount)")
+        }
         let metadata: [Data?] = decodedMetadata.map { $0.map { Data($0) } }
         offset += metadataSize
 

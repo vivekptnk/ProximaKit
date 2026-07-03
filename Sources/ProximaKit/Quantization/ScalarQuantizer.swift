@@ -80,11 +80,23 @@ public struct ScalarQuantizer: Sendable {
             return (codes: [Int8](repeating: 0, count: dimension), scale: 0)
         }
 
+        // Non-finite magnitude: a ±infinite component has no representable
+        // scale — maxAbs/127 stays +inf, and stepping it down one ulp at a
+        // time to a finite reconstruction would take tens of millions of
+        // iterations. There is no direction to preserve within the code
+        // range, so encode as a zero vector, the same degenerate fallback
+        // used for the zero and subnormal cases. (NaN never reaches here —
+        // `maxAbs > 0` is already false for it.)
+        guard maxAbs.isFinite else {
+            return (codes: [Int8](repeating: 0, count: dimension), scale: 0)
+        }
+
         var scale = maxAbs / Self.maxCode
         // Float division rounds to nearest, so scale can land an ulp above
         // maxAbs/127 — near greatestFiniteMagnitude that makes the decoded
-        // extreme (127 * scale) overflow to infinity. Nudge down until the
-        // reconstruction is finite (at most two steps).
+        // extreme (127 * scale) overflow to infinity. maxAbs is finite here
+        // (the guard above rejects ±inf), so nudging down to a finite
+        // reconstruction takes at most two steps.
         while !(scale * Self.maxCode).isFinite {
             scale = scale.nextDown
         }

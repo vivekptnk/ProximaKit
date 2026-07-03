@@ -31,7 +31,7 @@ Type a natural language query and see ProximaKit find semantically similar conte
 │  │  [  Pick  ] │  │                        │ │
 │  │             │  └────────────────────────┘ │
 │  │  Stats:     │                             │
-│  │  48 vectors │                             │
+│  │  46 vectors │                             │
 │  │  384d       │                             │
 │  └─────────────┘                             │
 └──────────────────────────────────────────────┘
@@ -74,7 +74,7 @@ open ProximaDemoApp.xcodeproj
 ### Startup
 
 1. `SearchEngine.buildIndex()` checks for a persisted index on disk.
-2. If none found, it embeds 48 sample sentences (see `SampleData.swift`) using `NLEmbeddingProvider` and builds an `HNSWIndex`.
+2. If none found, it embeds 46 sample sentences (see `SampleData.swift`) using `NLEmbeddingProvider` and builds an `HNSWIndex`.
 3. The index is saved to `~/Library/Application Support/ProximaDemoApp/` for next launch.
 
 ### Search
@@ -104,7 +104,7 @@ If found, it uses `CoreMLEmbeddingProvider` for higher-quality 384-dimensional e
 | `ProximaDemoApp.swift` | App entry point, initializes `SearchEngine` |
 | `MainView.swift` | SwiftUI interface with sidebar and results pane |
 | `SearchEngine.swift` | Index lifecycle, search, persistence, embedding |
-| `SampleData.swift` | 48 sample sentences across 9 categories |
+| `SampleData.swift` | 46 sample sentences across 9 categories |
 
 ---
 

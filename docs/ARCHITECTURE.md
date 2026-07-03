@@ -82,10 +82,18 @@ both paths).
 | `ScalarQuantizedHNSWIndex` | — (actor) | HNSW graph over INT8 codes, dequantize-per-candidate | `SQHW` codec | Metric-general except Hamming (ADR-007) |
 
 All dense indexes support **filtered search** (ADR-008): an optional
-`@Sendable (UUID) -> Bool` predicate applied to layer-0 candidates as
-results are materialized (post-filter — the beam traversal itself is
-filter-blind), with default overloads supplied by protocol extension.
-`HybridIndex.search` applies the filter to both legs before fusion.
+`@Sendable (UUID) -> Bool` predicate, with default overloads supplied by
+protocol extension. Strategy differs by index: `HNSWIndex` applies the
+predicate **during** the layer-0 beam with adaptive `ef` widening (ADR-008
+addendum) — rejected nodes still route the beam toward matching regions but
+never occupy result slots, so selective filters still fill `k` (acceptance
+gated by `FilteredSearchSelectivityTests`). `QuantizedHNSWIndex`,
+`ScalarQuantizedHNSWIndex`, and `SparseIndex` remain **post-filter** — the
+beam traversal itself is filter-blind, and the predicate is applied only as
+results are materialized, so a selective filter can return fewer than `k`.
+`BruteForceIndex` is exact under any filter (full scan). `HybridIndex.search`
+applies the filter to both legs before fusion, inheriting each leg's
+strategy — graph-aware on its dense leg if that leg is an `HNSWIndex`.
 
 `Heap` is an internal support type (beam search priority queues), not public API.
 
@@ -111,13 +119,22 @@ Both quantized indexes share one construction pipeline:
 2. Encode every vector (train a `ProductQuantizer` first for PQ; the scalar
    quantizer is stateless and needs no training).
 3. `build(...)` extracts the finished graph + codes; the Float32 vectors are
-   discarded. Search runs entirely on compressed codes.
+   discarded by default. Search runs on compressed codes.
 
 The two differ in how search computes distances:
 
 - **PQ / ADC** (`QuantizedHNSWIndex`): a per-query distance table over the
   codebooks; asymmetric distance = full-precision query vs. compressed codes.
   ~48-byte codes for 384d (M=48) ≈ **32× memory reduction**, L2 only.
+  **Opt-in reranking (ADR-012):** `build(retainOriginals: true)` keeps the
+  Float32 vectors alongside the codes instead of discarding them. The layer-0
+  beam still runs on ADC/compressed distances, but `search(rerankDepth:)`
+  re-scores the top `rerankDepth` live, filter-passing candidates with exact
+  Euclidean distance against those retained originals before the final sort
+  — reranked recall@10 is asserted ≥ 0.90 in `PQRerankTests`. Retention
+  forfeits the compression story above (originals cost the full `4·d`
+  bytes/vector again); the default (`retainOriginals: false`) behaves exactly
+  as described in step 3.
 - **INT8** (`ScalarQuantizedHNSWIndex`): each candidate is dequantized on the
   fly and fed to the configured metric, so cosine, euclidean, dot product,
   Manhattan, Chebyshev, and Bray-Curtis all work. 384d: 1536 B → 388 B ≈
@@ -143,7 +160,7 @@ magic + version headers (ADR-003, ADR-010):
 |--------|-------|-----------------------|-------|---------|
 | `.pxkt` | `PXKT` | 2 / 1 | `PersistenceEngine` | `HNSWIndex`, `BruteForceIndex` |
 | `.pxbm` | `PXBM` | 2 / 1 | `SparseIndexPersistence` | `SparseIndex` |
-| quantized HNSW | `PQHW` | 1 | `QuantizedHNSWIndexPersistence` | `QuantizedHNSWIndex` |
+| quantized HNSW | `PQHW` | 2 / 1 | `QuantizedHNSWIndexPersistence` | `QuantizedHNSWIndex` |
 | scalar-quantized HNSW | `SQHW` | 1 | `ScalarQuantizedHNSWIndexPersistence` | `ScalarQuantizedHNSWIndex` |
 | PQ codebooks | `PQTT` | 1 | `ProductQuantizerPersistence` | `ProductQuantizer` |
 
@@ -189,7 +206,7 @@ lost-update window without blocking reads.
 Index   : text ─▶ TextEmbedder.embed() ─▶ Vector ─▶ index.add(vector, id:)
 Query   : text ─▶ embed() ─▶ Vector ─▶ index.search(query:k:) ─▶ [SearchResult]
 Hybrid  : add/search fan out to dense + sparse legs ─▶ fuse (RRF | weighted)
-Quantize: vectors ─▶ full-precision HNSW build ─▶ encode ─▶ drop Float32s
+Quantize: vectors ─▶ full-precision HNSW build ─▶ encode ─▶ drop Float32s (or retain, ADR-012)
 Persist : actor snapshot ─▶ codec ─▶ atomic write ─▶ load() ─▶ new actor
 ```
 

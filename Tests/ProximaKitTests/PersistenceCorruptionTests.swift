@@ -577,6 +577,42 @@ final class PersistenceCorruptionTests: XCTestCase {
         assertThrowsPersistenceError(try QuantizedHNSWIndex.load(from: url), "m == 0")
     }
 
+    func testQuantizedMetadataCountMismatchThrows() async throws {
+        // The metadata section is the one variable-length (JSON) section whose
+        // element count is independent of nodeCount. A file whose metadata
+        // array is shorter than nodeCount must be rejected at load — the
+        // loader indexes metadata[node] unconditionally for every live node
+        // during search, so accepting it defers a fatal index-out-of-range to
+        // the first query instead of throwing (the sibling scalar codec
+        // already guards this exact case). load must throw a PersistenceError,
+        // never crash.
+        let url = try await savedQuantizedFile()  // nodeCount 2, metadata [nil, nil]
+        defer { cleanup(url) }
+
+        // Metadata is the trailing section (no retained originals): a UInt32
+        // byte-length prefix followed by the JSON payload `[null,null]`.
+        // Replace the whole section with the empty array `[]` (decoded count 0
+        // != nodeCount 2), keeping the length prefix consistent so the payload
+        // still parses as valid JSON and only the count guard can reject it.
+        let data = try Data(contentsOf: url)
+        guard let payloadRange = data.range(
+            of: Data("[null,null]".utf8), options: .backwards) else {
+            return XCTFail("metadata payload not found in saved PQHW file")
+        }
+        let sectionStart = payloadRange.lowerBound - 4  // 4-byte length prefix
+        let shortPayload = Data("[]".utf8)
+        var rebuilt = Data(data[..<sectionStart])
+        withUnsafeBytes(of: UInt32(shortPayload.count).littleEndian) {
+            rebuilt.append(contentsOf: $0)
+        }
+        rebuilt.append(shortPayload)
+        try rebuilt.write(to: url)
+
+        assertThrowsPersistenceError(
+            try QuantizedHNSWIndex.load(from: url),
+            "PQHW metadata count != nodeCount must throw, never defer a trap to search")
+    }
+
     // ══════════════════════════════════════════════════════════════════
     // Product Quantizer (.pqtt) — header layout:
     //   0 magic | 4 version | 8 dim | 12 M | 16 K | 20 trainIters

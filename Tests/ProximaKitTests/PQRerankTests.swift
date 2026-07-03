@@ -9,10 +9,10 @@
 //   backward read, corruption-matrix additions for the new section
 // - remove -> save -> load keeps originals slot-aligned through compaction
 //
-// All data-dependent assertions use SeededRandom + levelSeed; the residual
-// run-to-run variance is PQ k-means centroid initialization (same situation
-// as PQBenchmarkTests), so thresholds are pinned with margin below the
-// observed band.
+// All data-dependent assertions use SeededRandom + levelSeed, and PQ k-means
+// centroid initialization is pinned via PQConfiguration.seed (same situation
+// as PQBenchmarkTests), so the recall-recovery fixture below is fully
+// deterministic; thresholds are pinned with margin below the observed band.
 
 import XCTest
 @testable import ProximaKit
@@ -132,7 +132,8 @@ final class PQRerankTests: XCTestCase {
             count: n, dimension: dim, clusters: 10, seed: 0xCA11_AB1E_5EED_0012
         )
 
-        // levelSeed pins the graph; PQ k-means init is the residual variance.
+        // levelSeed pins the graph; PQConfiguration.seed pins PQ k-means init,
+        // so the whole fixture build is deterministic.
         let hnswConfig = HNSWConfiguration(
             m: 16, efConstruction: 200, efSearch: 100, levelSeed: 0x5EED_0012
         )
@@ -176,10 +177,12 @@ final class PQRerankTests: XCTestCase {
         // Plain-ADC recall on this fixture mirrors the CHA-91 band measured
         // in PQBenchmarkTests (0.667-0.717 there); reranking at depth 4k
         // recovers essentially all of the ADC loss. Observed over 5 local
-        // runs of THIS fixture: plain 0.667-0.730, reranked 0.990-1.000
-        // (within-run margin 0.27-0.33). Thresholds sit with margin below
-        // the observed band; the data and graph are pinned (SeededRandom +
-        // levelSeed), so PQ k-means init is the only variance source.
+        // runs BEFORE training was seeded: plain 0.667-0.730, reranked
+        // 0.990-1.000 (within-run margin 0.27-0.33). Data (SeededRandom),
+        // graph topology (levelSeed), and PQ k-means initialization
+        // (PQConfiguration.seed) are now all pinned, so this fixture
+        // measures a single deterministic pair of recall values inside that
+        // pre-seed band; thresholds stay pinned with margin below it.
         XCTAssertGreaterThanOrEqual(rerankedRecall, plainRecall + 0.15,
             "reranked recall@10 (\(rerankedRecall)) must beat plain ADC "
             + "(\(plainRecall)) by a clear margin")
@@ -368,6 +371,54 @@ final class PQRerankTests: XCTestCase {
             let expected = metric.distance(query, vectorByID[result.id]!)
             XCTAssertEqual(result.distance, expected,
                 "reranked distance must be the exact L2 distance")
+        }
+        for i in 1..<results.count {
+            XCTAssertLessThanOrEqual(results[i - 1].distance, results[i].distance)
+        }
+    }
+
+    // ── Partial-Depth Truncation: 0 < rerankDepth < k ────────────────
+
+    func testRerankDepthSmallerThanKTruncatesResultCount() async throws {
+        let dim = 16
+        let n = 150
+        let k = 10
+        let rerankDepth = 3
+
+        let (vectors, ids) = clusteredFixture(
+            count: n, dimension: dim, clusters: 3, seed: 0xCA11_AB1E_5EED_001A
+        )
+        let index = try await QuantizedHNSWIndex.build(
+            vectors: vectors, ids: ids, dimension: dim,
+            hnswConfig: HNSWConfiguration(m: 8, efConstruction: 100, efSearch: 50,
+                                          levelSeed: 0x5EED_001A),
+            pqConfig: PQConfiguration(subspaceCount: 4, trainingIterations: 5,
+                                      seed: 0x5EED_001A),
+            retainOriginals: true
+        )
+
+        let vectorByID = Dictionary(uniqueKeysWithValues: zip(ids, vectors))
+        let metric = EuclideanDistance()
+        let query = vectors[5]
+
+        // Doc contract (QuantizedHNSWIndex.swift:332-336): a positive
+        // rerankDepth smaller than k caps the result count at rerankDepth —
+        // only re-scored (exact-L2) candidates are returned, never padded
+        // back up to k with ADC-scale rows. With n=150 live vectors and
+        // ef=50, the beam always has >= rerankDepth live candidates, so the
+        // count is exactly rerankDepth (min(rerankDepth, live matches)).
+        let results = try await index.search(
+            query: query, k: k, efSearch: 50, rerankDepth: rerankDepth)
+
+        XCTAssertEqual(results.count, rerankDepth,
+            "0 < rerankDepth < k must cap the result count at rerankDepth, not k")
+
+        for result in results {
+            // A padded-back-to-k result would carry a squared-ADC distance
+            // here instead; asserting the exact L2 value catches scale-mixing.
+            let expected = metric.distance(query, vectorByID[result.id]!)
+            XCTAssertEqual(result.distance, expected,
+                "capped rerank results must carry exact L2 distances, never ADC-scale")
         }
         for i in 1..<results.count {
             XCTAssertLessThanOrEqual(results[i - 1].distance, results[i].distance)

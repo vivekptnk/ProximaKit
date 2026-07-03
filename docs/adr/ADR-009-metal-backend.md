@@ -1,7 +1,7 @@
 # ADR-009: Metal Backend for Batch Distance Computation (v1: Build-Phase Utility)
 
 ## Status
-Accepted
+Accepted (amended — see Correction, 2026-07)
 
 ## Context
 ADR-001 chose Accelerate/vDSP for all vector math and explicitly deferred Metal ("high dispatch overhead, overkill for < 100K vectors"). That caveat is the point: the roadmap's GPU item targets large index *builds*, where building a 100K-vector HNSW index is dominated by repeated one-query-to-N-candidates distance computation during insertion — exactly the shape where a single GPU dispatch amortizes its launch overhead over N parallel threads. The roadmap sketched a `DistanceBackend` protocol plus a `.metal` shader; this ADR scopes what v1 actually ships.
@@ -38,3 +38,7 @@ ADR-002's actor isolation is for stores. This utility is called synchronously in
 - CI runners without a GPU skip the parity tests cleanly; the availability-probe test still runs everywhere, so the suite exercises the no-Metal code path too.
 - Kernel indexing casts to `ulong` before the row-offset multiply, so matrices are limited by `maxBufferLength`, not 32-bit index arithmetic.
 - No performance numbers are published here or in `docs/BENCHMARKS.md` yet. A timing comparison exists in the test suite but prints only (hardware-dependent; it must not assert). Measured build-speedup numbers are a prerequisite for the insert-loop integration follow-up, per the roadmap's "instrument first" plan.
+
+## Correction (2026-07)
+
+"The suite exercises the no-Metal code path too" (Consequences, above) overstates what runs on a non-Metal platform. The `#else` stub's `init?()` always returns `nil` there, and every test that could call the stub's `batchSquaredL2`/`batchCosineDistances` first constructs an instance through `requireMetal()` (or an equivalent nil-check) and skips via `XCTSkipIf` when that construction fails — so those tests skip on a non-Metal platform exactly as they do on a Metal platform with no device. The one test that always runs, `testAvailabilityProbeIsDeterministic`, only compares `MetalBatchDistance() != nil` against itself; it never calls a batch method. So the no-Metal code path actually exercised everywhere is `init?` only — the stub's fallback numerics (which delegate to the same `fallbackSquaredL2`/`fallbackCosineDistances` free functions the Metal-backed `allowGPU: false` path also uses) are compiled but never invoked by any test on a non-Metal platform. This has no runtime consequence: the stub's methods are unreachable through the public `init?` flow by construction, as the stub's own header comment already notes. The claim above is corrected to `init?` only; it is not a claim about the stub's batch methods.

@@ -1,6 +1,6 @@
 # ProximaKit Roadmap
 
-**Updated:** 2026-06-10
+**Updated:** 2026-07-02
 **Current release:** v1.5.0
 
 This document tracks planned improvements across the library, benchmarking harness, and demo experience. Items are grouped by theme, not by release, because ordering depends on dependencies and measured impact.
@@ -92,7 +92,8 @@ Extending the graph-aware beam to the quantized indexes is the remaining gap. Th
 
 ## HNSW Graph Improvements
 
-- **Incremental delete:** current `remove(id:)` marks nodes as deleted (tombstone). Dangling-incoming-edge repair is now O(in-degree) via a maintained reverse-adjacency map (post-1.5.0; map rebuilt on load, format unchanged). A background compaction pass to physically remove tombstoned nodes and relink the graph is still deferred; it requires an ADR on compaction policy.
+- **Incremental delete:** current `remove(id:)` marks nodes as deleted (tombstone). Dangling-incoming-edge repair is now O(in-degree) via a maintained reverse-adjacency map (post-1.5.0; map rebuilt on load, format unchanged).
+- **Compaction — Shipped:** `compact()` is a public, synchronous API that snapshots every live node, resets storage, and re-inserts each one — physically reclaiming tombstoned slots (`count` becomes `== liveCount`) and fully relinking the graph, in O(n log n). It also runs automatically: `remove(id:)` invokes it whenever `liveCount / count` drops below `HNSWConfiguration.autoCompactionThreshold` (persisted in the format header, default `0.7`); covered by `CompactionTests`. What remains open is scheduling it off the hot path — today's compaction always runs inline on the calling task, blocking the triggering `remove(id:)` through the full rebuild, and an incremental or asynchronous/background-thread pass that avoids that stall has no design yet.
 - **Hierarchical NSW variant with dynamic `M`:** vary the number of connections per layer based on layer height to improve recall at low `efSearch` values.
 - **Serialisation versioning:** a magic number (`PXKT`) and format version field are already written and validated on load (`PersistenceError.unsupportedVersion`). The format-evolution policy (monotonic version bumps, N-1 reads, documented defaults, mandatory corruption tests) is settled in [ADR-010](adr/ADR-010-format-evolution.md); format v2 shipped under it.
 
@@ -115,7 +116,7 @@ Extending the graph-aware beam to the quantized indexes is the remaining gap. Th
 
 ## Demo App Evolution
 
-The `ProximaDemoApp` (macOS SwiftUI) ships with the repo and demonstrates semantic search on 48 sample documents. Planned improvements:
+The `ProximaDemoApp` (macOS SwiftUI) ships with the repo and demonstrates semantic search on 46 sample documents. Planned improvements:
 
 | Item | Priority |
 |------|----------|

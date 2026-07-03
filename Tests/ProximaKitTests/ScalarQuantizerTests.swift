@@ -168,4 +168,22 @@ final class ScalarQuantizerTests: XCTestCase {
         XCTAssertTrue(decoded.allSatisfy { $0 == 0 && $0.isFinite })
     }
 
+    /// Non-finite inputs: a ±infinite component has no representable scale, so
+    /// `maxAbs/127` stays +inf. The encoder must fall back to the zero-vector
+    /// encoding immediately rather than step `scale.nextDown` tens of millions
+    /// of times toward a finite reconstruction — the overflow-guard loop's
+    /// "at most two steps" bound only holds for finite maxAbs. CHA-201
+    /// mission-3 judge finding.
+    func testInfiniteMagnitudeEncodesAsZeroVector() {
+        let sq = ScalarQuantizer(dimension: 4)
+        let (codes, scale) = sq.encode([.infinity, 0, -1.0, 2.0])
+
+        XCTAssertEqual(scale, 0, "an infinite component must collapse to the zero encoding")
+        XCTAssertTrue(codes.allSatisfy { $0 == 0 },
+                      "scale 0 must never pair with nonzero codes")
+        let decoded = sq.decode(codes, scale: scale)
+        XCTAssertTrue(decoded.allSatisfy { $0 == 0 && $0.isFinite },
+                      "zero encoding must decode to a finite zero vector")
+    }
+
 }

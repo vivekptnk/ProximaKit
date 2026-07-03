@@ -1,7 +1,7 @@
 # ADR-008: Post-Filter Strategy for Filtered Search
 
 ## Status
-Accepted (retrospective)
+Accepted (retrospective + addendum; addendum amended — see Correction, 2026-07)
 
 ## Context
 `search(query:k:efSearch:filter:)` accepts an optional `(@Sendable (UUID) -> Bool)` predicate. Two candidate strategies: post-filter (search normally, drop non-matching candidates) vs graph-aware filtering (consult the predicate during HNSW traversal so the beam expands toward matching nodes). The filter is an arbitrary closure over UUID, so it cannot be pre-indexed.
@@ -43,3 +43,12 @@ All numbers below are asserted thresholds from `FilteredSearchSelectivityTests` 
 
 ### Consequences for this ADR
 The "Approximate indexes may return fewer than k results under selective filters" consequence above no longer applies to `HNSWIndex`; it still applies to the quantized variants, which retain post-filter until they adopt the same beam.
+
+## Correction (2026-07)
+
+Two claims above overstate what is actually tested or enforced.
+
+- **"at equal latency budgets" (Upgrade Path, above) was never met, and the addendum does not claim it was.** The shipped beam does not hold latency constant against the post-filter control — it deliberately trades latency for recall via adaptive `ef` widening, up to `efCap = max(ef, min(liveCount, 16 · max(ef, k)))` (worst case O(liveCount) distance evaluations under a highly selective filter; see "Termination" above). "Measured behavior"'s own wording is accurate about this ("No latency figures are claimed... at the post-filter strategy's own candidate budget"), but the original pre-merge acceptance criterion this addendum was meant to satisfy still reads "at equal latency budgets" and was relaxed, not met — that relaxation was never recorded as a decision. It is recorded now: the comparison is, and was always going to be, against post-filter's own `ef` budget, not an equal-latency control, because equal-latency graph-aware filtering would require capping `effectiveEf` at `ef` — which defeats the fill-`k` goal this addendum exists for.
+- **"re-running the suite against the pre-addendum implementation shows it returning 0–1 results" (Measured behavior, ~1% pass rate) is more specific than what `testOnePercentControlPostFilterUnderfillsK` asserts.** The committed assertion is `XCTAssertLessThan(survivors.count, Self.k)` — under-fill vs. `k = 10`, nothing tighter. "0–1" describes what was observed on the current seeded fixture when this addendum was written; no test pins that range, so a future change to the fixture (corpus, seed, or sampling stride) could shift the survivor count anywhere in `0..<10` without turning CI red.
+
+Both mechanisms remain correctly described above; only these two specific figures are corrected to what the code and committed tests actually guarantee.
