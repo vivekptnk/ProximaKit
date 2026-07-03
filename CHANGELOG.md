@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [1.6.1] — 2026-07-03
+
 ### Added
 - **Demo app Persistence lab + Benchmark tab (`Examples/ProximaDemoApp/`).**
   `ProximaDemoApp` grows from a single Search screen into a genuinely
@@ -41,6 +47,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `UserDefaults` — `-demoScreen <search|persistence|benchmark|index>`,
     `-demoQuery "<text>"`, `-demoAutorun 1`, `-demoFlow memory` — so every screen
     can be captured non-interactively in a known state.
+- **`scripts/check-imports.sh` dependency-policy guard, wired into CI lint.**
+  A POSIX-sh linter enforces the `CONTRIBUTING.md` "Module Rules" allowlist —
+  `ProximaKit` may import only Foundation/Accelerate/Metal/Darwin/Glibc (each
+  justified against real usage: vDSP per ADR-001, the GPU utility per ADR-009,
+  `fcntl`/`F_FULLFSYNC` + `mmap` per ADR-013); `ProximaEmbeddings` additionally
+  CoreML/NaturalLanguage/Vision/CoreGraphics. Handles attributed imports
+  (`@preconcurrency import X`), excludes the DocC catalog's snippet imports
+  from scope, and runs as a new "Check import policy" step in the `lint` CI
+  job (`sh scripts/check-imports.sh`) — proven to fail on an injected
+  violation. This backstops what was previously enforced only by manual PR
+  review (`import CoreML` inside `ProximaKit` still compiles: Apple's system
+  frameworks link against any target, and `Package.swift` declares no
+  per-target linkage that would reject it).
+- **`RecallBenchmarkTests` local skip gate.** A class-level `setUpWithError`
+  now requires `PROXIMA_RECALL_BENCH=1`, so a bare local `swift test` (without
+  `--skip`) drops from 20+ minutes of recall sweeps to an instant skip; set
+  `PROXIMA_RECALL_BENCH=1` to run them locally, matching the established
+  `PROXIMA_*` benchmark-gate idiom. CI behavior is unchanged — its explicit
+  `swift test --skip RecallBenchmarkTests` stays, so this weakens nothing CI
+  verifies.
+
+### Changed
+- **`QuantizedHNSWIndex` and `ScalarQuantizedHNSWIndex` `remove(id:)` repair
+  dangling incoming edges in O(in-degree)**, porting the `HNSWIndex`
+  reverse-adjacency map (1.6.0, below) onto both quantized indexes: a
+  maintained `inEdges` transpose map replaces the previous per-layer sweep of
+  every adjacency list. No public API change, no on-disk format change — the
+  map is derived state, lazily materialized (`ensureInEdges()`) on first use,
+  strictly after the build/load validation gates rather than eagerly in the
+  memberwise initializer (an eager cut tripped `PersistenceCorruptionTests`'
+  out-of-bounds-neighbor fixture, which builds corrupt in-memory indexes
+  through that initializer — a path `HNSWIndex` never exposes, since its
+  `init(restoring:)` only ever receives loader-validated layers). Equivalence
+  is proven differentially against the retired O(E_l) full sweep (kept
+  internal, test-only, as the control — judge-ruled KEEP, since without
+  reconnection there is no reachability oracle and only the differential
+  catches over-removal): graph fingerprints asserted equal after every one of
+  270 seeded churn ops (140 on PQHW, 130 on SQHW), plus save/load rebuild
+  consistency and interleaved search equality (`QuantizedReverseAdjacencyTests`).
+- **Corruption-contract hardening rode along.** `ScalarQuantizedHNSWIndex` had
+  the identical latent out-of-bounds-neighbor gap the `QuantizedHNSWIndex` fix
+  above closes, invisible only because no fixture exercised it for SQHW. A
+  new memberwise-init corrupt-fixture test
+  (`testOutOfBoundsNeighborViaMemberwiseInitSaveThenLoadThrows` in
+  `ScalarQuantizationPersistenceTests.swift`, mirroring
+  `PersistenceCorruptionTests`' `testQuantizedOutOfBoundsNeighborThrows` for
+  PQHW) is proven to trap RED against the unfixed code (ADR-010 rule 5) and
+  passes now, bringing SQHW's corruption coverage to parity with PQHW.
 
 ### Fixed
 - **WAL record counter no longer resets to 0 across a reopen, restoring the
