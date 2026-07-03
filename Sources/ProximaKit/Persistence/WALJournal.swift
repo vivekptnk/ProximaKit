@@ -117,11 +117,20 @@ final class WALJournal: @unchecked Sendable {
     /// preserved — the replay that just read them keeps its prefix). The
     /// header's parent generation is trusted to have been validated by the
     /// decoder before this call.
+    ///
+    /// Both counters are seeded from what the replay carried in so they keep
+    /// their "since the last checkpoint" meaning across a reopen: the WAL is
+    /// truncate-created fresh at each checkpoint, so every record in it (and
+    /// every byte past the header) was written since that checkpoint.
+    /// `existingRecordCount` is the number of records the decoder replayed from
+    /// the valid prefix — it must match `existingByteCount`'s prefix exactly,
+    /// so the byte- and op-count checkpoint rules agree from the first append.
     init(
         appendingTo url: URL,
         parentGeneration: UInt64,
         dimension: Int,
         existingByteCount: Int,
+        existingRecordCount: Int,
         durability: WALDurability
     ) throws {
         self.url = url
@@ -134,7 +143,7 @@ final class WALJournal: @unchecked Sendable {
         self.handle = handle
         try handle.seekToEnd()
         self.byteCount = existingByteCount
-        self.recordCount = 0
+        self.recordCount = existingRecordCount
     }
 
     // MARK: - Append

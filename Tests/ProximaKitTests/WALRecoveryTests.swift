@@ -380,6 +380,74 @@ final class WALRecoveryTests: XCTestCase {
         XCTAssertEqual(reloadedCount, 10)
     }
 
+    // ── 8. WAL op-counter honors "since last checkpoint" across reopen ─
+    //
+    // Both `journalRecordCount` and `journalByteCount` are documented "since the
+    // last checkpoint". After `open()` replays a non-empty WAL, the byte counter
+    // already includes the replayed records — the record counter must too, not
+    // reset to 0. Contract exercised end-to-end: reopen-with-records carries the
+    // count in, a later append advances it (N → N+1), a checkpoint resets it (→ 0).
+    func testJournalRecordCountSurvivesReopen() async throws {
+        let dir = tempDir(); defer { cleanup(dir) }
+        let base = dir.appendingPathComponent("index.pxkt")
+        let wal = dir.appendingPathComponent("index.pxwal")
+
+        let n = 12
+        let producer = HNSWIndex(dimension: 8, metric: EuclideanDistance(), config: seededConfig())
+        try await producer.checkpoint(baseURL: base, walURL: wal)   // gen 1, fresh empty WAL
+        for i in 0..<n { try await producer.add(vec(i, dim: 8), id: uuid(i)) }
+        let produced = await producer.journalRecordCount
+        XCTAssertEqual(produced, n, "fresh journal counts each append")
+        try await producer.syncJournal()
+        await producer.closeJournal()
+
+        // Reopen via open(): the replayed record count must carry in, not reset to 0.
+        let reopened = try await HNSWIndex.open(baseURL: base, walURL: wal)
+        let afterReopen = await reopened.journalRecordCount
+        XCTAssertEqual(afterReopen, n,
+                       "journalRecordCount must reflect the \(n) replayed records, not 0")
+
+        // A subsequent append advances the carried-in count (N → N+1).
+        try await reopened.add(vec(n, dim: 8), id: uuid(n))
+        let afterAppend = await reopened.journalRecordCount
+        XCTAssertEqual(afterAppend, n + 1, "append after reopen advances the carried-in count")
+
+        // A checkpoint folds the WAL into a fresh base and resets the counter.
+        try await reopened.checkpoint(baseURL: base, walURL: wal)
+        let afterCheckpoint = await reopened.journalRecordCount
+        XCTAssertEqual(afterCheckpoint, 0, "checkpoint must reset the record count")
+        await reopened.closeJournal()
+    }
+
+    // ── 8b. needsCheckpoint()'s maxOps rule counts carried-in ops ──────
+    //
+    // With `maxOps` below the number of records already in the WAL and the byte
+    // rule disabled, a freshly reopened index must report `needsCheckpoint()`
+    // true immediately — before any new append — because the carried-in ops
+    // count against the op budget. Before the fix, the reset-to-0 record counter
+    // made the op-count rule under-count and this returned false.
+    func testNeedsCheckpointCountsCarriedInOpsAfterReopen() async throws {
+        let dir = tempDir(); defer { cleanup(dir) }
+        let base = dir.appendingPathComponent("index.pxkt")
+        let wal = dir.appendingPathComponent("index.pxwal")
+
+        let n = 20
+        let producer = HNSWIndex(dimension: 8, metric: EuclideanDistance(), config: seededConfig())
+        try await producer.checkpoint(baseURL: base, walURL: wal)
+        for i in 0..<n { try await producer.add(vec(i, dim: 8), id: uuid(i)) }
+        try await producer.syncJournal()
+        await producer.closeJournal()
+
+        // maxOps far below the carried-in record count; the byte-fraction rule is
+        // disabled (fraction = .infinity) so ONLY the maxOps op-count rule can trip.
+        let policy = WALCheckpointPolicy(walBytesFractionOfBase: .infinity, maxOps: 5)
+        let reopened = try await HNSWIndex.open(baseURL: base, walURL: wal)
+        let needs = await reopened.needsCheckpoint(policy: policy)
+        XCTAssertTrue(needs,
+                      "carried-in ops (\(n)) exceed maxOps (5) → checkpoint needed immediately")
+        await reopened.closeJournal()
+    }
+
     // Deterministic UUIDs so producer/recovered use the same ids.
     private func uuid(_ i: Int) -> UUID {
         var bytes = (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,

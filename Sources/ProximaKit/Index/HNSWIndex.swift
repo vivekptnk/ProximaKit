@@ -794,11 +794,17 @@ public actor HNSWIndex: VectorIndex {
         if replay.trailingBytesDropped > 0 {
             try walData.prefix(validByteCount).write(to: walURL, options: .atomic)
         }
+        // Seed BOTH counters from the same valid prefix the decoder recovered:
+        // `validByteCount` bytes carry exactly `replay.records.count` records, so
+        // the byte- and op-count checkpoint rules stay consistent "since the last
+        // checkpoint" from the very first post-reopen append (a torn tail dropped
+        // its partial record and its bytes together).
         self.journal = try WALJournal(
             appendingTo: walURL,
             parentGeneration: generation,
             dimension: dimension,
             existingByteCount: validByteCount,
+            existingRecordCount: replay.records.count,
             durability: durability
         )
     }
