@@ -20,7 +20,7 @@
 │                 HybridIndex (RRF / weighted-sum fusion)            │
 │                 QuantizedHNSWIndex · ScalarQuantizedHNSWIndex      │
 │  Quantization/  ProductQuantizer · ScalarQuantizer                 │
-│  Distance/      8 metrics + BatchDistance vDSP fast paths          │
+│  Distance/      9 metrics + BatchDistance vDSP fast paths          │
 │  Persistence/   PersistenceEngine + per-format binary codecs       │
 │  Query/         SearchResult        Vector (vDSP value type)       │
 │                                                                    │
@@ -32,7 +32,7 @@
 
 | Directory | Contents |
 |-----------|----------|
-| `Sources/ProximaKit/Distance/` | `DistanceMetric` protocol, 8 metric implementations, `DistanceMetricType` (serialization), `BatchDistance` vDSP batch paths |
+| `Sources/ProximaKit/Distance/` | `DistanceMetric` protocol, 9 metric implementations, `DistanceMetricType` (serialization), `BatchDistance` vDSP batch paths |
 | `Sources/ProximaKit/Index/` | Six index types, `VectorIndex` / `SparseVectorIndex` protocols, BM25 tokenizers, internal `Heap`, quantized-index codecs |
 | `Sources/ProximaKit/Quantization/` | `ProductQuantizer` (+ codec, errors), `ScalarQuantizer` |
 | `Sources/ProximaKit/Persistence/` | `PersistenceEngine` (`.pxkt`), `SparseIndexPersistence` (`.pxbm`), `PersistenceError` |
@@ -43,10 +43,10 @@
 
 ## Distance Layer
 
-Eight `DistanceMetric` implementations: Cosine, Euclidean, DotProduct, Manhattan,
-Hamming, Chebyshev, BrayCurtis, Mahalanobis.
+Nine `DistanceMetric` implementations: Cosine, Euclidean, DotProduct, Manhattan,
+Hamming, Chebyshev, BrayCurtis, JensenShannon, Mahalanobis.
 
-- Seven are stateless and serializable via `DistanceMetricType` (a `UInt32` enum
+- Eight are stateless and serializable via `DistanceMetricType` (a `UInt32` enum
   stored in index file headers; `makeMetric()` reconstructs the instance on load).
 - `MahalanobisDistance` carries a `dimension × dimension` inverse-covariance
   matrix, so it has no `DistanceMetricType` case — saving an index configured
