@@ -13,7 +13,7 @@ import Accelerate
 /// Lower distance = more similar. All conforming types must be `Sendable`
 /// so they can be stored inside actor-isolated indices.
 ///
-/// ProximaKit ships eight metrics:
+/// ProximaKit ships nine metrics:
 /// - ``CosineDistance``: 1 - cosine_similarity. Best for text embeddings.
 /// - ``EuclideanDistance``: L2 (straight-line) distance.
 /// - ``DotProductDistance``: Negative dot product (for pre-normalized vectors).
@@ -21,6 +21,7 @@ import Accelerate
 /// - ``HammingDistance``: Count of differing positions. For binary/quantized vectors.
 /// - ``ChebyshevDistance``: L∞ (maximum component difference). For grid-like spaces.
 /// - ``BrayCurtisDistance``: Normalized L1 dissimilarity. For non-negative count vectors.
+/// - ``JensenShannonDistance``: Distribution distance for non-negative histograms.
 /// - ``MahalanobisDistance``: Covariance-aware distance. Not serializable.
 ///
 /// ```swift
@@ -270,6 +271,87 @@ public struct BrayCurtisDistance: DistanceMetric, Sendable {
         //   domain → 1 (maximal dissimilarity), never a silent perfect match.
         guard denominator > 0 else { return numerator > 0 ? 1 : 0 }
         return numerator / denominator
+    }
+}
+
+// ── Jensen-Shannon Distance ───────────────────────────────────────────
+
+/// Jensen-Shannon distance: `sqrt(JSD(a, b))` for non-negative distributions.
+///
+/// Range: [0, 1] where 0 = identical distributions and 1 = disjoint
+/// support. Inputs are treated as unnormalized finite, non-negative
+/// distributions and L1-normalized internally before comparison. The
+/// divergence uses base-2 logarithms, so `sqrt(JSD)` is bounded by 1.
+///
+/// This is the metric form of Jensen-Shannon: raw Jensen-Shannon divergence
+/// is useful as a dissimilarity, but the square root is the true metric
+/// (symmetric and satisfies the triangle inequality).
+///
+/// Zero components are valid: terms with probability 0 contribute 0 by the
+/// standard `0 * log(0) = 0` convention. When both vectors are all-zero,
+/// ProximaKit defines the distance as **0** (two empty distributions are
+/// identical). When exactly one vector is all-zero, the distance is **1**,
+/// the maximal value on the normalized distribution domain.
+///
+/// **Important:** ProximaKit does not clamp negatives or take absolute values
+/// because either choice silently changes the input distribution and can hide
+/// data-quality bugs.
+///
+/// Out-of-domain input:
+/// - negative or non-finite components: outside the documented finite,
+///   non-negative distribution domain → 1 (maximal dissimilarity), never a
+///   silent perfect match or process trap.
+/// - non-finite intermediate result: numerical overflow/NaN during
+///   normalization or divergence → 1, keeping distances bounded and sortable.
+///   In the subnormal total-mass regime, this applies even to identical inputs
+///   (d(a,a)=1, sacrificing the identity property there).
+public struct JensenShannonDistance: DistanceMetric, Sendable {
+    public init() {}
+
+    public func distance(_ a: Vector, _ b: Vector) -> Float {
+        precondition(a.dimension == b.dimension,
+                     "Dimension mismatch: \(a.dimension) vs \(b.dimension)")
+
+        var sumA: Float = 0
+        var sumB: Float = 0
+        for i in 0..<a.dimension {
+            let ai = a.components[i]
+            let bi = b.components[i]
+            guard ai.isFinite && ai >= 0 && bi.isFinite && bi >= 0 else {
+                return 1
+            }
+            sumA += ai
+            sumB += bi
+        }
+
+        switch (sumA > 0, sumB > 0) {
+        case (false, false):
+            return 0
+        case (false, true), (true, false):
+            return 1
+        case (true, true):
+            break
+        }
+
+        let invA = 1 / sumA
+        let invB = 1 / sumB
+        var divergence: Float = 0
+
+        for i in 0..<a.dimension {
+            let p = a.components[i] * invA
+            let q = b.components[i] * invB
+            let midpoint = 0.5 * (p + q)
+
+            if p > 0 {
+                divergence += 0.5 * p * log2(p / midpoint)
+            }
+            if q > 0 {
+                divergence += 0.5 * q * log2(q / midpoint)
+            }
+        }
+
+        let distance = sqrt(max(divergence, 0))
+        return distance.isFinite ? distance : 1
     }
 }
 

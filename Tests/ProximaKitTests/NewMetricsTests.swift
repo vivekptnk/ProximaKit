@@ -1,15 +1,15 @@
 // NewMetricsTests.swift
 // ProximaKit
 //
-// Tests for the roadmap "Distance Metrics — Planned" additions:
-// Chebyshev (L∞), Bray-Curtis, and Mahalanobis.
+// Tests for the roadmap "Distance Metrics" additions:
+// Chebyshev (L∞), Bray-Curtis, Jensen-Shannon, and Mahalanobis.
 //
 // Roadmap gate: "All new metrics must satisfy the `DistanceMetric` protocol
 // and pass the existing symmetry + triangle-inequality tests before merge."
 // This file extends the symmetry/triangle harness from DistanceTests and
 // VectorTests (testL2DistanceTriangleInequality) to randomized triples for
-// the genuine metrics (Chebyshev, Mahalanobis), and documents an
-// evidence-based EXCLUSION for Bray-Curtis: it is a semimetric, and
+// the genuine metrics (Chebyshev, Jensen-Shannon, Mahalanobis), and
+// documents an evidence-based EXCLUSION for Bray-Curtis: it is a semimetric, and
 // `testBrayCurtisViolatesTriangleInequality` demonstrates a concrete
 // counterexample on its intended non-negative domain.
 
@@ -260,6 +260,110 @@ final class NewMetricsTests: XCTestCase {
         assertBatchMatchesScalar(BrayCurtisDistance(), query: query, vectors: vectors)
     }
 
+    // ── JensenShannonDistance ────────────────────────────────────────
+
+    func testJensenShannonIdenticalDistributions() {
+        let metric = JensenShannonDistance()
+        let a = Vector([1.0, 2.0, 3.0])
+        let b = Vector([2.0, 4.0, 6.0])
+        // L1-normalization makes both distributions [1/6, 1/3, 1/2].
+        XCTAssertEqual(metric.distance(a, b), 0.0, accuracy: 1e-6)
+    }
+
+    func testJensenShannonDisjointSupportIsOne() {
+        let metric = JensenShannonDistance()
+        let a = Vector([3.0, 0.0, 0.0])
+        let b = Vector([0.0, 0.0, 5.0])
+        // Base-2 JSD for disjoint supports is 1, so sqrt(JSD) is 1.
+        XCTAssertEqual(metric.distance(a, b), 1.0, accuracy: 1e-6)
+    }
+
+    func testJensenShannonKnownMidRangeValue() {
+        let metric = JensenShannonDistance()
+        let a = Vector([1.0, 0.0])
+        let b = Vector([1.0, 1.0])
+        // p = [1, 0], q = [1/2, 1/2], m = [3/4, 1/4]
+        // JSD = 1/2·log2(4/3) + 1/4·log2(2/3) + 1/4·log2(2)
+        //     = 0.31127812445913294, sqrt(JSD) = 0.5579230452841439
+        XCTAssertEqual(metric.distance(a, b), 0.557923, accuracy: 1e-6)
+    }
+
+    func testJensenShannonZeroVectors() {
+        let metric = JensenShannonDistance()
+        let zero = Vector(dimension: 3)
+        XCTAssertEqual(metric.distance(zero, zero), 0.0, accuracy: 1e-6)
+        XCTAssertEqual(metric.distance(zero, Vector([1.0, 2.0, 3.0])), 1.0, accuracy: 1e-6)
+        XCTAssertEqual(metric.distance(Vector([1.0, 2.0, 3.0]), zero), 1.0, accuracy: 1e-6)
+    }
+
+    func testJensenShannonNegativeComponentIsMaxDistance() {
+        let metric = JensenShannonDistance()
+        XCTAssertEqual(metric.distance(Vector([-1.0, 1.0]), Vector([1.0, 0.0])), 1.0)
+        XCTAssertEqual(metric.distance(Vector([1.0, 0.0]), Vector([0.0, -1.0])), 1.0)
+    }
+
+    func testJensenShannonNonFiniteComponentIsMaxDistance() {
+        let metric = JensenShannonDistance()
+        XCTAssertEqual(metric.distance(Vector([Float.nan, 1.0]), Vector([1.0, 0.0])), 1.0)
+        XCTAssertEqual(metric.distance(Vector([1.0, 0.0]), Vector([Float.infinity, 1.0])), 1.0)
+    }
+
+    func testJensenShannonDenormalInputsStayFiniteAndBounded() {
+        let metric = JensenShannonDistance()
+        let denormal = Float.leastNonzeroMagnitude * 100_000
+        let reviewedDistance = metric.distance(
+            Vector([denormal, 0.0]),
+            Vector([denormal, denormal])
+        )
+
+        XCTAssertTrue(reviewedDistance.isFinite)
+        XCTAssertGreaterThanOrEqual(reviewedDistance, 0.0)
+        XCTAssertLessThanOrEqual(reviewedDistance, 1.0)
+
+        let tiny = Float.leastNonzeroMagnitude * 1_000
+        let tinyMassDistance = metric.distance(
+            Vector([tiny, tiny]),
+            Vector([tiny, tiny])
+        )
+
+        XCTAssertTrue(tinyMassDistance.isFinite)
+        XCTAssertGreaterThanOrEqual(tinyMassDistance, 0.0)
+        XCTAssertLessThanOrEqual(tinyMassDistance, 1.0)
+    }
+
+    func testJensenShannonRangeOnNonNegativeVectors() {
+        let metric = JensenShannonDistance()
+        var rng = SeededRandom(seed: 0x5EED_15D)
+        for _ in 0..<25 {
+            let a = randomVector(dimension: 6, range: 0...10, using: &rng)
+            let b = randomVector(dimension: 6, range: 0...10, using: &rng)
+            let d = metric.distance(a, b)
+            XCTAssertGreaterThanOrEqual(d, 0)
+            XCTAssertLessThanOrEqual(d, 1.0 + 1e-6)
+        }
+    }
+
+    func testJensenShannonSymmetry() {
+        assertIdentityAndSymmetry(JensenShannonDistance(), dimension: 8,
+                                  range: 0...10, seed: 0x5EED_15D1)
+    }
+
+    func testJensenShannonTriangleInequality() {
+        assertTriangleInequality(JensenShannonDistance(), dimension: 8,
+                                 range: 0...10, seed: 0x5EED_15D2)
+    }
+
+    func testBatchDistancesJensenShannonMatchesScalar() {
+        let query = Vector([1.0, 2.0, 0.0])
+        let vectors = [
+            Vector([2.0, 4.0, 0.0]),   // same normalized distribution
+            Vector([0.0, 0.0, 5.0]),   // disjoint support
+            Vector([1.0, 0.0, 1.0]),
+            Vector([0.0, 0.0, 0.0]),   // one all-zero distribution
+        ]
+        assertBatchMatchesScalar(JensenShannonDistance(), query: query, vectors: vectors)
+    }
+
     // ── MahalanobisDistance ───────────────────────────────────────────
 
     func testMahalanobisIdentityMatrixEqualsEuclidean() {
@@ -389,17 +493,54 @@ final class NewMetricsTests: XCTestCase {
         XCTAssertTrue(restored is BrayCurtisDistance)
     }
 
+    func testMetricTypeRoundtripJensenShannon() {
+        let metric = JensenShannonDistance()
+        let type = DistanceMetricType(metric: metric)
+        XCTAssertEqual(type, .jensenShannon)
+        let restored = type?.makeMetric()
+        XCTAssertTrue(restored is JensenShannonDistance)
+    }
+
     func testNewMetricTypeRawValues() {
         // Raw values are append-only (never reused) per ADR-010.
         XCTAssertEqual(DistanceMetricType.chebyshev.rawValue, 5)
         XCTAssertEqual(DistanceMetricType.brayCurtis.rawValue, 6)
+        XCTAssertEqual(DistanceMetricType.jensenShannon.rawValue, 7)
     }
 
     func testMetricTypeRawValueRoundtripForNewCases() {
         // The persistence path decodes via init(rawValue:) — make sure the
         // new discriminators survive the UInt32 round-trip.
-        for type in [DistanceMetricType.chebyshev, .brayCurtis] {
+        for type in [DistanceMetricType.chebyshev, .brayCurtis, .jensenShannon] {
             XCTAssertEqual(DistanceMetricType(rawValue: type.rawValue), type)
+        }
+    }
+
+    func testBruteForceRoundtripJensenShannon() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("jensen-shannon-roundtrip.proximakit")
+        try? FileManager.default.removeItem(at: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let index = BruteForceIndex(dimension: 3, metric: JensenShannonDistance())
+        let ids = [
+            UUID(uuidString: "00000000-0000-0000-0000-000000000101")!,
+            UUID(uuidString: "00000000-0000-0000-0000-000000000102")!,
+            UUID(uuidString: "00000000-0000-0000-0000-000000000103")!,
+        ]
+        try await index.add(Vector([1.0, 0.0, 0.0]), id: ids[0])
+        try await index.add(Vector([0.0, 1.0, 0.0]), id: ids[1])
+        try await index.add(Vector([1.0, 1.0, 0.0]), id: ids[2])
+
+        try await index.save(to: url)
+        let loaded = try BruteForceIndex.load(from: url)
+
+        let query = Vector([1.0, 0.0, 0.0])
+        let original = await index.search(query: query, k: 3)
+        let restored = await loaded.search(query: query, k: 3)
+        XCTAssertEqual(restored.map(\.id), original.map(\.id))
+        for (lhs, rhs) in zip(restored, original) {
+            XCTAssertEqual(lhs.distance, rhs.distance, accuracy: 1e-6)
         }
     }
 

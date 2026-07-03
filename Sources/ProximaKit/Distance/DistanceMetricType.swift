@@ -30,6 +30,7 @@ public enum DistanceMetricType: UInt32, Sendable, CaseIterable {
     case hamming = 4
     case chebyshev = 5
     case brayCurtis = 6
+    case jensenShannon = 7
 
     /// Creates the corresponding `DistanceMetric` instance.
     public func makeMetric() -> any DistanceMetric {
@@ -41,6 +42,7 @@ public enum DistanceMetricType: UInt32, Sendable, CaseIterable {
         case .hamming: return HammingDistance()
         case .chebyshev: return ChebyshevDistance()
         case .brayCurtis: return BrayCurtisDistance()
+        case .jensenShannon: return JensenShannonDistance()
         }
     }
 
@@ -55,6 +57,7 @@ public enum DistanceMetricType: UInt32, Sendable, CaseIterable {
         case is HammingDistance: self = .hamming
         case is ChebyshevDistance: self = .chebyshev
         case is BrayCurtisDistance: self = .brayCurtis
+        case is JensenShannonDistance: self = .jensenShannon
         default: return nil
         }
     }
