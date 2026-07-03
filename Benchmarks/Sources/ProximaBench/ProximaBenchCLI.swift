@@ -24,6 +24,10 @@ struct ProximaBenchCLI {
                 try await runHNSW(args: Array(args.dropFirst(2)))
             case "ground-truth":
                 try await runGroundTruth(args: Array(args.dropFirst(2)))
+            case "distance-kernel":
+                try runDistanceKernel(args: Array(args.dropFirst(2)))
+            case "insert-shape":
+                try await runInsertShape(args: Array(args.dropFirst(2)))
             case "-h", "--help", "help":
                 usage()
             default:
@@ -79,6 +83,52 @@ struct ProximaBenchCLI {
         try await GroundTruthBuilder.run(opts)
     }
 
+    // MARK: - distance-kernel (ADR-009 GO/NO-GO sweep)
+
+    static func runDistanceKernel(args: [String]) throws {
+        let f = Flags(args)
+        let opts = DistanceKernelBench.Options(
+            dimensions: intList(f.string("--dims") ?? "384,768"),
+            counts: intList(f.string("--counts") ?? "32,256,1024,10240,102400"),
+            metrics: strList(f.string("--metrics") ?? "euclidean,cosine"),
+            reps: f.int("--reps") ?? 7,
+            warmup: f.int("--warmup") ?? 3,
+            seed: UInt64(f.int("--seed") ?? 42),
+            libraryVersion: f.string("--version") ?? "1.5.0-dev",
+            notes: f.string("--notes") ?? "",
+            outputPath: f.required("--out")
+        )
+        try DistanceKernelBench.run(opts)
+    }
+
+    // MARK: - insert-shape (characterize the real HNSW build distance shapes)
+
+    static func runInsertShape(args: [String]) async throws {
+        let f = Flags(args)
+        let opts = InsertShapeBench.Options(
+            dimensions: intList(f.string("--dims") ?? "384,768"),
+            counts: intList(f.string("--counts") ?? "1000,5000"),
+            metrics: strList(f.string("--metrics") ?? "euclidean,cosine"),
+            m: f.int("--m") ?? 16,
+            efConstruction: f.int("--efc") ?? 200,
+            seed: UInt64(f.int("--seed") ?? 42),
+            libraryVersion: f.string("--version") ?? "1.5.0-dev",
+            notes: f.string("--notes") ?? "",
+            outputPath: f.required("--out")
+        )
+        try await InsertShapeBench.run(opts)
+    }
+
+    /// Parses a comma-separated list of ints (e.g. "384,768").
+    static func intList(_ s: String) -> [Int] {
+        s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    }
+
+    /// Parses a comma-separated list of strings (e.g. "euclidean,cosine").
+    static func strList(_ s: String) -> [String] {
+        s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
     static func usage() {
         FileHandle.standardError.write(Data("""
         ProximaBench — cross-library ANN benchmark harness
@@ -98,7 +148,23 @@ struct ProximaBenchCLI {
                 [--size N] [--query-count N] [--k 10]
                 [--metric l2|cosine]
 
-        Emits a JSON document following Benchmarks/JSON_SCHEMA.md.
+          ProximaBench distance-kernel        (ADR-009 GO/NO-GO sweep)
+                --out PATH
+                [--dims 384,768] [--counts 32,256,1024,10240,102400]
+                [--metrics euclidean,cosine] [--reps 7] [--warmup 3]
+                [--seed 42] [--version 1.5.0-dev] [--notes TEXT]
+                Emits a distance-kernel-sweep JSON (own schema; latency
+                measured here is NEVER asserted in CI, per ADR-009).
+
+          ProximaBench insert-shape           (characterize HNSW build shapes)
+                --out PATH
+                [--dims 384,768] [--counts 1000,5000]
+                [--metrics euclidean,cosine] [--m 16] [--efc 200]
+                [--seed 42] [--version 1.5.0-dev] [--notes TEXT]
+                Instruments HNSWIndex.add() distance-eval counts.
+
+        The hnsw / ground-truth subcommands emit documents following
+        Benchmarks/JSON_SCHEMA.md.
 
         """.utf8))
     }

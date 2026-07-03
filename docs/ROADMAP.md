@@ -63,13 +63,19 @@ Building a 100K-vector HNSW index on CPU (M-series) currently takes ~30–60 s. 
 
 **What v1 ships:** `MetalBatchDistance`, a standalone utility computing one-query-to-N squared-L2 and cosine distances over the same flat row-major layout as the vDSP batch paths. Inline-MSL kernel (SwiftPM can't build `.metal` files portably), lazily compiled and cached; vDSP numerical parity asserted to 1e-4; automatic CPU fallback on any runtime Metal failure; clean `XCTSkip` on GPU-less CI runners.
 
-**Deliberately NOT in v1** (the original plan's remaining steps, gated on measurement):
-- Integration into the `HNSWIndex` insert loop — follow-up, contingent on benchmarking the utility against vDSP at realistic build batch sizes. No speedup is claimed until measured.
-- The `DistanceBackend` abstraction protocol — premature with a single GPU consumer; extract it when integration lands.
-- Per-query search latency — at efSearch-scale candidate counts, kernel-launch overhead dominates and vDSP wins (ADR-001's verdict stands for search).
-- Zero-copy buffers (`makeBuffer(bytesNoCopy:)`) — belongs in the integration follow-up.
+**Insert-loop integration — benchmarked, decision NO-GO** ([ADR-009 addendum](adr/ADR-009-metal-backend.md#addendum-insert-loop-integration-benchmarked--no-go-2026-07)):
 
-No performance numbers are published in `docs/BENCHMARKS.md` for the GPU path yet, by design: measured build-speedup numbers are a prerequisite for the integration follow-up, not a consequence of it.
+The deferred insert-loop integration was benchmarked (the "instrument first" step) via the `Benchmarks` package's new `insert-shape` and `distance-kernel` subcommands, and **rejected**. Two measured findings killed the premise:
+- **The one-query-to-N batch ADR-009 bet on does not exist in the real build.** `HNSWIndex.add()` has zero batch-distance calls; distance work is serial scalar `metric.distance`, of which only 7–14 % is even one-query-to-N shaped (`searchLayer` traversal) and 86–93 % is pairwise (heuristic selection + pruning). The largest batchable unit is a single node expansion of `≤ mMax0 = 32` candidates.
+- **No GPU crossover exists at any realistic N.** On an Apple M4 Max (release build), vDSP beats `MetalBatchDistance` at every N from 32 to 1,000,000 for both metrics and both dimensions (384/768); the GPU stays ~4.8× slower even at N = 1M (vDSP_mmul on the AMX coprocessor vs the GPU's per-call copy + dispatch floor). Full measured table in the ADR addendum.
+
+Consequently `MetalBatchDistance` remains a standalone, parity-tested utility and is **not** integrated; the `DistanceBackend` protocol is **not** extracted (still no second consumer). The ADR addendum states exactly what measurement would reopen the decision (a batched-build algorithm plus a zero-copy dispatch path, or hardware without AMX-class CPU matrix acceleration).
+
+**Still out of scope for the GPU path:**
+- Per-query search latency — at efSearch-scale candidate counts, kernel-launch overhead dominates and vDSP wins (ADR-001's verdict stands for search).
+- Zero-copy buffers (`makeBuffer(bytesNoCopy:)`) — would only matter if the NO-GO above were reopened.
+
+Build-phase GPU latency is recorded in the ADR-009 addendum / the `distance-kernel` JSON, never asserted in CI (it is hardware-dependent). No GPU speedup is published in `docs/BENCHMARKS.md` because, per the measurement above, there is none to publish for this workload.
 
 ### Batch Embedding
 
@@ -106,7 +112,7 @@ Extending the graph-aware beam to the quantized indexes is the remaining gap. Th
 | ADR-006 | Lumen integration (ProximaKit as KV-store backend) | Draft (in `docs/adr/`) |
 | ADR-007 | INT8 scalar quantization: dequantization policy + codec format | Accepted |
 | ADR-008 | Filtered search: post-filter decision + graph-aware addendum (implemented for `HNSWIndex`) | Accepted (retrospective + addendum) |
-| ADR-009 | Metal batch distance — v1 scoped to a standalone build-phase utility (`MetalBatchDistance`); `DistanceBackend` protocol and insert-loop integration deferred | Accepted |
+| ADR-009 | Metal batch distance — v1 shipped a standalone build-phase utility (`MetalBatchDistance`); insert-loop integration was benchmarked and settled **NO-GO** (vDSP wins at every measured N, no crossover — see the ADR-009 addendum), so the `DistanceBackend` protocol stays unextracted | Accepted (amended) |
 | ADR-010 | Serialisation format evolution policy (version field already shipped) | Accepted |
 | ADR-011 | Product quantization codec format (`PQTT` / `PQHW`, ADC, K=256) | Accepted (retrospective) |
 | ADR-012 | Full-precision reranking for quantized HNSW (`retainOriginals` + `rerankDepth`, PQHW v2) | Accepted |
