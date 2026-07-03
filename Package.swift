@@ -70,6 +70,19 @@ let package = Package(
             ]
         ),
 
+        // ── WAL Kill-Rig Writer ───────────────────────────────────────
+        // Spawn target for the out-of-process WAL crash-recovery test
+        // (ADR-013 acceptance 1). Ingests seeded vectors into a journaled
+        // index so the parent test can SIGKILL it mid-write and assert
+        // prefix semantics on reopen.
+        .executableTarget(
+            name: "WALKillWriter",
+            dependencies: ["ProximaKit"],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency"),
+            ]
+        ),
+
         // ── Tests ─────────────────────────────────────────────────────
         .testTarget(
             name: "ProximaKitTests",

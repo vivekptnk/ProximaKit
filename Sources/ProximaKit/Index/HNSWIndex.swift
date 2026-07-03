@@ -10,6 +10,12 @@
 import Accelerate
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// Configuration for the HNSW index.
 ///
 /// - `m`: Max connections per node on upper layers. Layer 0 allows `2 * m`.
@@ -169,6 +175,32 @@ public actor HNSWIndex: VectorIndex {
     /// The highest layer currently in the index.
     private var maxLevel: Int = -1
 
+    // ── Write-ahead journaling (ADR-013, opt-in) ──────────────────────
+    //
+    // Off by default: a nil journal means this index behaves exactly as it
+    // always has (the non-journaled path is byte-identical). When a journal is
+    // attached via ``checkpoint(baseURL:walURL:durability:)`` or
+    // ``open(baseURL:walURL:durability:)``, every `add`/`remove` appends its
+    // primitive record (add carries the *assigned level* so replay is
+    // deterministic) synchronously inside the actor — WAL order is actor
+    // serialization order.
+
+    /// The attached WAL sink, or nil when journaling is disabled.
+    private var journal: WALJournal?
+
+    /// True while compaction or replay drives internal `add`/`remove` calls, so
+    /// those internal mutations are not re-journaled (compaction is a
+    /// checkpoint event; replay is reconstructing from the journal itself).
+    private var suppressJournaling = false
+
+    /// Generation of the last base snapshot this index was checkpointed to.
+    /// Bound into the WAL header so a stale WAL is rejected on open.
+    private var snapshotGeneration: UInt64 = 0
+
+    /// Byte size of the last base snapshot written/loaded, for the checkpoint
+    /// policy's "WAL bytes > fraction of base" rule.
+    private var baseByteCount: Int = 0
+
     /// The number of slots in the index, **including tombstoned (removed) nodes**.
     /// Use `liveCount` to get the number of searchable vectors.
     ///
@@ -213,8 +245,28 @@ public actor HNSWIndex: VectorIndex {
             _ = remove(id: id)
         }
 
-        let newNode = vectors.count
         let newLevel = assignLevel()
+        insertNode(vector, id: id, metadata: metadata, level: newLevel)
+
+        // Journal AFTER the in-memory mutation succeeds, carrying the assigned
+        // level so replay is byte-exact (no RNG re-draw). Skipped during
+        // compaction/replay. Errors deferred from a prior non-throwing
+        // `remove` surface here.
+        if !suppressJournaling, let journal = journal {
+            try journal.appendAdd(
+                id: id, level: newLevel, vector: Array(vector.components), metadata: metadata
+            )
+        }
+    }
+
+    /// Inserts a node with an explicit, caller-supplied level — the primitive
+    /// shared by `add` (which draws the level) and WAL replay (which feeds the
+    /// journaled level). Assumes `id` is not currently live (the caller, or a
+    /// preceding `remove`, guarantees this), performs no journaling, and does
+    /// not draw from the RNG. Everything the original `add` body did from the
+    /// node allocation onward lives here.
+    private func insertNode(_ vector: Vector, id: UUID, metadata: Data?, level newLevel: Int) {
+        let newNode = vectors.count
 
         // Store node data.
         vectors.append(vector)
@@ -402,6 +454,35 @@ public actor HNSWIndex: VectorIndex {
     /// decremented) until `compact()` or auto-compaction reclaims it.
     @discardableResult
     public func remove(id: UUID) -> Bool {
+        let removed = primitiveRemove(id: id)
+        guard removed else { return false }
+
+        // Journal the removal (non-throwing path: a write error is captured and
+        // re-raised by the next throwing journaled op). Skipped during
+        // compaction/replay.
+        if !suppressJournaling {
+            journal?.appendRemove(id: id)
+        }
+
+        // Auto-compaction reclaims tombstones but changes `count`, which an
+        // append-only WAL cannot reproduce on replay. So a *journaled* index
+        // defers compaction to the next checkpoint (which rewrites the base and
+        // truncates the WAL). Non-journaled indexes keep today's exact behavior.
+        if journal == nil,
+           let threshold = config.autoCompactionThreshold,
+           count > 0,
+           Double(liveCount) / Double(count) < threshold {
+            try? compact()
+        }
+
+        return true
+    }
+
+    /// The graph-repair core of `remove` (reverse-edge cleanup + neighbor
+    /// reconnection + entry-point recompute), without journaling or
+    /// auto-compaction. Shared by public `remove` and WAL replay.
+    @discardableResult
+    private func primitiveRemove(id: UUID) -> Bool {
         guard let node = uuidToNode[id] else { return false }
         let level = nodeLevels[node]
 
@@ -459,13 +540,6 @@ public actor HNSWIndex: VectorIndex {
                     entryPointNode = n
                 }
             }
-        }
-
-        // Auto-compact if the live ratio dropped below the threshold.
-        if let threshold = config.autoCompactionThreshold,
-           count > 0,
-           Double(liveCount) / Double(count) < threshold {
-            try? compact()
         }
 
         return true
@@ -547,6 +621,203 @@ public actor HNSWIndex: VectorIndex {
         try PersistenceEngine.loadHNSW(from: url)
     }
 
+    // ── Streaming persistence: WAL journaling (ADR-013, Stage 1, opt-in) ─
+    //
+    // Additive surface. `save(to:)`/`load(from:)` above are untouched (full
+    // resident, atomic, v2). These methods layer a write-ahead log over a base
+    // snapshot so saves become O(change) instead of O(corpus).
+
+    /// Opens a journaled index: loads the base `.pxkt`, then replays the
+    /// `.pxwal` sidecar (if present) over it, and attaches the WAL for further
+    /// appends. Prefix semantics — a torn WAL tail is truncated to its longest
+    /// intact record run; a stale WAL (parent generation ≠ base) throws
+    /// `PersistenceError.walGenerationMismatch`.
+    ///
+    /// The base file must exist (create one first with
+    /// ``checkpoint(baseURL:walURL:durability:)`` or a plain `save`).
+    public static func open(
+        baseURL: URL,
+        walURL: URL,
+        durability: WALDurability = .everyBatch
+    ) async throws -> HNSWIndex {
+        let index = try PersistenceEngine.loadHNSW(from: baseURL)
+        let generation = try PersistenceEngine.readGeneration(from: baseURL)
+        let baseBytes = (try? Data(contentsOf: baseURL, options: .mappedIfSafe).count) ?? 0
+        try await index.attachJournal(
+            baseURL: baseURL, walURL: walURL, generation: generation,
+            baseByteCount: baseBytes, durability: durability
+        )
+        return index
+    }
+
+    /// Replays an existing WAL (validating its generation) and attaches it in
+    /// append mode. Runs inside the actor.
+    private func attachJournal(
+        baseURL: URL,
+        walURL: URL,
+        generation: UInt64,
+        baseByteCount: Int,
+        durability: WALDurability
+    ) throws {
+        self.snapshotGeneration = generation
+        self.baseByteCount = baseByteCount
+
+        guard FileManager.default.fileExists(atPath: walURL.path) else {
+            // No WAL yet — create a fresh one bound to the base generation.
+            try startFreshJournal(walURL: walURL, durability: durability)
+            return
+        }
+
+        let walData = try Data(contentsOf: walURL, options: .mappedIfSafe)
+        // Throws for a damaged header or a stale generation; a torn record tail
+        // is recovered as the longest valid prefix (no throw).
+        let replay = try WALDecoder.decode(walData, expectedGeneration: generation)
+
+        // The decoder validates the WAL's own framing (header CRC, parent
+        // generation) but not that this sidecar was written for *this* base
+        // index. Cross-check the header's dimension/metric against the base
+        // before replaying: a crafted or mispaired WAL with a different
+        // dimension would otherwise feed mismatched-length vectors straight into
+        // `insertNode`, past the public `add(_:id:)` dimension guard.
+        guard replay.dimension == dimension else {
+            throw PersistenceError.walDimensionMismatch(expected: dimension, found: replay.dimension)
+        }
+        if let metricType = DistanceMetricType(metric: metric),
+           replay.metricRaw != metricType.rawValue {
+            throw PersistenceError.walMetricMismatch(expected: metricType.rawValue, found: replay.metricRaw)
+        }
+
+        applyReplay(replay.records)
+
+        // Reopen in append mode. If the tail was torn, rewrite the file to the
+        // valid prefix first so future appends extend clean bytes, not garbage.
+        let validByteCount = walData.count - replay.trailingBytesDropped
+        if replay.trailingBytesDropped > 0 {
+            try walData.prefix(validByteCount).write(to: walURL, options: .atomic)
+        }
+        self.journal = try WALJournal(
+            appendingTo: walURL,
+            parentGeneration: generation,
+            dimension: dimension,
+            existingByteCount: validByteCount,
+            durability: durability
+        )
+    }
+
+    private func startFreshJournal(walURL: URL, durability: WALDurability) throws {
+        guard let metricType = DistanceMetricType(metric: metric) else {
+            throw PersistenceError.unserializableMetric
+        }
+        journal?.close()
+        journal = try WALJournal(
+            creatingAt: walURL,
+            parentGeneration: snapshotGeneration,
+            dimension: dimension,
+            metricRaw: metricType.rawValue,
+            durability: durability
+        )
+    }
+
+    /// Applies decoded WAL records to rebuild state. No journaling, no
+    /// auto-compaction — records are replayed exactly as written, and the
+    /// journaled level makes each insertion deterministic.
+    private func applyReplay(_ records: [WALRecord]) {
+        let wasSuppressed = suppressJournaling
+        suppressJournaling = true
+        defer { suppressJournaling = wasSuppressed }
+        for record in records {
+            switch record {
+            case let .add(id, level, vector, metadata):
+                insertNode(Vector(vector), id: id, metadata: metadata, level: level)
+            case let .remove(id):
+                _ = primitiveRemove(id: id)
+            }
+        }
+    }
+
+    /// Checkpoints: compacts, writes a fresh v3 base snapshot (generation
+    /// bumped) atomically, `F_FULLFSYNC`, then resets the WAL to a new empty
+    /// journal bound to the new generation. This is the supported way to both
+    /// establish journaling on a fresh index and to fold an accumulated WAL
+    /// back into the base.
+    ///
+    /// Crash-safety note (Stage 1): the base rename is the commit point. A
+    /// crash after the new base is renamed but before the WAL is reset leaves a
+    /// complete new base beside a stale WAL; the next ``open(baseURL:walURL:)``
+    /// surfaces that as a typed `walGenerationMismatch` (no silent loss, no
+    /// corruption) — the operator can delete the stale WAL to recover, since
+    /// the new base already holds every committed record.
+    public func checkpoint(
+        baseURL: URL,
+        walURL: URL,
+        durability: WALDurability = .everyBatch
+    ) throws {
+        // Fold any deferred journal write error before we drop the old WAL.
+        try journal?.sync()
+
+        if liveCount < count {
+            try compact()
+        }
+        guard let metricType = DistanceMetricType(metric: metric) else {
+            throw PersistenceError.unserializableMetric
+        }
+
+        let newGeneration = snapshotGeneration &+ 1
+        let snapshot = HNSWSnapshot(
+            dimension: dimension, config: config, metricType: metricType,
+            vectors: vectors, metadata: metadata, nodeToUUID: nodeToUUID,
+            layers: layers, nodeLevels: nodeLevels,
+            entryPointNode: entryPointNode, maxLevel: maxLevel
+        )
+        // Atomic base write (temp + rename) and force it to media.
+        try PersistenceEngine.saveHNSW(snapshot, generation: newGeneration, to: baseURL)
+        try fullSyncFile(baseURL)
+        self.snapshotGeneration = newGeneration
+        self.baseByteCount = (try? Data(contentsOf: baseURL, options: .mappedIfSafe).count) ?? 0
+
+        // Reset the WAL to a fresh empty journal bound to the new generation.
+        try startFreshJournal(walURL: walURL, durability: durability)
+    }
+
+    /// Flushes the WAL per its durability policy (surfacing any deferred error).
+    public func syncJournal() throws {
+        try journal?.sync()
+    }
+
+    /// Whether the accumulated WAL warrants a checkpoint under `policy`.
+    public func needsCheckpoint(policy: WALCheckpointPolicy = WALCheckpointPolicy()) -> Bool {
+        guard let journal = journal else { return false }
+        if journal.recordCount > policy.maxOps { return true }
+        if baseByteCount > 0 {
+            return Double(journal.byteCount) > Double(baseByteCount) * policy.walBytesFractionOfBase
+        }
+        return false
+    }
+
+    /// Current WAL size in bytes (header + records since last checkpoint).
+    public var journalByteCount: Int { journal?.byteCount ?? 0 }
+
+    /// Records appended to the WAL since the last checkpoint.
+    public var journalRecordCount: Int { journal?.recordCount ?? 0 }
+
+    /// The generation of the base this index is currently bound to.
+    public var currentGeneration: UInt64 { snapshotGeneration }
+
+    /// Detaches and closes the journal (further mutations are not journaled).
+    public func closeJournal() {
+        journal?.close()
+        journal = nil
+    }
+
+    private func fullSyncFile(_ url: URL) throws {
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        #if canImport(Darwin)
+        if fcntl(handle.fileDescriptor, F_FULLFSYNC) == 0 { return }
+        #endif
+        _ = fsync(handle.fileDescriptor)
+    }
+
     // ── Compaction ────────────────────────────────────────────────────
 
     /// Rebuilds the index, removing all tombstoned (deleted) nodes.
@@ -562,6 +833,13 @@ public actor HNSWIndex: VectorIndex {
     /// // Now count == liveCount
     /// ```
     public func compact() throws {
+        // Compaction re-inserts live nodes through `add`, drawing fresh levels.
+        // It is a base-rewrite (checkpoint) event, never a journaled one, so
+        // suppress record emission for the duration.
+        let wasSuppressed = suppressJournaling
+        suppressJournaling = true
+        defer { suppressJournaling = wasSuppressed }
+
         // Snapshot all live nodes before clearing state.
         var live: [(id: UUID, vector: Vector, metadata: Data?)] = []
         for (node, uuid) in nodeToUUID.enumerated() {
@@ -981,5 +1259,34 @@ public actor HNSWIndex: VectorIndex {
             }
         }
         return visited.count == liveNodes.count
+    }
+
+    /// Full internal-state fingerprint for exact-equality assertions in WAL
+    /// recovery tests. Two indexes with identical fingerprints are byte-for-byte
+    /// the same graph — including tombstone slots, level assignments, adjacency,
+    /// entry point, vectors, and metadata. Used to prove that a WAL replay
+    /// reproduces the exact state that produced the log (ADR-013 acceptance 1).
+    internal struct StructuralFingerprint: Equatable {
+        let nodeToUUID: [UUID]
+        let uuidToNode: [UUID: Int]
+        let nodeLevels: [Int]
+        let layers: [[[Int]]]
+        let entryPointNode: Int?
+        let maxLevel: Int
+        let vectors: [Vector]
+        let metadata: [Data?]
+    }
+
+    internal var structuralFingerprint: StructuralFingerprint {
+        StructuralFingerprint(
+            nodeToUUID: nodeToUUID,
+            uuidToNode: uuidToNode,
+            nodeLevels: nodeLevels,
+            layers: layers,
+            entryPointNode: entryPointNode,
+            maxLevel: maxLevel,
+            vectors: vectors,
+            metadata: metadata
+        )
     }
 }

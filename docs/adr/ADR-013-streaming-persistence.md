@@ -1,12 +1,15 @@
 # ADR-013: Streaming Persistence — Incremental Saves and On-Demand Paging
 
 ## Status
-**Proposed — design only, NOT implemented.** Unlike every Accepted ADR in this
-directory, no shipping code corresponds to this document. It is a worked
-design for a future change, written so a future implementer does not have to
-re-derive the analysis. All byte figures below are arithmetic from code facts
-and the per-vector costs documented in ADR-007/ADR-011 — none are
-measurements, because the design has not been built.
+**Accepted (Stage 1: WAL / Option A) — Stage 2 (paged vectors / Option C)
+remains design-only.** Stage 1 (the `.pxwal` sidecar, `.pxkt` v3 generation
+binding, deterministic replay, checkpoint policy, fsync dial, and the recovery
+test rigs) ships. See the **Stage 1 implementation notes** addendum at the end
+of this document for what was built, the format bytes as implemented, and the
+deviations from the original design (all documented, none silent). Everything
+in Options B/C/D and acceptance criteria 3–4 below is still forward-looking
+design; the byte figures in the Context section remain arithmetic, not
+measurements.
 
 ## Context
 
@@ -331,3 +334,119 @@ as its checkpoint. Stage 2 rides the format bump Stage 1 already forces.
 - Until implemented, this ADR makes no performance or recall claims — every
   number above is either file-format arithmetic or an explicitly labeled
   acceptance gate to be measured under ADR-005 methodology.
+
+## Stage 1 implementation notes (addendum, M3-F29)
+
+This addendum records what Stage 1 actually shipped and where it deviates from
+the design above. Correction/addendum style per the ADR-003 precedent: the
+body of this ADR is the original design; this section is authoritative for the
+built code.
+
+### What shipped
+
+- **`PXWL` v1 sidecar** (`WALFormat.swift`, `WALJournal.swift`). Fixed 32-byte
+  header: magic `"PXWL"`, version, `parentGeneration: UInt64`, dimension,
+  metric raw, and a **header CRC32 over the first 24 bytes** (added beyond the
+  design so a damaged header is a typed error, not a mis-parse). Records are
+  framed `[payloadLength: UInt32][crc32: UInt32][payload]`, little-endian.
+  `add` payload = opcode + UUID + **assigned level (Int32)** + vector
+  (d × Float32) + metadata length/bytes; `remove` = opcode + UUID. CRC is
+  IEEE-802.3 (`0xEDB88320`), a small pure-Foundation implementation to keep the
+  zero-dependency contract.
+- **Torn-tail / prefix semantics.** The decoder stops at the first record whose
+  frame runs past EOF or whose CRC fails, returning the longest intact prefix
+  and the dropped-byte count. A torn tail is **not** an error — recovery
+  returns the recovered index. Only a damaged header or a stale
+  `parentGeneration` throws. Stale generation is the typed
+  `PersistenceError.walGenerationMismatch(expected:found:)` (the ADR's
+  recommended choice over silent discard).
+- **`.pxkt` v3** (`PersistenceEngine.saveHNSW(_:generation:to:)`,
+  `readGeneration(from:)`). The 64-byte legacy header and the v2 body are kept
+  byte-for-byte; a fixed 96-byte **trailer** is appended after the metadata
+  section: `sectionCount`, a per-section `(offset,length)` table for the five
+  sections, `snapshotGeneration: UInt64`, and a trailer magic `"PXK3"`. The
+  sequential loader stops after the metadata section, so **v3 loads through the
+  unchanged resident path exactly like v2**; only the WAL layer reads the
+  trailer. `minSupportedVersion` stays 1; `maxReadableVersion` is 3. v1/v2 load
+  exactly as today (covered by the existing corruption/version tests, still
+  green).
+- **Deterministic replay with exact equality.** Because the assigned level is
+  journaled, replay re-inserts through the same deterministic
+  `searchLayer`/heuristic path and reproduces the **byte-exact** producing
+  state — asserted structurally (adjacency, levels, entry point, tombstones,
+  vectors, metadata), not merely by search validity
+  (`WALRecoveryTests.testReplayReproducesExactState`).
+- **Checkpoint** (`HNSWIndex.checkpoint(baseURL:walURL:durability:)`) reuses the
+  atomic full save as the base rewrite: compact → write v3 base with generation
+  bumped → `F_FULLFSYNC` → reset the WAL to a fresh empty journal on the new
+  generation. Policy helper `needsCheckpoint(policy:)` with
+  `WALCheckpointPolicy(walBytesFractionOfBase: 0.10, maxOps: 10_000)` — both
+  configurable, defaults per the ADR.
+- **fsync dial** `WALDurability { .everyRecord, .everyBatch (default), .manual }`
+  with `F_FULLFSYNC` at checkpoint commit. Doc comments state the Darwin
+  guarantee precisely (`fsync` reaches the drive cache; only `F_FULLFSYNC`
+  forces media) — no overpromising.
+- **Additive, opt-in API.** `save(to:)`/`load(from:)` are untouched and still
+  write/read **v2** (byte-identical). Journaling is a new surface:
+  `HNSWIndex.open(baseURL:walURL:durability:)`,
+  `checkpoint(...)`, `syncJournal()`, `needsCheckpoint(...)`,
+  `closeJournal()`. Existing non-journaled call sites take an unchanged path
+  (the `journal == nil` branch).
+- **Recovery test rigs.** In-process truncation sweep at every record boundary
+  and every byte of the final record, asserting exact-prefix equality
+  (`WALTruncationSweepTests`); out-of-process `Process` + SIGKILL rig with a
+  5-iteration smoke that runs in CI and a ≥100-iteration heavy class gated
+  behind `PROXIMA_RUN_KILL_RIG` / `--skip WALKillRecoveryTests`
+  (`WALKillRecoveryTests`, spawn target `WALKillWriter`). Every new
+  regression/acceptance test was shown to fail under a code perturbation and
+  pass on restore.
+
+### Deviations from the design (documented)
+
+1. **Legacy `save(to:)` keeps writing v2, not v3.** The design says "writers
+   write 3." Acceptance criterion 5 and the harness ground rules require the
+   existing `save(to:)`/`load(from:)` to stay byte-identical, so only the new
+   streaming-persistence checkpoint writer stamps v3. v3 is otherwise a strict
+   superset (v2 body + trailer), so this costs nothing and preserves the frozen
+   contract. Consequence: a base only carries a generation once it has been
+   through a `checkpoint`; a plain-saved v2 base reads generation 0.
+2. **16 KiB vector-section padding deferred to Stage 2.** The design pads the
+   vector section start to a page boundary as part of the v3 bump. That padding
+   has **zero function in Stage 1** (which never memory-maps the vector region)
+   and would bloat every v3 file plus require threading a padded offset through
+   the sequential reader — pure Stage-2 (Option C) plumbing. The v3 trailer
+   ships a per-section offset/length table precisely so Stage 2 can add the
+   padding as a localized change without another version bump.
+3. **Auto-compaction is suppressed while a journal is attached.** Compaction
+   physically drops tombstone slots, changing `count` in a way an append-only
+   WAL cannot reproduce on replay. So a *journaled* index defers compaction to
+   the next `checkpoint` (which rewrites the base and truncates the WAL);
+   non-journaled indexes keep today's exact auto-compaction behavior. This is an
+   additive branch on the new opt-in mode, so existing call sites are unchanged.
+4. **Checkpoint crash window.** True cross-file atomicity of "rewrite base +
+   truncate WAL" is not possible with a single rename barrier. The base rename
+   is the commit point; a crash after it but before the WAL reset leaves a
+   complete new base beside a stale (generation − 1) WAL, which the next `open`
+   surfaces as a typed `walGenerationMismatch` (no silent loss, no corruption —
+   the new base already holds every committed record; the operator deletes the
+   stale WAL to proceed). The kill rig exercises kills during *ingest* (the
+   torn-tail path), not this checkpoint window.
+5. **Store-level journaling deferred.** The index-level WAL API is designed to
+   compose with the stores' `mutationGeneration`/`savedGeneration` discipline
+   (WAL append order = actor serialization order; `save()` → `checkpoint()`),
+   but wiring it into `VectorStore`/`HybridVectorStore` was not shipped in
+   Stage 1: `HybridVectorStore` explicitly freezes the `VectorStore` v1 contract
+   (CHA-107), the sparse leg has no WAL codec yet, and none of the in-scope
+   acceptance criteria (1, 2, 5) require it. It is a thin, additive wrapper over
+   the shipped index API and is left as a scoped follow-up.
+
+### Acceptance criteria status
+
+- **1 (recovery-after-kill): met.** In-process truncation sweep + out-of-process
+  SIGKILL rig, prefix semantics asserted; no `corruptedData` on a
+  library-written WAL; recovery never traps.
+- **2 (fsync policy): met.** Configurable dial, documented Darwin guarantees,
+  `F_FULLFSYNC` at checkpoint.
+- **3, 4 (paged memory / search parity): out of scope (Stage 2).**
+- **5 (additive API only): met at the index level; store wiring deferred
+  (deviation 5).** `save`/`load` unchanged; journaling is opt-in.

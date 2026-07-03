@@ -21,9 +21,31 @@ private let magic: UInt32 = 0x50584B54  // "PXKT"
 /// - v2: encodes `autoCompactionThreshold` in the previously reserved header
 ///   bytes at offset 56 (Float64 bit pattern; all-zero bits encode `nil`).
 ///   v1 files remain readable; they load with the documented default (`0.7`).
+/// - v3: identical 64-byte legacy header and body to v2, plus a fixed trailer
+///   appended after the metadata section (ADR-013): a per-section table
+///   (offset + length) and a `snapshotGeneration` that binds a WAL sidecar to
+///   this base. The sequential loader stops after the metadata section, so
+///   v3 files load byte-for-byte like v2 in the resident path; only the WAL
+///   layer reads the trailer. `minSupportedVersion` stays 1 (v1/v2 load exactly
+///   as today). The legacy `save(_:to:)` writers keep stamping v2 so their
+///   output is byte-identical to before; only the streaming-persistence
+///   checkpoint writer (`saveHNSW(_:generation:to:)`) stamps v3.
 private let formatVersion: UInt32 = 2
 private let minSupportedVersion: UInt32 = 1
+/// Highest version this reader understands. v3 adds the WAL-binding trailer.
+private let maxReadableVersion: UInt32 = 3
+private let v3FormatVersion: UInt32 = 3
 private let headerSize = 64
+
+// ── v3 trailer (ADR-013) ──────────────────────────────────────────────
+// Fixed layout appended after the metadata section:
+//   sectionCount: UInt32 (= 5)
+//   [uuids, vectors, nodeLevels, adjacency, metadata] × (offset: UInt64, length: UInt64)
+//   snapshotGeneration: UInt64
+//   trailerMagic: UInt32 ("PXK3")
+private let v3SectionCount = 5
+private let v3TrailerMagic: UInt32 = 0x5058_4B33  // "PXK3"
+private let v3TrailerSize = 4 + v3SectionCount * 16 + 8 + 4  // = 96
 
 /// The `HNSWConfiguration` default threshold, applied when loading v1 files
 /// that predate threshold serialization.
@@ -361,11 +383,118 @@ public enum PersistenceEngine {
 
         return HNSWIndex(restoring: snapshot)
     }
+
+    // MARK: - Save HNSW (v3, WAL-binding)
+
+    /// Saves an HNSW snapshot in `.pxkt` **v3**: the v2 body plus the trailer
+    /// that binds a `snapshotGeneration` to this base (ADR-013). Used by the
+    /// streaming-persistence checkpoint path; the legacy `save(_:to:)` keeps
+    /// writing v2 so its bytes are unchanged.
+    ///
+    /// The body (header through metadata) is laid out identically to v2, so
+    /// `loadHNSW(from:)` — which stops after the metadata section — restores a
+    /// v3 file exactly like a v2 one. The trailer is read only by
+    /// ``readGeneration(from:)``.
+    public static func saveHNSW(_ snapshot: HNSWSnapshot, generation: UInt64, to url: URL) throws {
+        var data = Data()
+        let count = snapshot.nodeToUUID.count
+
+        // ── Header (v3) ───────────────────────────────────────────────
+        appendUInt32(&data, magic)
+        appendUInt32(&data, v3FormatVersion)
+        appendUInt32(&data, indexTypeHNSW)
+        appendUInt32(&data, UInt32(snapshot.dimension))
+        appendUInt32(&data, UInt32(count))
+        appendUInt32(&data, snapshot.metricType.rawValue)
+        appendUInt32(&data, UInt32(snapshot.config.m))
+        appendUInt32(&data, UInt32(snapshot.config.mMax0))
+        appendUInt32(&data, UInt32(snapshot.config.efConstruction))
+        appendUInt32(&data, UInt32(snapshot.config.efSearch))
+        appendInt32(&data, snapshot.entryPointNode.map { Int32($0) } ?? -1)
+        appendInt32(&data, Int32(snapshot.maxLevel))
+        appendUInt32(&data, UInt32(snapshot.layers.count))
+        let metadataOffsetPosition = data.count
+        appendUInt32(&data, 0) // placeholder
+        appendUInt64(&data, snapshot.config.autoCompactionThreshold?.bitPattern ?? 0)
+        assert(data.count == headerSize)
+
+        // Track section boundaries for the trailer's section table.
+        var sections: [(offset: Int, length: Int)] = []
+        func section(_ body: () -> Void) {
+            let start = data.count
+            body()
+            sections.append((start, data.count - start))
+        }
+
+        section {  // UUIDs
+            for uuid in snapshot.nodeToUUID { appendUUID(&data, uuid) }
+        }
+        section {  // Vectors
+            for vector in snapshot.vectors {
+                vector.components.withUnsafeBufferPointer { buffer in
+                    buffer.withMemoryRebound(to: UInt8.self) { data.append(contentsOf: $0) }
+                }
+            }
+        }
+        section {  // nodeLevels
+            for level in snapshot.nodeLevels { appendInt32(&data, Int32(level)) }
+        }
+        section {  // adjacency
+            for layer in snapshot.layers {
+                for neighbors in layer {
+                    appendUInt32(&data, UInt32(neighbors.count))
+                    for neighbor in neighbors { appendInt32(&data, Int32(neighbor)) }
+                }
+            }
+        }
+        let metadataOffset = UInt32(data.count)
+        writeMetadataOffset(&data, offset: metadataOffset, at: metadataOffsetPosition)
+        section {  // metadata
+            appendMetadata(&data, snapshot.metadata)
+        }
+
+        // ── Trailer ───────────────────────────────────────────────────
+        appendUInt32(&data, UInt32(v3SectionCount))
+        for s in sections {
+            appendUInt64(&data, UInt64(s.offset))
+            appendUInt64(&data, UInt64(s.length))
+        }
+        appendUInt64(&data, generation)
+        appendUInt32(&data, v3TrailerMagic)
+
+        try data.write(to: url, options: .atomic)
+    }
+
+    /// Reads the `snapshotGeneration` bound to a base file. v1/v2 files (which
+    /// predate the trailer) report generation 0. A v3 file whose trailer is
+    /// truncated or whose trailer magic is wrong throws a typed
+    /// `PersistenceError` — never traps.
+    public static func readGeneration(from url: URL) throws -> UInt64 {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        let header = try readHeader(data)   // validates magic/version/metric
+        guard header.version >= v3FormatVersion else { return 0 }
+        guard data.count >= headerSize + v3TrailerSize else {
+            throw PersistenceError.corruptedData("v3 file too small for trailer")
+        }
+        let trailerStart = data.count - v3TrailerSize
+        let trailerMagic = data.loadLE(UInt32.self, at: data.count - 4)
+        guard trailerMagic == v3TrailerMagic else {
+            throw PersistenceError.corruptedData("v3 trailer magic mismatch")
+        }
+        let sectionCount = data.loadLE(UInt32.self, at: trailerStart)
+        guard sectionCount == UInt32(v3SectionCount) else {
+            throw PersistenceError.corruptedData(
+                "v3 trailer section count \(sectionCount) != \(v3SectionCount)")
+        }
+        let generationOffset = trailerStart + 4 + v3SectionCount * 16
+        return data.loadLE(UInt64.self, at: generationOffset)
+    }
 }
 
 // MARK: - Header Parsing
 
 private struct FileHeader {
+    let version: UInt32
     let indexType: UInt32
     let dimension: UInt32
     let count: UInt32
@@ -392,7 +521,7 @@ private func readHeader(_ data: Data) throws -> FileHeader {
     }
 
     let version = data.loadLE(UInt32.self, at: 4)
-    guard version >= minSupportedVersion, version <= formatVersion else {
+    guard version >= minSupportedVersion, version <= maxReadableVersion else {
         throw PersistenceError.unsupportedVersion(version)
     }
 
@@ -421,6 +550,7 @@ private func readHeader(_ data: Data) throws -> FileHeader {
     }
 
     return FileHeader(
+        version: version,
         indexType: data.loadLE(UInt32.self, at: 8),
         dimension: data.loadLE(UInt32.self, at: 12),
         count: data.loadLE(UInt32.self, at: 16),
