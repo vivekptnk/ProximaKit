@@ -94,6 +94,24 @@ struct SplitMix64: RandomNumberGenerator {
     }
 }
 
+/// How ``HNSWIndex/open(baseURL:walURL:durability:mode:)`` materializes the
+/// base snapshot's vector section (ADR-013 Stage 2). Additive; `.resident` is
+/// the default and preserves the historical fully-resident behavior byte for
+/// byte.
+public enum HNSWOpenMode: Sendable {
+    /// Decode every section (including vectors) into resident memory — the
+    /// original behavior. Fastest warm search, highest residency.
+    case resident
+
+    /// Serve the vector section from a read-only file mapping, faulted in on
+    /// demand, keeping only the graph, ids, levels, metadata, and a resident
+    /// tail of post-snapshot adds in memory. Requires a padded v3 base (written
+    /// by any `checkpoint`). Trades a slower first-search-after-open (page
+    /// faults) for corpus-larger-than-RAM residency; warm results are
+    /// bit-identical to `.resident`.
+    case paged
+}
+
 /// Approximate nearest-neighbor index using Hierarchical Navigable Small World graphs.
 ///
 /// The index organizes vectors into a multi-layer graph:
@@ -157,8 +175,19 @@ public actor HNSWIndex: VectorIndex {
     /// The maximum layer each node was assigned to.
     private var nodeLevels: [Int] = []
 
-    /// Vector data for each node.
-    private var vectors: [Vector] = []
+    /// Vector data for each node, served through the resident-or-paged provider
+    /// (ADR-013 Stage 2). Resident by default (byte-identical to the historical
+    /// `[Vector]`); a `.paged` open maps the base's vector section and keeps
+    /// post-snapshot adds in a resident tail. `count` slots come from here.
+    private var vectorProvider: VectorProvider
+
+    /// Whether this index was opened in `.paged` mode. Governs the
+    /// checkpoint-remap story: a paged index re-maps the freshly written base
+    /// after a checkpoint so it keeps serving vectors from the file, not
+    /// resident memory. Resident indexes leave it `false` and behave exactly as
+    /// before. (`compact` materializes vectors resident transiently; the next
+    /// checkpoint re-establishes the mapping.)
+    private var isPagedMode = false
 
     /// Metadata for each node.
     private var metadata: [Data?] = []
@@ -208,7 +237,7 @@ public actor HNSWIndex: VectorIndex {
     ///   *live* document count from `count` (its slot total is `slotCount`).
     ///   When comparing the two legs of a ``HybridIndex`` after removals,
     ///   compare this index's `liveCount` against the sparse leg's `count`.
-    public var count: Int { vectors.count }
+    public var count: Int { vectorProvider.count }
 
     /// The number of live (non-tombstoned) vectors available for search.
     /// After removals, `liveCount <= count`. After `compact()`, they are equal.
@@ -232,6 +261,7 @@ public actor HNSWIndex: VectorIndex {
         self.config = config
         self.levelMultiplier = 1.0 / log(Double(config.m))
         self.levelRNG = config.levelSeed.map(SplitMix64.init(seed:))
+        self.vectorProvider = .resident(dimension: dimension)
     }
 
     // ── VectorIndex: Add (Algorithm 1 from paper) ─────────────────────
@@ -266,10 +296,10 @@ public actor HNSWIndex: VectorIndex {
     /// not draw from the RNG. Everything the original `add` body did from the
     /// node allocation onward lives here.
     private func insertNode(_ vector: Vector, id: UUID, metadata: Data?, level newLevel: Int) {
-        let newNode = vectors.count
+        let newNode = vectorProvider.count
 
         // Store node data.
-        vectors.append(vector)
+        vectorProvider.append(vector)
         self.metadata.append(metadata)
         nodeToUUID.append(id)
         uuidToNode[id] = newNode
@@ -516,9 +546,9 @@ public actor HNSWIndex: VectorIndex {
                 candidateNodes.remove(f)
                 guard !candidateNodes.isEmpty else { continue }
 
-                let fVector = vectors[f]
+                let fVector = vectorProvider.vector(at: f)
                 let candidates = candidateNodes.map { candidate in
-                    (node: candidate, distance: metric.distance(fVector, vectors[candidate]))
+                    (node: candidate, distance: metric.distance(fVector, vectorProvider.vector(at: candidate)))
                 }
                 let selected = selectNeighborsHeuristic(
                     target: fVector,
@@ -574,12 +604,50 @@ public actor HNSWIndex: VectorIndex {
         }
         self.inEdges = rebuiltInEdges
         self.nodeLevels = snapshot.nodeLevels
-        self.vectors = snapshot.vectors
+        self.vectorProvider = .resident(snapshot.vectors, dimension: snapshot.dimension)
         self.metadata = snapshot.metadata
         self.nodeToUUID = snapshot.nodeToUUID
         self.entryPointNode = snapshot.entryPointNode
         self.maxLevel = snapshot.maxLevel
         // Rebuild the reverse lookup.
+        self.uuidToNode = [:]
+        for (i, uuid) in snapshot.nodeToUUID.enumerated() {
+            self.uuidToNode[uuid] = i
+        }
+    }
+
+    /// Restores an HNSW index in **paged** mode: identical to `init(restoring:)`
+    /// except the vector section is served from `region` (a read-only file
+    /// mapping) instead of a resident `[Vector]`. Post-snapshot adds (live adds
+    /// and WAL replay) land in the provider's resident tail — node id
+    /// `< region.count` maps into the file, otherwise into the tail. Used only
+    /// by ``PersistenceEngine/loadHNSWPaged(from:)``; `snapshot.vectors` is
+    /// ignored (empty by construction).
+    internal init(restoringPaged snapshot: HNSWSnapshot, region: MappedVectorRegion) {
+        self.dimension = snapshot.dimension
+        self.metric = snapshot.metricType.makeMetric()
+        self.config = snapshot.config
+        self.levelMultiplier = 1.0 / log(Double(snapshot.config.m))
+        self.levelRNG = snapshot.config.levelSeed.map(SplitMix64.init(seed:))
+        self.layers = snapshot.layers
+        var rebuiltInEdges: [[Set<Int>]] = snapshot.layers.map { layer in
+            Array(repeating: Set<Int>(), count: layer.count)
+        }
+        for (l, layer) in snapshot.layers.enumerated() {
+            for (from, neighbors) in layer.enumerated() {
+                for to in neighbors {
+                    rebuiltInEdges[l][to].insert(from)
+                }
+            }
+        }
+        self.inEdges = rebuiltInEdges
+        self.nodeLevels = snapshot.nodeLevels
+        self.vectorProvider = .paged(region: region, dimension: snapshot.dimension)
+        self.isPagedMode = true
+        self.metadata = snapshot.metadata
+        self.nodeToUUID = snapshot.nodeToUUID
+        self.entryPointNode = snapshot.entryPointNode
+        self.maxLevel = snapshot.maxLevel
         self.uuidToNode = [:]
         for (i, uuid) in snapshot.nodeToUUID.enumerated() {
             self.uuidToNode[uuid] = i
@@ -600,7 +668,7 @@ public actor HNSWIndex: VectorIndex {
             dimension: dimension,
             config: config,
             metricType: metricType,
-            vectors: vectors,
+            vectors: vectorProvider.materialized(),
             metadata: metadata,
             nodeToUUID: nodeToUUID,
             layers: layers,
@@ -635,12 +703,34 @@ public actor HNSWIndex: VectorIndex {
     ///
     /// The base file must exist (create one first with
     /// ``checkpoint(baseURL:walURL:durability:)`` or a plain `save`).
+    ///
+    /// `mode` (ADR-013 Stage 2, additive — defaults to `.resident` so existing
+    /// call sites are byte-identical):
+    /// - `.resident` decodes the whole base into memory, exactly as before.
+    /// - `.paged` serves the base's vector section from a read-only file
+    ///   mapping instead of copying it resident, cutting cold-start and
+    ///   residency to the graph + working-set of vector pages. Requires a
+    ///   padded v3 base (any `checkpoint` writes one); an unpadded or non-v3
+    ///   base throws a typed `PersistenceError`. Post-open adds and WAL
+    ///   replay land in a resident tail. **Contract:** the mapping is opened
+    ///   read-only and ProximaKit never truncates its own live files, but
+    ///   truncating a mapped base from *outside* the library is out of
+    ///   contract — a faulted page past a shrunken end-of-file raises SIGBUS,
+    ///   which Swift cannot catch. See ``MappedVectorRegion`` and ADR-013 for
+    ///   the full mmap-lifetime discussion.
     public static func open(
         baseURL: URL,
         walURL: URL,
-        durability: WALDurability = .everyBatch
+        durability: WALDurability = .everyBatch,
+        mode: HNSWOpenMode = .resident
     ) async throws -> HNSWIndex {
-        let index = try PersistenceEngine.loadHNSW(from: baseURL)
+        let index: HNSWIndex
+        switch mode {
+        case .resident:
+            index = try PersistenceEngine.loadHNSW(from: baseURL)
+        case .paged:
+            index = try PersistenceEngine.loadHNSWPaged(from: baseURL)
+        }
         let generation = try PersistenceEngine.readGeneration(from: baseURL)
         let baseBytes = (try? Data(contentsOf: baseURL, options: .mappedIfSafe).count) ?? 0
         try await index.attachJournal(
@@ -743,10 +833,24 @@ public actor HNSWIndex: VectorIndex {
     ///
     /// Crash-safety note (Stage 1): the base rename is the commit point. A
     /// crash after the new base is renamed but before the WAL is reset leaves a
-    /// complete new base beside a stale WAL; the next ``open(baseURL:walURL:durability:)``
+    /// complete new base beside a stale WAL; the next ``open(baseURL:walURL:durability:mode:)``
     /// surfaces that as a typed `walGenerationMismatch` (no silent loss, no
     /// corruption) — the operator can delete the stale WAL to recover, since
     /// the new base already holds every committed record.
+    ///
+    /// Paged-mode remap (ADR-013 Stage 2): a checkpoint necessarily renumbers
+    /// nodes (compaction) and writes an all-resident base, so the pre-checkpoint
+    /// mapping can no longer serve the new node numbering. The commit therefore
+    /// **re-maps**: after the padded v3 base is written and `F_FULLFSYNC`-ed,
+    /// the index opens a fresh ``MappedVectorRegion`` over the *new* base inode
+    /// and swaps the provider to paged again (`snapshotBoundary = count`,
+    /// resident tail cleared). The whole method is a single synchronous,
+    /// actor-isolated critical section — no `await` occurs between the compact,
+    /// the write, and the swap — so a concurrent search can never observe a torn
+    /// intermediate state. The old inode is released (unmapped) when the prior
+    /// region is dropped. Peak residency during the checkpoint equals a resident
+    /// checkpoint's (the snapshot is materialized to write it); steady-state
+    /// paged residency is restored immediately by the re-map.
     public func checkpoint(
         baseURL: URL,
         walURL: URL,
@@ -765,7 +869,7 @@ public actor HNSWIndex: VectorIndex {
         let newGeneration = snapshotGeneration &+ 1
         let snapshot = HNSWSnapshot(
             dimension: dimension, config: config, metricType: metricType,
-            vectors: vectors, metadata: metadata, nodeToUUID: nodeToUUID,
+            vectors: vectorProvider.materialized(), metadata: metadata, nodeToUUID: nodeToUUID,
             layers: layers, nodeLevels: nodeLevels,
             entryPointNode: entryPointNode, maxLevel: maxLevel
         )
@@ -774,6 +878,15 @@ public actor HNSWIndex: VectorIndex {
         try fullSyncFile(baseURL)
         self.snapshotGeneration = newGeneration
         self.baseByteCount = (try? Data(contentsOf: baseURL, options: .mappedIfSafe).count) ?? 0
+
+        // Paged-mode remap: re-establish the mapping over the freshly written
+        // base so the index keeps serving vectors from the file rather than the
+        // resident array `materialized()` just produced. Synchronous swap → no
+        // torn state; dropping `vectorProvider` unmaps the previous inode.
+        if isPagedMode {
+            let region = try MappedVectorRegion(baseURL: baseURL)
+            self.vectorProvider = .paged(region: region, dimension: dimension)
+        }
 
         // Reset the WAL to a fresh empty journal bound to the new generation.
         try startFreshJournal(walURL: walURL, durability: durability)
@@ -844,14 +957,17 @@ public actor HNSWIndex: VectorIndex {
         var live: [(id: UUID, vector: Vector, metadata: Data?)] = []
         for (node, uuid) in nodeToUUID.enumerated() {
             guard uuidToNode[uuid] == node else { continue }
-            live.append((id: uuid, vector: vectors[node], metadata: metadata[node]))
+            live.append((id: uuid, vector: vectorProvider.vector(at: node), metadata: metadata[node]))
         }
 
-        // Reset all storage.
+        // Reset all storage. In paged mode this drops the mapping and returns
+        // the provider to resident-empty; the re-inserted live nodes below land
+        // in the resident tail. A following paged checkpoint re-establishes the
+        // mapping over the freshly written base (see `checkpoint`).
         layers = []
         inEdges = []
         nodeLevels = []
-        vectors = []
+        vectorProvider = .resident(dimension: dimension)
         metadata = []
         nodeToUUID = []
         uuidToNode = [:]
@@ -890,8 +1006,8 @@ public actor HNSWIndex: VectorIndex {
     /// Ensures the layers array has capacity through the given level.
     private func ensureLayer(_ level: Int) {
         while layers.count <= level {
-            layers.append(Array(repeating: [], count: vectors.count))
-            inEdges.append(Array(repeating: Set<Int>(), count: vectors.count))
+            layers.append(Array(repeating: [], count: vectorProvider.count))
+            inEdges.append(Array(repeating: Set<Int>(), count: vectorProvider.count))
         }
     }
 
@@ -906,7 +1022,7 @@ public actor HNSWIndex: VectorIndex {
         ef: Int,
         layer: Int
     ) -> [(node: Int, distance: Float)] {
-        let epDist = metric.distance(query, vectors[entryPoint])
+        let epDist = metric.distance(query, vectorProvider.vector(at: entryPoint))
 
         var candidates = Heap<(node: Int, distance: Float)>(comparator: { $0.distance < $1.distance })
         candidates.push((entryPoint, epDist))
@@ -928,7 +1044,7 @@ public actor HNSWIndex: VectorIndex {
                 guard !visited.contains(neighbor) else { continue }
                 visited.insert(neighbor)
 
-                let dist = metric.distance(query, vectors[neighbor])
+                let dist = metric.distance(query, vectorProvider.vector(at: neighbor))
 
                 let shouldAdd: Bool
                 if results.count < ef {
@@ -1020,7 +1136,7 @@ public actor HNSWIndex: VectorIndex {
             effectiveEf = min(efCap, max(ef, needed))
         }
 
-        let epDist = metric.distance(query, vectors[entryPoint])
+        let epDist = metric.distance(query, vectorProvider.vector(at: entryPoint))
 
         var candidates = Heap<(node: Int, distance: Float)>(comparator: { $0.distance < $1.distance })
         candidates.push((entryPoint, epDist))
@@ -1048,7 +1164,7 @@ public actor HNSWIndex: VectorIndex {
                 guard !visited.contains(neighbor) else { continue }
                 visited.insert(neighbor)
 
-                let dist = metric.distance(query, vectors[neighbor])
+                let dist = metric.distance(query, vectorProvider.vector(at: neighbor))
 
                 let shouldExplore: Bool
                 if results.count < effectiveEf {
@@ -1106,11 +1222,11 @@ public actor HNSWIndex: VectorIndex {
 
             // Check: is this candidate closer to the target than
             // to any already-selected neighbor?
-            let candidateVector = vectors[candidate.node]
+            let candidateVector = vectorProvider.vector(at: candidate.node)
             var isGood = true
 
             for (selectedNode, _) in selected {
-                let distToSelected = metric.distance(candidateVector, vectors[selectedNode])
+                let distToSelected = metric.distance(candidateVector, vectorProvider.vector(at: selectedNode))
                 if distToSelected < candidate.distance {
                     isGood = false
                     break
@@ -1142,9 +1258,9 @@ public actor HNSWIndex: VectorIndex {
     private func pruneConnections(node: Int, layer: Int, maxConnections: Int) {
         guard layers[layer][node].count > maxConnections else { return }
 
-        let nodeVector = vectors[node]
+        let nodeVector = vectorProvider.vector(at: node)
         let neighbors = layers[layer][node].map { neighbor in
-            (node: neighbor, distance: metric.distance(nodeVector, vectors[neighbor]))
+            (node: neighbor, distance: metric.distance(nodeVector, vectorProvider.vector(at: neighbor)))
         }
 
         let selected = selectNeighborsHeuristic(
@@ -1235,7 +1351,7 @@ public actor HNSWIndex: VectorIndex {
     /// Used by tests to verify `remove()` repairs connectivity.
     internal var isLayer0Connected: Bool {
         guard !layers.isEmpty else { return true }
-        let liveNodes = (0..<vectors.count).filter { isLiveNode($0) }
+        let liveNodes = (0..<vectorProvider.count).filter { isLiveNode($0) }
         guard let start = liveNodes.first else { return true }
 
         // Build an undirected view of layer 0 (pruning can leave edges
@@ -1285,7 +1401,7 @@ public actor HNSWIndex: VectorIndex {
             layers: layers,
             entryPointNode: entryPointNode,
             maxLevel: maxLevel,
-            vectors: vectors,
+            vectors: vectorProvider.materialized(),
             metadata: metadata
         )
     }

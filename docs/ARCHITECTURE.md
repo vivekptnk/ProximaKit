@@ -179,6 +179,11 @@ the legacy `save(to:)` keeps writing v2 byte-for-byte, unchanged. The
 sequential loader stops after the metadata section, so v3 files load through
 the identical resident path as v2 — only the WAL layer reads the trailer.
 `minSupportedVersion` stays 1: v1/v2 files load exactly as before.
+`checkpoint(...)` also zero-pads the vector section to a 16 KiB boundary (the
+Apple-Silicon page size) so it can be mapped read-only for paged access
+(Stage 2, below); the section table records the padded offset, and padded
+and unpadded v3 bases both still decode identically through the resident
+path.
 
 Shared invariants:
 
@@ -272,8 +277,25 @@ if await index.needsCheckpoint() {
   complete new base beside a stale WAL — the next `open` surfaces that as a
   typed `walGenerationMismatch`, not silent data loss (the new base already
   holds every committed record). Stage 2 of ADR-013 (paged, on-demand vector
-  loading) remains **design-only** — nothing described in this section pages
-  vectors; every journaled index is still fully resident.
+  loading) has shipped — see the paged vector region below.
+- **Paged vector region (ADR-013 Stage 2, opt-in).** `HNSWOpenMode.paged`
+  serves the vector section from a read-only `mmap` (`MappedVectorRegion`)
+  over the 16 KiB-padded v3 base instead of decoding it resident. Access is
+  copy-on-access, not zero-copy: each read copies the requested vector out of
+  the mapping into a value-typed `Vector` inside one synchronous,
+  actor-isolated call, so no raw mapping pointer is ever held across an
+  `await` — the deliberate trade that keeps paged results bit-identical to
+  resident and makes the design trivially sound against actor re-entrancy.
+  Checkpointing a paged index **remaps**: it writes the fresh padded base,
+  `F_FULLFSYNC`s it, then opens a new mapping over the new inode and swaps
+  the provider back to paged — compact, write, and swap all happen inside the
+  same single synchronous, actor-isolated critical section, so a concurrent
+  search can never observe torn state. Honestly stated: the mapping is opened
+  read-only and ProximaKit never truncates its own live files, but
+  truncating a mapped base from outside the library is out of contract and
+  raises an uncatchable SIGBUS — the same risk class the `.mappedIfSafe`
+  decode pass already carries at load time, now extended to the paged
+  index's whole lifetime.
 
 ## Store Layer
 

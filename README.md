@@ -36,7 +36,7 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 | **Filtered search** | `@Sendable` predicate on every index and store; graph-aware on `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` — the layer-0 beam applies the filter during traversal with adaptive widening, so selective filters still fill `k` (`SparseIndex` keeps post-filter — no beam to route through) ([ADR-008](docs/adr/ADR-008-filtered-search.md)) |
 | **GPU batch distance (v1)** | `MetalBatchDistance` — standalone one-query-to-N squared-L2/cosine utility with automatic vDSP fallback. Measured **NO-GO** on wiring it into `HNSWIndex` build/search — vDSP (AMX) wins at every tested scale, no crossover ([ADR-009 addendum](docs/adr/ADR-009-metal-backend.md)) |
 | **8 distance metrics** | Cosine, Euclidean, dot product, Manhattan, Hamming, Chebyshev, Bray-Curtis, Mahalanobis — all vDSP-accelerated where it pays |
-| **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)); *(new)* opt-in WAL incremental saves make mutations O(change) instead of O(corpus) ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
+| **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)); *(new)* opt-in WAL incremental saves + paged vector region make mutations O(change) instead of O(corpus) ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
 | **Embedding providers** | Apple NaturalLanguage, Vision, and bring-your-own CoreML (BERT/MiniLM via WordPiece tokenizer) |
 | **Concurrency** | Every index is a Swift `actor`; `Sendable` API surface, built with `StrictConcurrency` |
 | **Proof** | 400+ tests, recall floors enforced in CI, cross-library benchmark harness vs FAISS/ScaNN running nightly |
@@ -352,6 +352,18 @@ if await index.needsCheckpoint() {
 
 Recovery is prefix-safe: a crash mid-write truncates to the longest valid WAL record and never corrupts the base — proven with an out-of-process `SIGKILL` rig, not just asserted in-process. `save(to:)`/`load(from:)` above are untouched; journaling is additive and opt-in. On Darwin, a plain `fsync(2)` only reaches the drive cache — checkpoint commits force media with `F_FULLFSYNC`, and the `durability` dial (`.everyRecord` / `.everyBatch` / `.manual`) documents exactly what each level guarantees. Store-level wiring (`VectorStore`/`HybridVectorStore`) isn't shipped yet — this is index-level only. Design and Stage 1 notes: [ADR-013](docs/adr/ADR-013-streaming-persistence.md).
 
+### Paged Vectors (mmap)
+
+For corpora that don't comfortably fit in RAM, opening in `.paged` mode serves the vector section straight from a read-only file mapping instead of decoding it resident, keeping only the graph, ids, levels, metadata, and any post-snapshot adds in memory:
+
+```swift
+let index = try await HNSWIndex.open(
+    baseURL: baseURL, walURL: walURL, durability: .everyBatch, mode: .paged
+)
+```
+
+Paging requires a padded v3 base — any `checkpoint(...)` call writes one; a Stage-1, unpadded v3 base still loads fine, just resident, until one more `checkpoint` pads it. `.resident` stays the default and is byte-identical to before. One contract worth knowing: the mapping is read-only and ProximaKit never truncates its own files, but truncating a mapped base from outside the library is out of contract and raises an uncatchable SIGBUS.
+
 
 ## Use a Custom AI Model (CoreML)
 
@@ -598,7 +610,7 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-010](docs/adr/ADR-010-format-evolution.md): Persistence format evolution policy
 - [ADR-011](docs/adr/ADR-011-pq-codec.md): Product quantization codec
 - [ADR-012](docs/adr/ADR-012-pq-reranking.md): Full-precision reranking for quantized HNSW
-- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — Stage 1 (WAL incremental saves) shipped; Stage 2 (paged vectors) still design only
+- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — Stage 1 (WAL incremental saves) **shipped**; Stage 2 (paged vectors) **shipped**
 
 
 ## Building & Testing
@@ -628,7 +640,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
 |------|--------|
 | Graph-aware filtered search — higher recall under selective filters | **Shipped** for `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` ([ADR-008 addenda](docs/adr/ADR-008-filtered-search.md)); `SparseIndex` stays post-filter (no beam to route through) |
 | GPU acceleration | v1 shipped: `MetalBatchDistance` batch utility ([ADR-009](docs/adr/ADR-009-metal-backend.md)). Index build/search integration measured and decided **NO-GO** — vDSP (AMX) wins at every tested scale, no crossover |
-| Streaming persistence — incremental saves (WAL) + paged vectors | Stage 1 (WAL incremental saves) **shipped** ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)); Stage 2 (paged vectors) still design only |
+| Streaming persistence — incremental saves (WAL) + paged vectors | **Shipped** ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) — both stages: WAL incremental saves + opt-in paged vector region |
 | Jensen-Shannon divergence metric | Considering |
 | Background HNSW compaction policy | Planned |
 | Demo app — CoreML model download UI, benchmark tab, result export | Planned |

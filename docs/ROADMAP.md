@@ -93,13 +93,13 @@ Graph-aware filtering now covers every HNSW-graph index — the "extend to the q
 
 ## Persistence
 
-### Streaming Persistence — WAL Incremental Saves, Stage 1 Shipped ([ADR-013](adr/ADR-013-streaming-persistence.md))
+### Streaming Persistence — WAL Incremental Saves + Paged Vectors, Both Stages Shipped ([ADR-013](adr/ADR-013-streaming-persistence.md))
 
 Every save through the default API still rewrites the entire index snapshot — ADR-013 works out the arithmetic at ≈1.76 GB per save for a 1M × 384d index, regardless of how many vectors actually changed. **Stage 1 (the write-ahead log, "Option A") is shipped**: `HNSWIndex` now has an additive, opt-in journaled path — `open(baseURL:walURL:durability:)` / `checkpoint(baseURL:walURL:durability:)` — that appends a `.pxwal` mutation record (file-format arithmetic: ~1.6 KB per `add` at 384d, per ADR-013 — see `docs/BENCHMARKS.md`) instead of a full rewrite. The existing `save(to:)`/`load(from:)` API is untouched and byte-identical; journaling changes nothing for callers who don't opt in.
 
 Delivered: the `.pxwal` v1 sidecar (CRC-framed records, deterministic replay via journaled HNSW levels so recovered state is asserted byte-exact, not merely valid), `.pxkt` v3 (a section table plus a snapshot-generation binding; `minSupportedVersion` stays 1), a configurable checkpoint policy and fsync dial (`.everyRecord` / `.everyBatch` / `.manual`, with the Darwin `fsync`-vs-`F_FULLFSYNC` distinction documented rather than glossed over), and recovery proven rather than merely designed — an in-process truncation sweep across every WAL byte/record boundary plus an out-of-process `SIGKILL` rig (100/100 recoveries opt-in via `PROXIMA_RUN_KILL_RIG`, a 5-iteration smoke in every CI run). Full design in `docs/ARCHITECTURE.md`; the ADR's "Stage 1 implementation notes" addendum records the built format bytes and every documented deviation (store-level `VectorStore`/`HybridVectorStore` wiring deferred; auto-compaction suppressed while a journal is attached; one narrow checkpoint crash window that surfaces as a typed error, never silent data loss).
 
-**Stage 2 (paged, on-demand vector loading over a memory-mapped region, "Option C") remains design-only.** Nothing shipped pages vectors — every journaled or plain-loaded index today is still fully resident. Stage 2 rides the same `.pxkt` v3 bump Stage 1 already forced (its section table gives Stage 2 an offset to align the vector section to a page boundary without another format bump). Estimated at ~2–3 additional engineering weeks per the ADR's cost breakdown.
+**Stage 2 (paged, on-demand vector loading over a memory-mapped region, "Option C") is shipped.** An additive `.paged` open mode (`HNSWOpenMode`, via `HNSWIndex.open(baseURL:walURL:durability:mode:)`) serves the vector section from a read-only file mapping (`MappedVectorRegion`) instead of decoding it resident, riding the same `.pxkt` v3 bump Stage 1 already forced — `checkpoint(...)` now pads the vector section to a 16 KiB boundary so it can be mapped independently. Measured, Apple M4 Max, release: a 100,000 × 384d fixture with a 146.5 MB vector payload shows a paged open resident at 18.1 MB versus 112.3 MB for the same base opened `.resident` — 94.1 MB (64%) of the payload not resident — with paged search byte-identical to resident and no measurable resident-mode search regression (worst case +0.5%, well under the 2% bail-out threshold). `.resident` stays the default, byte-identical to before. The graph adjacency stays resident and unpaged — variable-length encoding, in-place mutation, and the traversal hot path rule it out, per the ADR's Option C analysis. Recorded follow-up: `SQHW`/`PQHW` paged originals, the fix ADR-012 deferred for PQ's 32× memory story.
 
 ---
 
@@ -123,7 +123,7 @@ Delivered: the `.pxwal` v1 sidecar (CRC-framed records, deterministic replay via
 | ADR-010 | Serialisation format evolution policy (version field already shipped) | Accepted |
 | ADR-011 | Product quantization codec format (`PQTT` / `PQHW`, ADC, K=256) | Accepted (retrospective) |
 | ADR-012 | Full-precision reranking for quantized HNSW (`retainOriginals` + `rerankDepth`, PQHW v2) | Accepted |
-| ADR-013 | Streaming persistence: WAL incremental saves (Stage 1) + paged vector region (Stage 2) | Accepted — Stage 1 (WAL) shipped; Stage 2 (paged vectors) remains design-only |
+| ADR-013 | Streaming persistence: WAL incremental saves (Stage 1) + paged vector region (Stage 2) | Accepted — both stages shipped |
 
 ---
 

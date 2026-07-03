@@ -28,6 +28,8 @@ struct ProximaBenchCLI {
                 try runDistanceKernel(args: Array(args.dropFirst(2)))
             case "insert-shape":
                 try await runInsertShape(args: Array(args.dropFirst(2)))
+            case "search-provider-bench":
+                try await runSearchProviderBench(args: Array(args.dropFirst(2)))
             case "-h", "--help", "help":
                 usage()
             default:
@@ -117,6 +119,25 @@ struct ProximaBenchCLI {
             outputPath: f.required("--out")
         )
         try await InsertShapeBench.run(opts)
+    }
+
+    // MARK: - search-provider-bench (ADR-013 Stage 2 resident-regression proof)
+
+    static func runSearchProviderBench(args: [String]) async throws {
+        let f = Flags(args)
+        let opts = SearchProviderBench.Options(
+            count: f.int("--count") ?? 50_000,
+            dimension: f.int("--dim") ?? 128,
+            m: f.int("--m") ?? 16,
+            efConstruction: f.int("--efc") ?? 200,
+            efSearch: f.int("--ef") ?? 50,
+            k: f.int("--k") ?? 10,
+            queryCount: f.int("--query-count") ?? 2_000,
+            reps: f.int("--reps") ?? 9,
+            warmup: f.int("--warmup") ?? 2,
+            seed: UInt64(f.int("--seed") ?? 42)
+        )
+        try await SearchProviderBench.run(opts)
     }
 
     /// Parses a comma-separated list of ints (e.g. "384,768").

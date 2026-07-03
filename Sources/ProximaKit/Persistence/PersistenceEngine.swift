@@ -46,6 +46,14 @@ private let headerSize = 64
 private let v3SectionCount = 5
 private let v3TrailerMagic: UInt32 = 0x5058_4B33  // "PXK3"
 private let v3TrailerSize = 4 + v3SectionCount * 16 + 8 + 4  // = 96
+/// Index of the vector section within the v3 section table.
+private let v3VectorSectionIndex = 1
+/// Index of the node-levels section within the v3 section table (the first
+/// section after the vectors — where the paged loader resumes reading).
+private let v3NodeLevelsSectionIndex = 2
+/// 16 KiB — the Apple-Silicon page size the vector section start is padded to
+/// so it can be `mmap`-ed independently (ADR-013 Stage 2).
+private let vectorSectionAlignment = 16_384
 
 /// The `HNSWConfiguration` default threshold, applied when loading v1 files
 /// that predate threshold serialization.
@@ -303,10 +311,123 @@ public enum PersistenceEngine {
         let uuids = try readUUIDs(fileData, count: count, offset: &offset)
 
         // ── Vectors ───────────────────────────────────────────────────
+        // For v3 the vector section may be page-padded away from the UUID tail;
+        // jump to its recorded offset. No-op for unpadded v3 (offset already
+        // there) and irrelevant to v1/v2 (no table). Everything after the
+        // vector section stays contiguous with it, so the sequential graph
+        // reader below resumes correctly.
+        if header.version >= v3FormatVersion {
+            offset = try readV3Trailer(fileData).sections[v3VectorSectionIndex].offset
+        }
         let vectors: [Vector] = try (0..<count).map { _ in
             let floats = try readFloats(fileData, count: dimension, offset: &offset)
             return Vector(floats)
         }
+
+        // ── Graph + metadata + config (shared with the paged loader) ──
+        let graph = try readHNSWGraph(
+            fileData, header: header, count: count, layerCount: layerCount, offset: &offset)
+
+        let snapshot = HNSWSnapshot(
+            dimension: dimension,
+            config: graph.config,
+            metricType: header.metricType,
+            vectors: vectors,
+            metadata: graph.metadata,
+            nodeToUUID: uuids,
+            layers: graph.layers,
+            nodeLevels: graph.nodeLevels,
+            entryPointNode: graph.entryPointNode,
+            maxLevel: graph.maxLevel
+        )
+
+        return HNSWIndex(restoring: snapshot)
+    }
+
+    // MARK: - Load HNSW (paged, ADR-013 Stage 2)
+
+    /// Loads an HNSW index in **paged** mode: the graph, UUIDs, node levels, and
+    /// metadata are decoded resident exactly as `loadHNSW` does, but the vector
+    /// section is served from a read-only `MappedVectorRegion` instead of being
+    /// copied into `[Vector]`. Requires a padded v3 base (a Stage-2 checkpoint);
+    /// a non-v3 or unpadded base throws a typed `PersistenceError` (never traps).
+    internal static func loadHNSWPaged(from url: URL) throws -> HNSWIndex {
+        let fileData = try Data(contentsOf: url, options: .mappedIfSafe)
+        let header = try readHeader(fileData)
+
+        guard header.indexType == indexTypeHNSW else {
+            throw PersistenceError.unknownIndexType(header.indexType)
+        }
+        guard header.version >= v3FormatVersion else {
+            throw PersistenceError.corruptedData("paged open requires a v3 base; checkpoint the index first")
+        }
+
+        let count = Int(header.count)
+        let dimension = Int(header.dimension)
+        let layerCount = Int(header.layerCount)
+        var offset = headerSize
+
+        // ── Header sanity (mirrors loadHNSW) ──────────────────────────
+        guard dimension > 0 else {
+            throw PersistenceError.corruptedData("Dimension must be positive, got \(dimension)")
+        }
+        guard layerCount <= fileData.count else {
+            throw PersistenceError.corruptedData(
+                "Layer count \(layerCount) implausible for file of \(fileData.count) bytes")
+        }
+        guard header.m >= 2, header.efConstruction > 0, header.efSearch > 0 else {
+            throw PersistenceError.corruptedData(
+                "HNSW configuration fields out of range "
+                + "(m: \(header.m) [min 2], efConstruction: \(header.efConstruction), efSearch: \(header.efSearch))")
+        }
+        guard UInt64(header.mMax0) == 2 * UInt64(header.m) else {
+            throw PersistenceError.corruptedData(
+                "mMax0 \(header.mMax0) inconsistent with m \(header.m) (expected \(2 * UInt64(header.m)))")
+        }
+
+        let trailer = try readV3Trailer(fileData)
+
+        // ── UUIDs (contiguous after the header) ───────────────────────
+        let uuids = try readUUIDs(fileData, count: count, offset: &offset)
+
+        // ── Skip the mapped vector section; resume at node levels ─────
+        offset = trailer.sections[v3NodeLevelsSectionIndex].offset
+
+        // ── Graph + metadata + config (shared with the resident loader) ─
+        let graph = try readHNSWGraph(
+            fileData, header: header, count: count, layerCount: layerCount, offset: &offset)
+
+        // ── Map the vector section read-only ──────────────────────────
+        let region = try MappedVectorRegion(baseURL: url)
+        guard region.count == count, region.dimension == dimension else {
+            throw PersistenceError.corruptedData(
+                "mapped vector section (\(region.count)×\(region.dimension)) disagrees with header (\(count)×\(dimension))")
+        }
+
+        let snapshot = HNSWSnapshot(
+            dimension: dimension,
+            config: graph.config,
+            metricType: header.metricType,
+            vectors: [],   // served from `region`, not resident
+            metadata: graph.metadata,
+            nodeToUUID: uuids,
+            layers: graph.layers,
+            nodeLevels: graph.nodeLevels,
+            entryPointNode: graph.entryPointNode,
+            maxLevel: graph.maxLevel
+        )
+
+        return HNSWIndex(restoringPaged: snapshot, region: region)
+    }
+
+    /// Decodes the node-levels, adjacency, integrity, metadata, and config —
+    /// everything after the vector section — from `offset` onward. Shared by the
+    /// resident and paged loaders so the two never diverge. `offset` must enter
+    /// positioned at the node-levels section.
+    private static func readHNSWGraph(
+        _ fileData: Data, header: FileHeader, count: Int, layerCount: Int, offset: inout Int
+    ) throws -> (nodeLevels: [Int], layers: [[[Int]]], entryPointNode: Int?, maxLevel: Int,
+                 metadata: [Data?], config: HNSWConfiguration) {
 
         // ── Graph: nodeLevels ─────────────────────────────────────────
         let nodeLevels: [Int] = try (0..<count).map { _ in
@@ -368,20 +489,7 @@ public enum PersistenceEngine {
             autoCompactionThreshold: header.autoCompactionThreshold
         )
 
-        let snapshot = HNSWSnapshot(
-            dimension: dimension,
-            config: config,
-            metricType: header.metricType,
-            vectors: vectors,
-            metadata: metadata,
-            nodeToUUID: uuids,
-            layers: layers,
-            nodeLevels: nodeLevels,
-            entryPointNode: entryPointNode,
-            maxLevel: maxLevel
-        )
-
-        return HNSWIndex(restoring: snapshot)
+        return (nodeLevels, layers, entryPointNode, maxLevel, metadata, config)
     }
 
     // MARK: - Save HNSW (v3, WAL-binding)
@@ -396,6 +504,21 @@ public enum PersistenceEngine {
     /// v3 file exactly like a v2 one. The trailer is read only by
     /// ``readGeneration(from:)``.
     public static func saveHNSW(_ snapshot: HNSWSnapshot, generation: UInt64, to url: URL) throws {
+        try saveHNSW(snapshot, generation: generation, to: url, padVectorSection: true)
+    }
+
+    /// v3 writer with explicit control over vector-section padding.
+    ///
+    /// `padVectorSection` (the shipped default via the public overload) pads the
+    /// vector section start to a 16 KiB boundary (ADR-013 Stage 2) so the base
+    /// can be `mmap`-ed for paged open, each fault pulling a clean vector page.
+    /// The section table records the padded offset, so `loadHNSW` (which jumps
+    /// to the recorded offset for v3) reads padded and unpadded v3 identically.
+    /// The `false` path exists only to let tests reproduce a Stage-1-shaped
+    /// (unpadded) v3 file and prove it still loads.
+    internal static func saveHNSW(
+        _ snapshot: HNSWSnapshot, generation: UInt64, to url: URL, padVectorSection: Bool
+    ) throws {
         var data = Data()
         let count = snapshot.nodeToUUID.count
 
@@ -428,6 +551,13 @@ public enum PersistenceEngine {
 
         section {  // UUIDs
             for uuid in snapshot.nodeToUUID { appendUUID(&data, uuid) }
+        }
+        if padVectorSection {
+            // Pad so the vector section START lands on a 16 KiB boundary,
+            // making it independently mappable (ADR-013 Stage 2). The section
+            // table below records the padded offset; only the vector section is
+            // padded, so the sections after it stay contiguous with it.
+            padToAlignment(&data, alignment: vectorSectionAlignment)
         }
         section {  // Vectors
             for vector in snapshot.vectors {
@@ -473,22 +603,98 @@ public enum PersistenceEngine {
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
         let header = try readHeader(data)   // validates magic/version/metric
         guard header.version >= v3FormatVersion else { return 0 }
-        guard data.count >= headerSize + v3TrailerSize else {
-            throw PersistenceError.corruptedData("v3 file too small for trailer")
-        }
-        let trailerStart = data.count - v3TrailerSize
-        let trailerMagic = data.loadLE(UInt32.self, at: data.count - 4)
-        guard trailerMagic == v3TrailerMagic else {
-            throw PersistenceError.corruptedData("v3 trailer magic mismatch")
-        }
-        let sectionCount = data.loadLE(UInt32.self, at: trailerStart)
-        guard sectionCount == UInt32(v3SectionCount) else {
-            throw PersistenceError.corruptedData(
-                "v3 trailer section count \(sectionCount) != \(v3SectionCount)")
-        }
-        let generationOffset = trailerStart + 4 + v3SectionCount * 16
-        return data.loadLE(UInt64.self, at: generationOffset)
+        return try readV3Trailer(data).generation
     }
+
+    /// Physical layout of a v3 base's mapped vector section, for paged open
+    /// (`MappedVectorRegion`). Reads the header + trailer only — no vector data
+    /// is copied. Throws a typed `PersistenceError` (never traps) for a non-v3
+    /// base, a mis-sized vector section, or a section-table entry out of bounds.
+    internal static func pagedVectorLayout(of url: URL) throws -> PagedVectorLayout {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        let header = try readHeader(data)
+        guard header.indexType == indexTypeHNSW else {
+            throw PersistenceError.unknownIndexType(header.indexType)
+        }
+        guard header.version >= v3FormatVersion else {
+            throw PersistenceError.corruptedData("paged open requires a v3 base; checkpoint the index first")
+        }
+        let dimension = Int(header.dimension)
+        let count = Int(header.count)
+        guard dimension > 0 else {
+            throw PersistenceError.corruptedData("Dimension must be positive, got \(dimension)")
+        }
+        let trailer = try readV3Trailer(data)
+        let vectorSection = trailer.sections[v3VectorSectionIndex]
+        // The section length must be exactly count × dimension × 4; a mismatch
+        // means a corrupt table or a crafted file.
+        let (stride, strideOverflow) = dimension.multipliedReportingOverflow(by: 4)
+        let (expected, expectedOverflow) = count.multipliedReportingOverflow(by: stride)
+        guard !strideOverflow, !expectedOverflow, vectorSection.length == expected else {
+            throw PersistenceError.corruptedData(
+                "v3 vector section length \(vectorSection.length) != \(count) × \(dimension) × 4")
+        }
+        return PagedVectorLayout(
+            dimension: dimension,
+            count: count,
+            vectorOffset: vectorSection.offset,
+            vectorLength: vectorSection.length,
+            fileSize: data.count
+        )
+    }
+}
+
+/// Physical placement of a v3 base's vector section, resolved from the section
+/// table for paged (`mmap`) open.
+internal struct PagedVectorLayout {
+    let dimension: Int
+    let count: Int
+    let vectorOffset: Int
+    let vectorLength: Int
+    let fileSize: Int
+}
+
+/// The v3 section table + snapshot generation, parsed from the fixed 96-byte
+/// trailer. Every section offset/length is bounds-checked against the file so a
+/// crafted or truncated table is a typed error, never a trap.
+private struct V3Trailer {
+    let sections: [(offset: Int, length: Int)]   // 5 entries, table order
+    let generation: UInt64
+}
+
+private func readV3Trailer(_ data: Data) throws -> V3Trailer {
+    guard data.count >= headerSize + v3TrailerSize else {
+        throw PersistenceError.corruptedData("v3 file too small for trailer")
+    }
+    let trailerStart = data.count - v3TrailerSize
+    let trailerMagic = data.loadLE(UInt32.self, at: data.count - 4)
+    guard trailerMagic == v3TrailerMagic else {
+        throw PersistenceError.corruptedData("v3 trailer magic mismatch")
+    }
+    let sectionCount = data.loadLE(UInt32.self, at: trailerStart)
+    guard sectionCount == UInt32(v3SectionCount) else {
+        throw PersistenceError.corruptedData(
+            "v3 trailer section count \(sectionCount) != \(v3SectionCount)")
+    }
+    // Sections must lie fully within the pre-trailer body: 0 ≤ offset,
+    // offset + length ≤ trailerStart. This rejects a section-table offset past
+    // EOF and any length that would run into the trailer.
+    let bodyEnd = UInt64(trailerStart)
+    var sections: [(offset: Int, length: Int)] = []
+    sections.reserveCapacity(v3SectionCount)
+    for i in 0..<v3SectionCount {
+        let entry = trailerStart + 4 + i * 16
+        let offset = data.loadLE(UInt64.self, at: entry)
+        let length = data.loadLE(UInt64.self, at: entry + 8)
+        let (end, overflow) = offset.addingReportingOverflow(length)
+        guard !overflow, offset <= bodyEnd, end <= bodyEnd else {
+            throw PersistenceError.corruptedData(
+                "v3 section \(i) (offset \(offset), length \(length)) out of bounds for a \(data.count)-byte file")
+        }
+        sections.append((Int(offset), Int(length)))
+    }
+    let generation = data.loadLE(UInt64.self, at: trailerStart + 4 + v3SectionCount * 16)
+    return V3Trailer(sections: sections, generation: generation)
 }
 
 // MARK: - Header Parsing
@@ -583,6 +789,15 @@ private func appendUInt64(_ data: inout Data, _ value: UInt64) {
 
 private func appendUUID(_ data: inout Data, _ uuid: UUID) {
     withUnsafeBytes(of: uuid.uuid) { data.append(contentsOf: $0) }
+}
+
+/// Zero-pads `data` so its length becomes a multiple of `alignment`. Used to
+/// push the vector section start onto a page boundary (ADR-013 Stage 2).
+private func padToAlignment(_ data: inout Data, alignment: Int) {
+    let remainder = data.count % alignment
+    if remainder != 0 {
+        data.append(Data(count: alignment - remainder))
+    }
 }
 
 private func appendMetadata(_ data: inout Data, _ store: [Data?]) {

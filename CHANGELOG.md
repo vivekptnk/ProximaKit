@@ -45,6 +45,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **Store-level wiring (`VectorStore`/`HybridVectorStore`) is deferred, not
   shipped** — `HybridVectorStore` froze the v1 store contract (CHA-107) and the
   sparse leg has no WAL codec yet; this release is index-level only.
+- **Paged vector region for `HNSWIndex` ([ADR-013](docs/adr/ADR-013-streaming-persistence.md),
+  Stage 2).** A new opt-in `.paged` open mode
+  (`HNSWOpenMode`, via `HNSWIndex.open(baseURL:walURL:durability:mode:)`)
+  serves the vector section directly from a read-only file mapping
+  (`MappedVectorRegion`) instead of decoding it resident, keeping only the
+  graph, ids, levels, metadata, and a resident tail of post-snapshot adds in
+  memory. Paging rides the `.pxkt` v3 format Stage 1 already shipped:
+  `checkpoint(...)` now zero-pads the vector section to a 16 KiB
+  (Apple-Silicon page) boundary so it can be mapped independently, and the v3
+  section table records the padded offset — both padded and unpadded v3 bases
+  still decode identically through the unchanged resident path. Paged search
+  is byte-identical to resident — same ids, bit-equal Float32 distances —
+  across seeded queries, graph-aware filtered search, and post-WAL-replay
+  state, asserted by `PagedVectorParityTests`. `.resident` stays the default,
+  byte-identical to before; `.paged` requires a padded v3 base (any
+  `checkpoint` writes one). Measured, Apple M4 Max, release: a
+  100,000 × 384d fixture with a 146.5 MB vector payload shows a paged open
+  resident at 18.1 MB versus 112.3 MB for the same base opened `.resident` —
+  94.1 MB (64%) of the payload not resident. Resident-mode search is
+  unaffected by the change: the ADR's before/after regression benchmark
+  (identical seed, 9 reps + 2 warmup) puts the worst-case comparison at
+  +0.5%, far under the project's 2% bail-out threshold (measured, Apple M4
+  Max, release).
 - **Graph-aware filtered search extended to `QuantizedHNSWIndex` and
   `ScalarQuantizedHNSWIndex` ([ADR-008 second
   addendum](docs/adr/ADR-008-filtered-search.md)).** Both quantized indexes now

@@ -1,15 +1,20 @@
 # ADR-013: Streaming Persistence — Incremental Saves and On-Demand Paging
 
 ## Status
-**Accepted (Stage 1: WAL / Option A) — Stage 2 (paged vectors / Option C)
-remains design-only.** Stage 1 (the `.pxwal` sidecar, `.pxkt` v3 generation
-binding, deterministic replay, checkpoint policy, fsync dial, and the recovery
-test rigs) ships. See the **Stage 1 implementation notes** addendum at the end
-of this document for what was built, the format bytes as implemented, and the
-deviations from the original design (all documented, none silent). Everything
-in Options B/C/D and acceptance criteria 3–4 below is still forward-looking
-design; the byte figures in the Context section remain arithmetic, not
-measurements.
+**Accepted (Stage 1: WAL / Option A + Stage 2: paged vectors / Option C).**
+Stage 1 (the `.pxwal` sidecar, `.pxkt` v3 generation binding, deterministic
+replay, checkpoint policy, fsync dial, and the recovery test rigs) shipped
+first. Stage 2 (16 KiB vector-section padding in v3, `MappedVectorRegion`, the
+resident/paged vector-provider abstraction threaded through the search/insert
+hot path, the additive `.resident`/`.paged` open mode, and the checkpoint-remap
+story) now ships too, proven free of resident-mode regression before landing.
+See the **Stage 1 implementation notes** and the **Stage 2 implementation
+notes** addenda at the end of this document for what was built, the format
+bytes and measured numbers as implemented, and the deviations from the original
+design (all documented, none silent). Acceptance criteria 3–4 are now met with
+measured evidence; the byte figures in the Context section remain arithmetic
+projections at 1M scale (the acceptance numbers below are real measurements at
+100K scale, labeled with machine + build mode).
 
 ## Context
 
@@ -447,6 +452,145 @@ built code.
   library-written WAL; recovery never traps.
 - **2 (fsync policy): met.** Configurable dial, documented Darwin guarantees,
   `F_FULLFSYNC` at checkpoint.
-- **3, 4 (paged memory / search parity): out of scope (Stage 2).**
+- **3, 4 (paged memory / search parity): shipped in Stage 2** — see the Stage 2
+  implementation notes below.
 - **5 (additive API only): met at the index level; store wiring deferred
   (deviation 5).** `save`/`load` unchanged; journaling is opt-in.
+
+## Stage 2 implementation notes (addendum, paged vectors / Option C)
+
+This addendum records what Stage 2 actually shipped. Same convention as the
+Stage 1 addendum: the body of this ADR is the original design; this section is
+authoritative for the built code. Stage 2 rides the v3 format Stage 1 already
+forced and adds paging as a localized change — no new version bump.
+
+### Measurement provenance
+
+All numbers below were measured on: **Apple M4 Max, macOS 26.0.1 (Darwin
+25.0.0), 36 GB, page size 16384, Swift 6.2, `-c release`.** Search-latency
+numbers come from the `ProximaBench search-provider-bench` harness (public API
+only, seeded fixture); memory numbers from `PagedVectorMemoryTests` (release,
+`PROXIMA_PAGED_BENCH=1`). Per ADR-005 discipline these are the only performance
+claims Stage 2 makes; both are reproducible from a seed.
+
+### What shipped
+
+- **16 KiB vector-section padding in v3 (`PersistenceEngine`).** The v3
+  checkpoint writer (`saveHNSW(_:generation:to:)`) now zero-pads so the vector
+  section START lands on a 16384-byte (Apple-Silicon page) boundary; the v3
+  section table records the padded offset. Only the vector section is padded, so
+  the sections after it stay contiguous with it. The resident loader
+  (`loadHNSW`) reads the vector-section offset from the table and jumps to it, so
+  it decodes **padded and unpadded v3 identically** — Stage-1-written unpadded v3
+  files keep loading (verified by `PagedVectorCorruptionTests.testPaddedAndUnpadded
+  V3LoadIdentically` and `.testUnpaddedV3PagedRejectedButResidentLoads`, which
+  round-trip an unpadded v3 produced via the internal
+  `saveHNSW(…, padVectorSection: false)`). The trailer parse
+  (`readV3Trailer`) now bounds-checks every section entry, so a section-table
+  offset past EOF or a non-aligned claimed offset is a typed `PersistenceError`,
+  never a trap (`PagedVectorCorruptionTests.testVectorOffsetPastEOFRejected`,
+  `.testNonAlignedVectorOffsetRejected`).
+- **`MappedVectorRegion` (`Persistence/MappedVectorRegion.swift`).** A
+  `final class … @unchecked Sendable` that opens the base read-only, `fstat`s its
+  size once, and `mmap`s just the (page-aligned) vector section `PROT_READ`,
+  `MAP_PRIVATE`; `munmap` + `close` in `deinit`; it never truncates. The
+  `@unchecked Sendable` is justified exactly as ADR-002 justifies actor-isolated
+  state and as Stage 1 justifies `WALJournal`: the region is confined to the
+  `HNSWIndex` actor and its raw pointer is dereferenced only in synchronous,
+  actor-isolated calls, never escaping an `await`. The **SIGBUS contract** is
+  documented verbatim in the file's header doc and on the public `open` mode:
+  read-only + `fstat`-once + never-truncate-our-own-files closes every window the
+  library controls; the residual exposure is *external* truncation of a mapped
+  file (out of contract), the same risk class the `.mappedIfSafe` decode pass
+  already carries, extended from load-time to index lifetime.
+- **Vector-provider abstraction (`VectorProvider`, same file).** A value type
+  storing actor-isolated state that unifies vector access: resident mode holds
+  everything in a `[Vector]` tail (`snapshotBoundary == 0`), so `vector(at:)`
+  reduces to a single array subscript; paged mode serves node ids
+  `< region.count` from the mapping and post-snapshot ids from the resident tail.
+  It is threaded through `searchLayer`, `searchLayer0Filtered`, `insertNode`,
+  `selectNeighborsHeuristic`, `pruneConnections`, `primitiveRemove`, `compact`,
+  and the snapshot builders. **Copy-on-access, not zero-copy pointers:** the
+  paged accessor copies each requested vector into a value-typed `Vector` inside
+  one synchronous scope. This is a deliberate simplification over the ADR's
+  sketch of scoped `UnsafeBufferPointer` access — it makes paged results
+  bit-identical to resident (same Float32 bytes, same math) and makes the
+  actor-reentrancy/remap story *trivially* sound (no raw mapping pointer ever
+  exists across a suspension, because none is ever handed out), at the cost of a
+  transient per-access copy on the paged path only. The resident path is
+  untouched by this. (Zero-copy scoped access remains a possible future
+  optimization under ADR-005 measurement.)
+- **Additive `.resident` / `.paged` open mode (`HNSWOpenMode`).**
+  `open(baseURL:walURL:durability:mode:)` gains a defaulted `mode` parameter;
+  `.resident` is the default and byte-identical to before, so every existing call
+  site is unchanged. `.paged` requires a padded v3 base (any `checkpoint` writes
+  one); a non-v3 or unpadded base throws a typed error. Post-open adds and WAL
+  replay compose: they append to the resident tail (verified by
+  `PagedVectorParityTests.testPagedParityAfterWALReplay` — 300 mapped + 120
+  replayed).
+- **Checkpoint-remap choice (documented).** A checkpoint necessarily renumbers
+  nodes (compaction) and writes an all-resident base, so the pre-checkpoint
+  mapping cannot serve the new numbering. The chosen story: the checkpoint
+  **re-maps** — after the padded v3 base is written and `F_FULLFSYNC`-ed, a paged
+  index opens a fresh `MappedVectorRegion` over the *new* inode and swaps the
+  provider back to paged (`snapshotBoundary = count`, tail cleared). The entire
+  `checkpoint` is a single synchronous, actor-isolated critical section — no
+  `await` between compact, write, and swap — so a concurrent search can never
+  observe a torn intermediate state (the ADR's "no window where search sees torn
+  state" requirement). This is the actor-local realization of the ADR's "keep
+  serving the old inode until reopen" note: the old inode is pinned by the old
+  mapping until it is dropped by the swap. Peak residency during the checkpoint
+  equals a resident checkpoint's; steady-state paged residency is restored
+  immediately (`PagedVectorParityTests.testPagedCheckpointRemapKeepsParity`).
+
+### Acceptance criteria 3 & 4 — measured
+
+- **3 (paged-mode memory): met.** `PagedVectorMemoryTests` (release,
+  `PROXIMA_PAGED_BENCH=1`) builds a 100,000 × 384d fixture (vector payload =
+  146.5 MB), then measures `phys_footprint` (`task_vm_info`) deltas on the SAME
+  base: **paged open = 18.1 MB, resident open = 112.3 MB** → **94.1 MB (64% of
+  the payload) recovered** by not residenting the vectors, and **+50 warm
+  searches faulted only 0.2 MB** (bounded working set, not the corpus). The test
+  asserts `residentDelta − pagedDelta ≥ 60%` of the payload (threshold derived
+  from this measured baseline with margin). It is benchmark-class and
+  env-gated, excluded from the PR job like `RecallBenchmarkTests`.
+- **4 (search parity): met.** `PagedVectorParityTests` proves `.paged` results
+  are **byte-identical** to `.resident` on the same file — same ids AND
+  bit-equal Float32 distances (raw bit patterns compared) — across seeded
+  queries, including graph-aware **filtered** search and **post-WAL-replay**
+  state, plus a checkpoint-remap parity case and a recall check against brute
+  force. Parity holds by construction: the paged accessor copies the identical
+  Float32 bytes the resident loader reads, and the beam traversal is
+  deterministic given identical distances. Every new test was red-green proven
+  (e.g. a +0.001 perturbation of the paged accessor breaks the distance-bit
+  assertion; disabling the padded-offset jump breaks the padded-v3 load).
+
+### Resident-mode regression proof (the gate the ADR ordered first)
+
+The provider abstraction touches the hottest loop in the library, so it was
+proven free of resident-mode regression **before** landing. Harness:
+`ProximaBench search-provider-bench`, seeded 50,000 × 128d fixture, k=10,
+efSearch=50, 2,000 queries/rep, 9 reps + 2 warmup, `-c release`, identical seed
+(so the graph is bit-identical before/after; only per-query search compute
+differs). Per-query medians (ns):
+
+| | run 1 | run 2 |
+|---|---|---|
+| before (resident `[Vector]`) | 264,889 | 256,919 |
+| after (provider abstraction) | 257,029 | 258,207 |
+
+The before/after distributions fully overlap and the medians interleave; the
+most adversarial comparison (after-worst 258,207 vs before-best 256,919) is
+**+0.5%**, far under the ADR's 2% bail-out threshold — no measurable regression
+(if anything a wash in the favorable direction). The resident accessor compiles
+to `tail[node − 0]`, a couple of integer ops against a vDSP distance, consistent
+with the measurement. Search-result checksums were identical across all runs.
+
+### Out of scope (unchanged from the design)
+
+Save cost is untouched by Stage 2 (that is Stage 1's win). The graph adjacency
+stays resident and is not paged, for the four reasons the Options/Option C
+section gives (variable-length encoding, in-place mutation, traversal hot path,
+derived-only reverse edges). `SQHW`/`PQHW` paged originals (ADR-012's deferred
+fix) remain a follow-up: they adopt the same section-table + padding shape but
+are a separate change.
