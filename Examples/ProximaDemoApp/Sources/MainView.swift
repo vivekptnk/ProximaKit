@@ -2,11 +2,43 @@ import SwiftUI
 import UniformTypeIdentifiers
 import ProximaKit
 
+/// The three feature screens the demo surfaces in the detail pane / tab bar.
+/// Search is the original experience; Persistence and Benchmark are the v1.6.0
+/// additions.
+enum DemoScreen: String, CaseIterable, Identifiable {
+    case search, persistence, benchmark, index
+    var id: String { rawValue }
+    /// The three screens shown in the regular-width detail switcher (Index is
+    /// the always-visible sidebar there, so it isn't a detail screen).
+    static let detailScreens: [DemoScreen] = [.search, .persistence, .benchmark]
+    var title: String {
+        switch self {
+        case .search: "Search"
+        case .persistence: "Persistence"
+        case .benchmark: "Benchmark"
+        case .index: "Index"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .search: "magnifyingglass"
+        case .persistence: "internaldrive"
+        case .benchmark: "chart.xyaxis.line"
+        case .index: "slider.horizontal.3"
+        }
+    }
+}
+
 struct MainView: View {
     @Bindable var engine: SearchEngine
     @State private var searchText = ""
     @State private var newNote = ""
     @State private var showImagePicker = false
+    // The two v1.6.0 lab controllers are self-contained (synthetic corpora, no
+    // embedder) so they live and die with the view, never disturbing search.
+    @State private var lab = PersistenceLab()
+    @State private var bench = BenchmarkEngine()
+    @State private var screen: DemoScreen = .search
     #if !os(macOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
@@ -14,6 +46,14 @@ struct MainView: View {
     var body: some View {
         layout
             .task {
+                // Screenshot/UI-test hook: `simctl launch <sim> <bundle-id>
+                // -demoScreen benchmark|persistence|search|index` selects the
+                // initial screen/tab (launch args of the -key value form land in
+                // UserDefaults). Pairs with -demoQuery below.
+                if let s = UserDefaults.standard.string(forKey: "demoScreen"),
+                   let mapped = DemoScreen(rawValue: s) {
+                    screen = mapped
+                }
                 // Screenshot/UI-test hook: `simctl launch <sim> <bundle-id>
                 // -demoQuery "..."` pre-fills the search field (launch
                 // arguments of the -key value form land in UserDefaults).
@@ -28,6 +68,30 @@ struct MainView: View {
                         ticks += 1
                     }
                     searchText = demo
+                }
+                // Screenshot/UI-test hook: `-demoAutorun 1` kicks the selected
+                // screen's headline action on appear (benchmark sweep, or build
+                // the persistence lab + grow its WAL) so a populated screen can
+                // be captured non-interactively.
+                if UserDefaults.standard.bool(forKey: "demoAutorun") {
+                    switch screen {
+                    case .benchmark:
+                        await bench.run()
+                    case .persistence:
+                        await lab.build()
+                        // `-demoFlow memory` walks the happy path (checkpoint →
+                        // measure); default grows the WAL and surfaces the
+                        // paged-open error → checkpoint recovery flow.
+                        if UserDefaults.standard.string(forKey: "demoFlow") == "memory" {
+                            await lab.checkpoint()
+                            await lab.measureMemory()
+                        } else {
+                            await lab.addOps(50)
+                            try? await lab.openJournaled(mode: .paged)
+                        }
+                    default:
+                        break
+                    }
                 }
             }
             .onChange(of: searchText) {
@@ -52,16 +116,30 @@ struct MainView: View {
         splitLayout
         #else
         if horizontalSizeClass == .compact {
-            TabView {
+            TabView(selection: $screen) {
                 NavigationStack {
                     searchPane.navigationTitle("Search")
                 }
-                .tabItem { Label("Search", systemImage: "magnifyingglass") }
+                .tabItem { Label("Search", systemImage: DemoScreen.search.icon) }
+                .tag(DemoScreen.search)
+
+                NavigationStack {
+                    BenchmarkView(engine: bench)
+                }
+                .tabItem { Label("Benchmark", systemImage: DemoScreen.benchmark.icon) }
+                .tag(DemoScreen.benchmark)
+
+                NavigationStack {
+                    PersistencePanel(lab: lab)
+                }
+                .tabItem { Label("Persistence", systemImage: DemoScreen.persistence.icon) }
+                .tag(DemoScreen.persistence)
 
                 NavigationStack {
                     sidebar.navigationTitle("Index")
                 }
-                .tabItem { Label("Index", systemImage: "slider.horizontal.3") }
+                .tabItem { Label("Index", systemImage: DemoScreen.index.icon) }
+                .tag(DemoScreen.index)
             }
         } else {
             splitLayout
@@ -74,7 +152,34 @@ struct MainView: View {
             sidebar
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260)
         } detail: {
-            searchPane
+            detailPane
+        }
+    }
+
+    // Regular-width detail: a segmented switch across the three feature screens,
+    // keeping the familiar Search experience as the default while surfacing the
+    // v1.6.0 Persistence and Benchmark panels alongside it.
+    private var detailPane: some View {
+        VStack(spacing: 0) {
+            Picker("View", selection: $screen) {
+                ForEach(DemoScreen.detailScreens) { screen in
+                    Label(screen.title, systemImage: screen.icon).tag(screen)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelStyle(.titleAndIcon)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+
+            Divider().padding(.top, 8)
+
+            switch screen {
+            // `.index` is the sidebar on regular width, not a detail screen —
+            // fall back to search if a launch hook selected it here.
+            case .search, .index: searchPane
+            case .persistence: PersistencePanel(lab: lab)
+            case .benchmark: BenchmarkView(engine: bench)
+            }
         }
     }
 

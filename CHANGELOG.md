@@ -8,7 +8,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **Demo app Persistence lab + Benchmark tab (`Examples/ProximaDemoApp/`).**
+  `ProximaDemoApp` grows from a single Search screen into a genuinely
+  multiplatform SwiftUI target (iPhone/iPad/macOS/visionOS) that dogfoods the
+  Stage 1/Stage 2 persistence surfaces from 1.6.0 on-device.
+  - **Persistence tab** (`PersistenceLab.swift` controller + `PersistencePanel.swift`
+    view): builds a reproducible synthetic corpus (3,000 / 6,000 / 12,000 × 384d
+    via the deterministic `SyntheticCorpus` / `DemoRNG` generator — no embedder,
+    no network), saves a v2 base, opens it journaled, and surfaces live WAL-state
+    readouts (generation, WAL bytes on disk, ops since checkpoint, needs-checkpoint,
+    base format v2/v3) with a one-tap checkpoint. It dogfoods the real typed-error
+    path rather than faking success: a `.paged` open on an unpadded v2 base is
+    refused with `PersistenceError`, surfaced as an honest "Paged open blocked"
+    banner with one-tap checkpoint-to-recover (a checkpoint writes the page-aligned
+    v3 base that `.paged` requires). It also measures LIVE resident-vs-paged
+    process memory via `task_vm_info.phys_footprint` — the same probe
+    `PagedVectorMemoryTests` uses — including the incremental cost of warm searches
+    against the paged mapping.
+  - **Benchmark tab** (`BenchmarkEngine.swift` + `BenchmarkView.swift`): runs a
+    seeded `efSearch` sweep (16 / 32 / 64 / 128 / 256) over a reproducible synthetic
+    corpus (3,000 × 128d), measuring recall@10 against an exact `BruteForceIndex`
+    ground truth alongside live per-query latency (median + p90), visualized with
+    SwiftUI Charts (recall-vs-latency) plus a results table.
+  - **Shared support** (`DemoLabSupport.swift`): `MemoryProbe`, `SyntheticCorpus`,
+    and `DemoRNG` — dependency-free and reproducible, with no embedder or network.
+  - **Layout**: compact width uses a four-tab `TabView`
+    (Search / Benchmark / Persistence / Index); regular width keeps the
+    `NavigationSplitView` with a segmented switcher across the three feature screens
+    in the detail pane.
+  - **Automation hooks**: screenshot/UI-test capture reads launch-arg
+    `UserDefaults` — `-demoScreen <search|persistence|benchmark|index>`,
+    `-demoQuery "<text>"`, `-demoAutorun 1`, `-demoFlow memory` — so every screen
+    can be captured non-interactively in a known state.
+
+### Fixed
+- **WAL record counter no longer resets to 0 across a reopen, restoring the
+  documented "since the last checkpoint" contract.** `journalByteCount` and
+  `journalRecordCount` are both documented as counting activity since the last
+  checkpoint, but `HNSWIndex.open()` broke the pair: after replaying a non-empty
+  WAL, `WALJournal.init(appendingTo:…)` seeded `byteCount` from the replayed
+  valid-prefix byte count yet hardcoded `recordCount = 0`. Immediately after a
+  reopen the two counters disagreed — the op-count arm of `needsCheckpoint(policy:)`
+  (`journal.recordCount > policy.maxOps`) under-counted, believing zero ops had
+  accrued since the checkpoint when the N replayed records actually had, so a WAL
+  already past its `WALCheckpointPolicy.maxOps` budget went unflagged until enough
+  *new* appends re-crossed it. The fix threads `existingRecordCount` through
+  `WALJournal.init(appendingTo:parentGeneration:dimension:existingByteCount:existingRecordCount:durability:)`,
+  passed from `HNSWIndex.open()` as `replay.records.count` — the exact record count
+  the decoder recovered from the same valid prefix that produced `existingByteCount`
+  — so both counters agree from the very first append after reopen (a torn tail
+  drops its partial record and its bytes together). Proven by two new
+  `WALRecoveryTests`: `testJournalRecordCountSurvivesReopen` (reopen carries the
+  count in unchanged, a subsequent append advances it N → N+1, and a checkpoint
+  resets it to 0) and `testNeedsCheckpointCountsCarriedInOpsAfterReopen` (with the
+  byte-fraction rule disabled via `walBytesFractionOfBase: .infinity` and `maxOps`
+  set below the carried-in count, `needsCheckpoint()` must report `true` immediately
+  after reopen, before any new append — exactly the case that returned `false`
+  before the fix).
 
 ---
 

@@ -220,6 +220,14 @@ And on Apple Vision Pro, the same target renders as a spatial glass panel (real 
   <img src="docs/assets/screenshot-visionos.png" alt="ProximaDemoApp on Apple Vision Pro: the search interface floats as a translucent glass panel in a simulated living room" width="760" />
 </p>
 
+Beyond Search, the app now ships two more screens. A **Persistence lab** opens the index journaled (WAL), shows live WAL state — generation, bytes on disk, ops since checkpoint — checkpoints into a page-aligned base, and demonstrates the library's honest typed-error path: a `.paged` open on an unpadded base is refused with a "Paged open blocked" banner, not silently faked. It also measures resident-vs-paged process memory **live, in-app**, via the same `task_vm_info.phys_footprint` probe the library's `PagedVectorMemoryTests` use — the exact figure varies run to run and simulator vs device, so it's captured in the screenshot rather than quoted here. A **Benchmark** tab runs a seeded `efSearch` sweep (16–256) and charts recall@10 against latency with SwiftUI Charts, recall measured against an exact `BruteForceIndex` ground truth.
+
+<p align="center">
+  <img src="docs/assets/screenshot-iphone-persistence-memory.png" alt="ProximaDemoApp on iPhone: the Persistence tab after a checkpoint, showing a resident-vs-paged memory card with live-measured process-footprint numbers from task_vm_info.phys_footprint" width="280" />
+  &nbsp;&nbsp;
+  <img src="docs/assets/screenshot-iphone-benchmark.png" alt="ProximaDemoApp on iPhone: the Benchmark tab after an efSearch sweep, charting recall@10 against query latency across ef 16 to 256" width="280" />
+</p>
+
 The animated terminal at the top of this README replays a real `swift run ProximaDemo` CLI session, and the desktop layout looks like this (illustrative mock-up):
 
 <p align="center">
