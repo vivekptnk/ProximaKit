@@ -2,29 +2,90 @@ import SwiftUI
 import UniformTypeIdentifiers
 import ProximaKit
 
-/// The three feature screens the demo surfaces in the detail pane / tab bar.
-/// Search is the original experience; Persistence and Benchmark are the v1.6.0
-/// additions.
+/// The feature screens the demo surfaces in the detail pane / tab bar.
+/// Search is the original experience; the inspector/import/export screens are
+/// the demo-app phase-2 additions alongside the persistence and benchmark labs.
 enum DemoScreen: String, CaseIterable, Identifiable {
-    case search, persistence, benchmark, index
+    case search
+    case inspector
+    case importDocuments = "import"
+    case exportResults = "export"
+    case persistence
+    case benchmark
+
     var id: String { rawValue }
-    /// The three screens shown in the regular-width detail switcher (Index is
-    /// the always-visible sidebar there, so it isn't a detail screen).
-    static let detailScreens: [DemoScreen] = [.search, .persistence, .benchmark]
+    static let detailScreens: [DemoScreen] = [.search, .inspector, .importDocuments, .exportResults, .persistence, .benchmark]
+
+    init?(launchArgument: String) {
+        switch launchArgument.lowercased() {
+        case "index", "inspector":
+            self = .inspector
+        case "import":
+            self = .importDocuments
+        case "export":
+            self = .exportResults
+        default:
+            self.init(rawValue: launchArgument.lowercased())
+        }
+    }
+
     var title: String {
         switch self {
         case .search: "Search"
+        case .inspector: "Inspector"
+        case .importDocuments: "Import"
+        case .exportResults: "Export"
         case .persistence: "Persistence"
         case .benchmark: "Benchmark"
-        case .index: "Index"
         }
     }
     var icon: String {
         switch self {
         case .search: "magnifyingglass"
+        case .inspector: "point.3.connected.trianglepath.dotted"
+        case .importDocuments: "tray.and.arrow.down"
+        case .exportResults: "square.and.arrow.up"
         case .persistence: "internaldrive"
         case .benchmark: "chart.xyaxis.line"
-        case .index: "slider.horizontal.3"
+        }
+    }
+}
+
+private enum DemoCompactTab: Hashable {
+    case search, inspector, importDocuments, exportResults, labs
+
+    init(screen: DemoScreen) {
+        switch screen {
+        case .search:
+            self = .search
+        case .inspector:
+            self = .inspector
+        case .importDocuments:
+            self = .importDocuments
+        case .exportResults:
+            self = .exportResults
+        case .persistence, .benchmark:
+            self = .labs
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .search: "Search"
+        case .inspector: "Inspector"
+        case .importDocuments: "Import"
+        case .exportResults: "Export"
+        case .labs: "Labs"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .search: DemoScreen.search.icon
+        case .inspector: DemoScreen.inspector.icon
+        case .importDocuments: DemoScreen.importDocuments.icon
+        case .exportResults: DemoScreen.exportResults.icon
+        case .labs: "testtube.2"
         }
     }
 }
@@ -34,11 +95,13 @@ struct MainView: View {
     @State private var searchText = ""
     @State private var newNote = ""
     @State private var showImagePicker = false
+    @State private var showCorpusImporter = false
     // The two v1.6.0 lab controllers are self-contained (synthetic corpora, no
     // embedder) so they live and die with the view, never disturbing search.
     @State private var lab = PersistenceLab()
     @State private var bench = BenchmarkEngine()
     @State private var screen: DemoScreen = .search
+    @State private var labsScreen: DemoScreen = .benchmark
     #if !os(macOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
@@ -47,12 +110,15 @@ struct MainView: View {
         layout
             .task {
                 // Screenshot/UI-test hook: `simctl launch <sim> <bundle-id>
-                // -demoScreen benchmark|persistence|search|index` selects the
+                // -demoScreen benchmark|persistence|search|inspector|import|export` selects the
                 // initial screen/tab (launch args of the -key value form land in
                 // UserDefaults). Pairs with -demoQuery below.
                 if let s = UserDefaults.standard.string(forKey: "demoScreen"),
-                   let mapped = DemoScreen(rawValue: s) {
+                   let mapped = DemoScreen(launchArgument: s) {
                     screen = mapped
+                    if mapped == .benchmark || mapped == .persistence {
+                        labsScreen = mapped
+                    }
                 }
                 // Screenshot/UI-test hook: `simctl launch <sim> <bundle-id>
                 // -demoQuery "..."` pre-fills the search field (launch
@@ -62,11 +128,7 @@ struct MainView: View {
                     // Wait for the index build to have started AND finished —
                     // checking isIndexing alone races the buildIndex() task
                     // and can fire the query against an empty index.
-                    var ticks = 0
-                    while (engine.isIndexing || engine.indexedCount == 0) && ticks < 300 {
-                        try? await Task.sleep(for: .milliseconds(100))
-                        ticks += 1
-                    }
+                    await waitForIndexReady()
                     searchText = demo
                 }
                 // Screenshot/UI-test hook: `-demoAutorun 1` kicks the selected
@@ -89,9 +151,26 @@ struct MainView: View {
                             await lab.addOps(50)
                             try? await lab.openJournaled(mode: .paged)
                         }
+                    case .importDocuments:
+                        await waitForIndexReady()
+                        await engine.importDemoCorpus()
+                    case .exportResults:
+                        await waitForIndexReady()
+                        let query = UserDefaults.standard.string(forKey: "demoQuery") ?? "space exploration"
+                        searchText = query
+                        await engine.search(query)
+                        _ = try? engine.writeExportFile(format: .csv)
+                        _ = try? engine.writeExportFile(format: .json)
+                    case .inspector:
+                        await waitForIndexReady()
                     default:
                         break
                     }
+                }
+            }
+            .onChange(of: screen) {
+                if screen == .benchmark || screen == .persistence {
+                    labsScreen = screen
                 }
             }
             .onChange(of: searchText) {
@@ -105,6 +184,18 @@ struct MainView: View {
                 guard let urls = try? result.get() else { return }
                 Task { await engine.addImages(urls) }
             }
+            .fileImporter(
+                isPresented: $showCorpusImporter,
+                allowedContentTypes: corpusImportTypes,
+                allowsMultipleSelection: true
+            ) { result in
+                do {
+                    let urls = try result.get()
+                    Task { await engine.importCorpus(from: urls) }
+                } catch {
+                    engine.importErrorMessage = error.localizedDescription
+                }
+            }
     }
 
     // Compact widths (iPhone, narrow iPad splits) lead with search in a tab
@@ -116,35 +207,64 @@ struct MainView: View {
         splitLayout
         #else
         if horizontalSizeClass == .compact {
-            TabView(selection: $screen) {
+            TabView(selection: compactTabBinding) {
                 NavigationStack {
                     searchPane.navigationTitle("Search")
                 }
-                .tabItem { Label("Search", systemImage: DemoScreen.search.icon) }
-                .tag(DemoScreen.search)
+                .tabItem { Label(DemoCompactTab.search.title, systemImage: DemoCompactTab.search.icon) }
+                .tag(DemoCompactTab.search)
 
                 NavigationStack {
-                    BenchmarkView(engine: bench)
+                    IndexInspectorView(engine: engine)
                 }
-                .tabItem { Label("Benchmark", systemImage: DemoScreen.benchmark.icon) }
-                .tag(DemoScreen.benchmark)
+                .tabItem { Label(DemoCompactTab.inspector.title, systemImage: DemoCompactTab.inspector.icon) }
+                .tag(DemoCompactTab.inspector)
 
                 NavigationStack {
-                    PersistencePanel(lab: lab)
+                    CorpusImportView(engine: engine) { showCorpusImporter = true }
                 }
-                .tabItem { Label("Persistence", systemImage: DemoScreen.persistence.icon) }
-                .tag(DemoScreen.persistence)
+                .tabItem { Label(DemoCompactTab.importDocuments.title, systemImage: DemoCompactTab.importDocuments.icon) }
+                .tag(DemoCompactTab.importDocuments)
 
                 NavigationStack {
-                    sidebar.navigationTitle("Index")
+                    ResultsExportView(engine: engine, queryText: $searchText)
                 }
-                .tabItem { Label("Index", systemImage: DemoScreen.index.icon) }
-                .tag(DemoScreen.index)
+                .tabItem { Label(DemoCompactTab.exportResults.title, systemImage: DemoCompactTab.exportResults.icon) }
+                .tag(DemoCompactTab.exportResults)
+
+                NavigationStack {
+                    labsPane
+                }
+                .tabItem { Label(DemoCompactTab.labs.title, systemImage: DemoCompactTab.labs.icon) }
+                .tag(DemoCompactTab.labs)
             }
         } else {
             splitLayout
         }
         #endif
+    }
+
+    private var compactTabBinding: Binding<DemoCompactTab> {
+        Binding {
+            DemoCompactTab(screen: screen)
+        } set: { tab in
+            switch tab {
+            case .search:
+                screen = .search
+            case .inspector:
+                screen = .inspector
+            case .importDocuments:
+                screen = .importDocuments
+            case .exportResults:
+                screen = .exportResults
+            case .labs:
+                screen = labsScreen
+            }
+        }
+    }
+
+    private var corpusImportTypes: [UTType] {
+        [.plainText, UTType(filenameExtension: "md") ?? .plainText, .folder]
     }
 
     private var splitLayout: some View {
@@ -174,12 +294,49 @@ struct MainView: View {
             Divider().padding(.top, 8)
 
             switch screen {
-            // `.index` is the sidebar on regular width, not a detail screen —
-            // fall back to search if a launch hook selected it here.
-            case .search, .index: searchPane
+            case .search: searchPane
+            case .inspector: IndexInspectorView(engine: engine)
+            case .importDocuments: CorpusImportView(engine: engine) { showCorpusImporter = true }
+            case .exportResults: ResultsExportView(engine: engine, queryText: $searchText)
             case .persistence: PersistencePanel(lab: lab)
             case .benchmark: BenchmarkView(engine: bench)
             }
+        }
+    }
+
+    private var labsPane: some View {
+        VStack(spacing: 0) {
+            Picker("Lab", selection: $labsScreen) {
+                Label(DemoScreen.benchmark.title, systemImage: DemoScreen.benchmark.icon)
+                    .tag(DemoScreen.benchmark)
+                Label(DemoScreen.persistence.title, systemImage: DemoScreen.persistence.icon)
+                    .tag(DemoScreen.persistence)
+            }
+            .pickerStyle(.segmented)
+            .labelStyle(.titleAndIcon)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            .onChange(of: labsScreen) {
+                screen = labsScreen
+            }
+
+            Divider().padding(.top, 8)
+
+            switch labsScreen {
+            case .persistence:
+                PersistencePanel(lab: lab)
+            default:
+                BenchmarkView(engine: bench)
+            }
+        }
+        .navigationTitle("Labs")
+    }
+
+    private func waitForIndexReady() async {
+        var ticks = 0
+        while (engine.isIndexing || engine.indexedCount == 0) && ticks < 300 {
+            try? await Task.sleep(for: .milliseconds(100))
+            ticks += 1
         }
     }
 
@@ -200,6 +357,13 @@ struct MainView: View {
             .padding(12)
 
             Divider()
+
+            #if !os(macOS)
+            if horizontalSizeClass == .compact {
+                compactSearchControls
+                Divider()
+            }
+            #endif
 
             // Content
             if engine.isIndexing {
@@ -230,7 +394,7 @@ struct MainView: View {
                 .font(.system(size: 48))
                 .foregroundStyle(.secondary)
             Text("Semantic Search").font(.title2)
-            Text("Search \(engine.indexedCount) items by meaning.\nAdd your own notes in the sidebar.")
+            Text("Search \(engine.indexedCount) items by meaning.\nAdd notes or import documents to grow the index.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 300)
@@ -264,6 +428,52 @@ struct MainView: View {
             }
             .padding(.vertical, 2)
         }
+    }
+
+    private var compactSearchControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("efSearch \(Int(engine.efSearch))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Slider(value: $engine.efSearch, in: 10...200, step: 10)
+                    .onChange(of: engine.efSearch) {
+                        if !searchText.isEmpty {
+                            Task { await engine.search(searchText) }
+                        }
+                    }
+            }
+
+            HStack(spacing: 8) {
+                TextField("Add a note...", text: $newNote)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        Task { await engine.addNote(newNote); newNote = "" }
+                    }
+                Button {
+                    Task { await engine.addNote(newNote); newNote = "" }
+                } label: {
+                    Image(systemName: "plus.circle.fill")
+                }
+                .disabled(newNote.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    showImagePicker = true
+                } label: {
+                    Label("Images", systemImage: "photo")
+                }
+                Button {
+                    Task { await engine.rebuildIndex() }
+                } label: {
+                    Label("Rebuild", systemImage: "arrow.clockwise")
+                }
+            }
+            .buttonStyle(.bordered)
+            .font(.callout)
+        }
+        .padding(12)
     }
 
     // MARK: - Sidebar

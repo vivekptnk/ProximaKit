@@ -1,12 +1,12 @@
 # ProximaDemoApp
 
-A multiplatform SwiftUI demo app — iPhone, iPad, macOS, and visionOS from a single target — showcasing ProximaKit's semantic search, persistence, and benchmarking capabilities.
+A multiplatform SwiftUI demo app — iPhone, iPad, macOS, and visionOS from a single target — showcasing ProximaKit's semantic search, graph inspection, custom corpus import, result export, persistence, and benchmarking capabilities.
 
 ---
 
 ## What It Does
 
-The app has three feature screens, switched via a `DemoScreen` picker (see `MainView.swift`):
+The app has six feature screens, switched via `DemoScreen` (see `MainView.swift`):
 
 ### Search
 
@@ -37,10 +37,36 @@ Runs a seeded `efSearch` sweep (16 / 32 / 64 / 128 / 256) over a reproducible sy
 - Charts recall-vs-latency with SwiftUI Charts, plus a results table
 - Corpus and graph construction use fixed seeds, so recall is identical every run; latency is measured live and varies by machine/load
 
+### Index Inspector
+
+Visualizes the live HNSW graph behind the Search screen:
+
+- Uses the public `HNSWIndex.persistenceSnapshot()` surface to read node ids, node levels, metadata, and true layer-0 adjacency without touching library internals
+- Renders a deterministic, pausable force-directed graph in SwiftUI `Canvas` / `TimelineView`
+- Caps graph rendering at 150 sampled live nodes for legibility and labels the sample honestly as "showing N of M"
+- Sizes/rings nodes by HNSW layer height and draws sampled layer-0 links
+- Selecting a node shows the stored document text, category/title metadata, UUID, internal node number, layer, and degree
+
+### Import
+
+Imports custom `.txt` and `.md` files or folders into the Search index:
+
+- Uses SwiftUI `fileImporter` with security-scoped resource handling on iOS/macOS
+- Recursively reads supported files from selected folders, chunks text, embeds each chunk with the active Search embedder, and appends the chunks to the persisted demo HNSW index
+- Shows import progress, imported file/chunk counts, and readable skipped-file errors
+
+### Export
+
+Exports the current Search results:
+
+- CSV and JSON formats include query, UUIDs, scores, document titles, categories, and result text
+- iOS/iPadOS/visionOS use `ShareLink` share sheets
+- macOS uses `NSSavePanel` save dialogs
+
 ### Layout
 
-- **Compact width** (iPhone, narrow iPad split): a 4-tab `TabView` — Search, Benchmark, Persistence, Index.
-- **Regular width** (iPad full-screen, macOS, visionOS): a `NavigationSplitView` — the sidebar is the Index view, and the detail pane has a segmented picker switching between Search / Persistence / Benchmark.
+- **Compact width** (iPhone, narrow iPad split): a 5-tab `TabView` — Search, Inspector, Import, Export, Labs. Labs contains a segmented Benchmark / Persistence switch.
+- **Regular width** (iPad full-screen, macOS, visionOS): a `NavigationSplitView` — the sidebar keeps Search settings and index stats, and the detail pane has a segmented picker switching between Search / Inspector / Import / Export / Persistence / Benchmark.
 
 ### Search screen
 
@@ -129,9 +155,9 @@ For screenshots and UI-test automation, `MainView.swift` reads launch arguments 
 
 | Argument | Effect |
 |---|---|
-| `-demoScreen <search\|persistence\|benchmark\|index>` | Selects the initial screen/tab on launch |
-| `-demoQuery "<text>"` | Pre-fills the search field once the index has finished building (Search screen only; waits up to 30s for indexing to complete before filling, to avoid racing an empty index) |
-| `-demoAutorun 1` | Boolean flag. Kicks off the selected screen's headline action automatically on appear, so a populated screen can be captured non-interactively: on Benchmark it runs the full sweep; on Persistence it builds the lab corpus, then either (default) grows the WAL by 50 ops and attempts a `.paged` open — surfacing the paged-blocked banner — or, when paired with `-demoFlow memory`, checkpoints and measures memory instead (the happy path) |
+| `-demoScreen <search\|inspector\|import\|export\|persistence\|benchmark>` | Selects the initial screen/tab on launch. `index` is kept as a backwards-compatible alias for `inspector` |
+| `-demoQuery "<text>"` | Pre-fills the search field once the index has finished building (waits up to 30s for indexing to complete before filling, to avoid racing an empty index). Also supplies the autorun query for `-demoScreen export -demoAutorun 1` |
+| `-demoAutorun 1` | Boolean flag. Kicks off the selected screen's headline action automatically on appear, so a populated screen can be captured non-interactively: on Benchmark it runs the full sweep; on Persistence it builds the lab corpus, then either (default) grows the WAL by 50 ops and attempts a `.paged` open — surfacing the paged-blocked banner — or, when paired with `-demoFlow memory`, checkpoints and measures memory instead (the happy path); on Import it writes two temporary local documents and imports them through the same importer path; on Export it runs a search (using `-demoQuery` or the default sample query) and prepares CSV/JSON files; on Inspector it waits for the Search index before rendering |
 | `-demoFlow memory` | Paired with `-demoScreen persistence -demoAutorun 1`; selects the checkpoint-then-measure-memory flow instead of the default WAL-growth/paged-blocked-banner flow |
 
 Example — build, boot, install, and launch straight into a populated Benchmark screen:
@@ -161,6 +187,26 @@ Bundle identifier: `com.vivekptnk.ProximaDemoApp`.
 2. The query is embedded using the same provider that built the index (whichever `setupEmbedder()` selected at startup).
 3. `HNSWIndex.search(query:k:)` returns the nearest neighbors.
 4. Results are color-coded by distance: green (<0.55), orange (<0.68), red (>0.68).
+
+### Inspector
+
+1. The Inspector requests `SearchEngine.makeInspectorGraph(sampleLimit:)`.
+2. The engine calls the public `HNSWIndex.persistenceSnapshot()` actor method and projects `nodeToUUID`, `nodeLevels`, `metadata`, and `layers[0]` into display nodes and sampled layer-0 links.
+3. `IndexInspectorView` runs a deterministic force simulation in `TimelineView` and draws the graph in `Canvas`.
+4. Node selection reads the same decoded metadata used by Search results, so imported chunks, notes, images, and sample sentences all display their real stored text.
+
+### Import
+
+1. The Import screen opens a SwiftUI `fileImporter` for `.txt`, `.md`, and folders.
+2. `SearchEngine.importCorpus(from:)` starts security-scoped access for each selected URL, recursively reads supported files, records skipped-file failures, and chunks readable text.
+3. Each chunk is embedded with the active Search embedder and added to the live `HNSWIndex` with JSON metadata carrying document title, source path, document id, and chunk index.
+4. The updated index is saved back to the demo's persisted index file.
+
+### Export
+
+1. The Export screen uses the current `SearchEngine.results` and `currentQuery`.
+2. `SearchEngine.exportData(format:)` serializes CSV or JSON with query, ids, scores, document titles, categories, and text.
+3. iOS/iPadOS/visionOS write temporary export files for `ShareLink`; macOS writes the chosen payload to the `NSSavePanel` destination.
 
 ### CoreML Model (Optional)
 
@@ -194,8 +240,11 @@ Convert `sentence-transformers/all-MiniLM-L6-v2` (or any BERT-family sentence-tr
 |------|---------|
 | `ProximaDemoApp.swift` | App entry point, initializes `SearchEngine` |
 | `MainView.swift` | Root view: `DemoScreen` enum, compact `TabView` / regular `NavigationSplitView` layout, launch-hook handling |
-| `SearchEngine.swift` | Index lifecycle, search, persistence, embedding (Search screen) |
+| `SearchEngine.swift` | Index lifecycle, search, persistence, embedding, public graph snapshot projection, corpus import/chunking, and CSV/JSON export |
 | `SampleData.swift` | 46 sample sentences across 9 categories |
+| `IndexInspectorView.swift` | SwiftUI `Canvas` / `TimelineView` force-directed HNSW graph inspector with node selection and layer histogram |
+| `CorpusImportView.swift` | Custom `.txt` / `.md` file and folder import UI with progress, counts, and skipped-file errors |
+| `ResultsExportView.swift` | CSV/JSON result export UI, using `ShareLink` on iOS/visionOS and `NSSavePanel` on macOS |
 | `BenchmarkEngine.swift` | `@Observable` controller: builds exact + approximate indexes, computes ground truth, sweeps `efSearch`, measures recall@10 and latency (median/p90) |
 | `BenchmarkView.swift` | SwiftUI view for the Benchmark screen: run button, progress, recall-vs-latency chart (SwiftUI Charts), results table |
 | `PersistenceLab.swift` | `@Observable @MainActor` controller for the Persistence screen: builds the synthetic corpus, opens/reopens journaled, grows the WAL, checkpoints, measures live resident-vs-paged memory via `task_vm_info` |
