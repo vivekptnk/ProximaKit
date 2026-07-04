@@ -72,6 +72,24 @@ public actor HybridVectorStore {
     /// Tail of the compound-operation chain (see ``serialized(_:)``).
     private var operationTail: Task<Void, Never>?
 
+    /// Whether the **dense** leg journals mutations to a `.pxwal` sidecar
+    /// (ADR-013 store-level journaling). `false` for every store built through
+    /// the two historical initializers. Only
+    /// ``open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)``
+    /// sets it `true`. The sparse leg has no WAL codec; under journaling it is
+    /// reconstructed from the dense leg's metadata on open (see that factory).
+    private let journaling: Bool
+
+    /// WAL durability dial for the dense leg, used only when ``journaling``.
+    private let durability: WALDurability
+
+    /// Dense base snapshot path (`index.pxkt`).
+    private var denseURL: URL { storageURL.appendingPathComponent("index.pxkt") }
+    /// Dense write-ahead-log sidecar path (`index.pxwal`).
+    private var walURL: URL { storageURL.appendingPathComponent("index.pxwal") }
+    /// Sparse leg snapshot path (`index.pxbm`).
+    private var sparseURL: URL { storageURL.appendingPathComponent("index.pxbm") }
+
     // MARK: - Initialization
 
     /// Creates (or restores) a hybrid vector store at the given storage directory.
@@ -131,6 +149,8 @@ public actor HybridVectorStore {
         self._dense = dense
         self._sparse = sparse
         self.index = HybridIndex(dense: dense, sparse: sparse, fusion: fusion)
+        self.journaling = false
+        self.durability = .everyBatch
     }
 
     /// Creates a HybridVectorStore wrapping an existing `HybridIndex` (testing hook).
@@ -152,6 +172,114 @@ public actor HybridVectorStore {
         self._sparse = sparse
         self.embedder = embedder
         self.storageURL = storageDirectory.appendingPathComponent(name)
+        self.journaling = false
+        self.durability = .everyBatch
+    }
+
+    /// Designated initializer for the journaled open path (private — journaling
+    /// is established only through the async ``open`` factory, which recovers
+    /// the dense leg from its WAL and rebuilds the sparse leg + document map
+    /// before handing the fully-consistent state here).
+    private init(
+        name: String,
+        index: HybridIndex,
+        dense: HNSWIndex,
+        sparse: SparseIndex,
+        embedder: any TextEmbedder,
+        storageDirectory: URL,
+        journaling: Bool,
+        durability: WALDurability,
+        documentMap: [String: Set<UUID>]
+    ) {
+        self.name = name
+        self.index = index
+        self._dense = dense
+        self._sparse = sparse
+        self.embedder = embedder
+        self.storageURL = storageDirectory.appendingPathComponent(name)
+        self.journaling = journaling
+        self.durability = durability
+        self.documentMap = documentMap
+    }
+
+    // MARK: - Journaled Lifecycle (ADR-013 store-level journaling, opt-in)
+
+    /// Opens a **journaled** hybrid store. The dense leg streams mutations to a
+    /// `.pxwal` sidecar; the sparse (BM25) leg — which has no WAL codec — and
+    /// the document map are **both reconstructed from the dense leg** on open.
+    ///
+    /// ## Why this is crash-consistent (the blocker bar)
+    /// Each chunk's ``ChunkMetadata`` (carrying its `documentId` **and** its
+    /// original `text`) is journaled into the dense leg's WAL record. On open,
+    /// after the dense WAL is replayed to its longest valid prefix, the sparse
+    /// leg is rebuilt by re-adding every live dense node's text, and the
+    /// document map by indexing every live node's `documentId`. The dense
+    /// index + WAL are therefore the **single source of truth**: the sparse
+    /// leg and the map are pure projections of it, so after any crash every
+    /// recovered id is searchable in *both* legs and mapped — a dense vector
+    /// without a sparse entry or a mapping, or vice versa, is structurally
+    /// impossible. A stale `index.pxbm` / `hybrid.json` left by a prior
+    /// ``checkpoint()`` is ignored here.
+    ///
+    /// - Note: The sparse leg is reconstructed from `ChunkMetadata.text`, which
+    ///   *is* the chunk text by that field's definition ("the original text of
+    ///   this chunk"). In normal use it equals the string passed to
+    ///   ``addChunks(_:metadata:)`` and the rebuilt sparse leg is identical to
+    ///   the live one; even if a caller diverged the two, the blocker-bar
+    ///   invariant (every id present in both legs and the map) still holds.
+    ///
+    /// - Parameter durability: dense-leg WAL flush policy (default `.everyBatch`).
+    public static func open(
+        name: String,
+        embedder: any TextEmbedder,
+        storageDirectory: URL,
+        metric: any DistanceMetric = CosineDistance(),
+        hnswConfig: HNSWConfiguration = HNSWConfiguration(),
+        bm25Config: BM25Configuration = BM25Configuration(),
+        tokenizer: any BM25Tokenizer = DefaultBM25Tokenizer(),
+        fusion: HybridFusionStrategy = .rrf(),
+        durability: WALDurability = .everyBatch
+    ) async throws -> HybridVectorStore {
+        let storeDir = storageDirectory.appendingPathComponent(name)
+        let denseURL = storeDir.appendingPathComponent("index.pxkt")
+        let walURL = storeDir.appendingPathComponent("index.pxwal")
+
+        let dense: HNSWIndex
+        if FileManager.default.fileExists(atPath: denseURL.path) {
+            dense = try await HNSWIndex.open(baseURL: denseURL, walURL: walURL, durability: durability)
+        } else {
+            try FileManager.default.createDirectory(at: storeDir, withIntermediateDirectories: true)
+            let fresh = HNSWIndex(dimension: embedder.dimension, metric: metric, config: hnswConfig)
+            try await fresh.checkpoint(baseURL: denseURL, walURL: walURL, durability: durability)
+            dense = fresh
+        }
+
+        // Rebuild the sparse leg and the document map from the recovered dense
+        // leg — the single source of truth. Order is dense node order; the
+        // sparse leg's internal numbering is UUID-keyed, so this is
+        // deterministic and externally invisible.
+        let sparse = SparseIndex(tokenizer: tokenizer, configuration: bm25Config)
+        let decoder = JSONDecoder()
+        var map: [String: Set<UUID>] = [:]
+        for entry in await dense.liveEntries() {
+            guard let data = entry.metadata,
+                  let meta = try? decoder.decode(ChunkMetadata.self, from: data) else { continue }
+            try await sparse.add(text: meta.text, id: entry.id, metadata: data)
+            map[meta.documentId, default: []].insert(entry.id)
+        }
+
+        let index = HybridIndex(dense: dense, sparse: sparse, fusion: fusion)
+        return HybridVectorStore(
+            name: name,
+            index: index,
+            dense: dense,
+            sparse: sparse,
+            embedder: embedder,
+            storageDirectory: storageDirectory,
+            journaling: true,
+            durability: durability,
+            documentMap: map
+        )
     }
 
     // MARK: - Operation Serialization
@@ -312,6 +440,20 @@ public actor HybridVectorStore {
     private func performSave() async throws {
         guard isDirty else { return }
 
+        // ── Journaled path (ADR-013): only the dense leg is durable-per-mutation
+        // via its WAL; save() flushes that WAL. The sparse leg and the document
+        // map are NOT persisted here — both are rebuilt from the dense leg on the
+        // next open, so neither can fall behind (or ahead of) the WAL and present
+        // a torn pair. This is what makes the sparse-leg-has-no-WAL asymmetry safe.
+        if journaling {
+            let generation = mutationGeneration
+            try await _dense.syncJournal()
+            if mutationGeneration == generation {
+                savedGeneration = generation
+            }
+            return
+        }
+
         // Snapshot the generation and document map before any suspension
         // point so the map written below matches the leg snapshots even if
         // a mutation were ever to interleave with this save.
@@ -340,8 +482,62 @@ public actor HybridVectorStore {
         }
     }
 
+    /// Folds the dense WAL into a fresh base and refreshes both legs' on-disk
+    /// caches. A full ``save()`` for a non-journaled store.
+    ///
+    /// Under journaling, ``save()`` is a cheap dense-WAL flush; `checkpoint()`
+    /// is the periodic fold: it checkpoints the dense leg (compact → new v3
+    /// base → `F_FULLFSYNC` → WAL reset), then rewrites the `index.pxbm` sparse
+    /// snapshot and the `hybrid.json` map cache so a non-journaled reload still
+    /// works. A crash between the dense commit and the cache rewrites is
+    /// harmless: journaled ``open`` rebuilds both the sparse leg and the map
+    /// from the dense leg, ignoring the stale caches.
+    public func checkpoint() async throws {
+        try await serialized {
+            try await self.performCheckpoint()
+        }
+    }
+
+    /// Whether the dense WAL warrants a ``checkpoint()`` under `policy`.
+    /// Always `false` for a non-journaled store.
+    public func needsCheckpoint(policy: WALCheckpointPolicy = WALCheckpointPolicy()) async -> Bool {
+        guard journaling else { return false }
+        return await _dense.needsCheckpoint(policy: policy)
+    }
+
+    /// Performs the fold. Must only run inside ``serialized(_:)``.
+    private func performCheckpoint() async throws {
+        guard journaling else {
+            try await performSave()
+            return
+        }
+
+        let generation = mutationGeneration
+        let mapSnapshot = documentMap.mapValues { Array($0) }
+
+        // Dense commit point: fold the WAL into a fresh v3 base + reset the WAL.
+        try await _dense.checkpoint(baseURL: denseURL, walURL: walURL, durability: durability)
+
+        // Refresh derived caches for the non-journaled reload path. Both are
+        // rebuilt from the dense leg on a journaled open, so a crash before
+        // they land cannot corrupt recovery.
+        try await _sparse.save(to: sparseURL)
+        let mapURL = storageURL.appendingPathComponent("hybrid.json")
+        let mapData = try JSONEncoder().encode(mapSnapshot)
+        try mapData.write(to: mapURL, options: .atomic)
+
+        if mutationGeneration == generation {
+            savedGeneration = generation
+        }
+    }
+
     /// Restores the document map from disk after a cold-load.
+    ///
+    /// - Note: A no-op for a journaled store (opened via ``open``): its map and
+    ///   sparse leg are authoritative projections of the dense leg rebuilt at
+    ///   open, so loading a possibly-stale `hybrid.json` would be a regression.
     public func loadDocumentMap() throws {
+        guard !journaling else { return }
         let mapURL = storageURL.appendingPathComponent("hybrid.json")
         guard FileManager.default.fileExists(atPath: mapURL.path) else {
             return
@@ -374,4 +570,9 @@ public actor HybridVectorStore {
     }
 
     public var hasUnsavedChanges: Bool { isDirty }
+
+    /// Every UUID tracked by the document map (union over all documents).
+    /// Internal diagnostic hook: recovery tests assert this equals both legs'
+    /// live-id sets, proving the dense leg, sparse leg, and map never diverge.
+    internal var trackedIDs: Set<UUID> { Set(documentMap.values.flatMap { $0 }) }
 }

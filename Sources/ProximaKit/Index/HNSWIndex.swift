@@ -937,6 +937,25 @@ public actor HNSWIndex: VectorIndex {
         journal = nil
     }
 
+    /// Every live (non-tombstoned) node's external id paired with its stored
+    /// metadata, in internal node order.
+    ///
+    /// This is the projection a journaled store replays to rebuild derived
+    /// sidecars — the document → UUID map, and (for a hybrid store) the whole
+    /// sparse leg — from the dense index after WAL recovery, so those sidecars
+    /// are never an independent on-disk source of truth that could diverge from
+    /// the index on a crash (ADR-013 store-level journaling addendum). The
+    /// liveness test (`uuidToNode[uuid] == node`) is the same identity check
+    /// search and compaction use, so tombstoned and re-added slots are skipped.
+    public func liveEntries() -> [(id: UUID, metadata: Data?)] {
+        var out: [(id: UUID, metadata: Data?)] = []
+        out.reserveCapacity(uuidToNode.count)
+        for (node, uuid) in nodeToUUID.enumerated() where uuidToNode[uuid] == node {
+            out.append((id: uuid, metadata: metadata[node]))
+        }
+        return out
+    }
+
     private func fullSyncFile(_ url: URL) throws {
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }

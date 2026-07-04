@@ -598,3 +598,156 @@ section gives (variable-length encoding, in-place mutation, traversal hot path,
 derived-only reverse edges). `SQHW`/`PQHW` paged originals (ADR-012's deferred
 fix) remain a follow-up: they adopt the same section-table + padding shape but
 are a separate change.
+
+## Store-level journaling (addendum — closes deviation 5)
+
+This addendum wires the index-level WAL (Stage 1) into `VectorStore` and
+`HybridVectorStore`, closing **deviation 5** of the Stage 1 notes. Same
+convention as the prior addenda: the ADR body is the original design, this
+section is authoritative for the built code. Motivation: an agentic on-device
+consumer mutates memory continuously, so a full-corpus rewrite per `save()` is
+prohibitive — journaled saves make it O(change).
+
+### The multi-file crash-consistency problem
+
+A store is an index **plus sidecars** (`docmap.json`; and for hybrid the whole
+sparse `index.pxbm` leg). The index-level WAL makes the dense index durable per
+mutation, but the sidecars only persisted on `save()`. Naively journaling the
+index while the sidecars lag would let a crash leave a **replayed index newer
+than its sidecars**: a dense vector with no doc-map entry (an *orphan*) or, if a
+stale sidecar were trusted, a doc-map entry with no live vector (a *phantom*).
+For hybrid it is worse — the sparse leg has no WAL at all, so a crash would
+leave a document searchable in the dense leg but absent from the sparse leg.
+Either shape is a silent internal inconsistency, strictly worse than the
+pre-journaling honest all-or-nothing `save()`.
+
+### Design chosen: sidecars are derived from the journaled index (Option (c))
+
+The dense index + its WAL are the **single source of truth**; every sidecar is a
+pure projection of it, recomputed on `open`, never an independent persisted
+authority.
+
+- Each chunk is added to the dense index with its `ChunkMetadata` (JSON) as the
+  node metadata, and that metadata is what the WAL `add` record already carries
+  (Stage 1 framing, unchanged — **PXWL v1 is not touched**). `ChunkMetadata`
+  carries both `documentId` **and** the chunk `text`.
+- New additive hook `HNSWIndex.liveEntries() -> [(id, metadata)]` enumerates the
+  live (non-tombstoned) nodes. After WAL replay on `open`, the store rebuilds:
+  - the **document map** by decoding each live node's `documentId`;
+  - (hybrid only) the **entire sparse leg** by re-adding each live node's `text`
+    under its UUID.
+- Because both are computed *from* the recovered index, they cannot be newer or
+  older than it. A doc-map entry exists iff a live vector exists; a sparse entry
+  exists iff a live dense vector exists. Orphans and phantoms are structurally
+  impossible — this is the blocker bar, met by construction rather than by
+  careful ordering.
+
+Any `docmap.json` / `index.pxbm` / `hybrid.json` on disk is a **load-time cache
+for the non-journaled reload path only**, written at `checkpoint()` and
+**ignored** by a journaled `open` (which always rebuilds from the index). A
+stale or even hand-corrupted cache cannot inject a phantom (test
+`testPhantomSidecarIsIgnored`).
+
+### Alternatives rejected
+
+- **(a) Extend WAL records with an opaque store-payload field.** Rejected: it
+  couples the frozen PXWL v1 format and the index decoder to store-layer
+  concerns for zero benefit — the doc-map/sparse data is *already* fully implied
+  by the metadata the WAL carries, so a second copy would be redundant and a new
+  drift source. Derivation (c) needs no format change at all.
+- **(b) Atomic multi-file commit with cross-file generation binding + truncate
+  the index replay to the sidecar generation.** Rejected: it keeps the sidecars
+  as an independent source of truth (so it must *reconcile* two truths on every
+  recovery), throws away durably-journaled index records to match a laggy
+  sidecar (data loss the WAL exists to prevent), and cannot rescue the sparse
+  leg at all (no WAL to truncate against). Derivation subsumes it: there is only
+  one truth, so there is nothing to reconcile.
+
+### API (additive; CHA-107 preserved)
+
+- `VectorStore.open(name:embedder:storageDirectory:metric:config:durability:)`
+  and
+  `HybridVectorStore.open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)`
+  — async factories that establish journaling. A fresh directory creates an
+  empty index and checkpoints it (generation-1 base + fresh WAL); an existing
+  base (including a plain **v2** base from a historical `save()`) is opened and
+  its WAL replayed.
+- `checkpoint()` / `needsCheckpoint(policy:)` — new methods folding the WAL into
+  a fresh base and refreshing the caches.
+- The two historical initializers, `save()`, `query()`, `addChunks`,
+  `removeDocument`, and `loadDocumentMap()` are **unchanged** for non-journaled
+  stores (byte-identical); the existing `StoreReentrancy` / `VectorStore` /
+  `HybridVectorStore` suites pass unmodified. `loadDocumentMap()` is a no-op on a
+  journaled store (its map is already authoritative). Journaling is `false` for
+  every store not built through `open` — the frozen v1 `VectorStore` contract
+  (CHA-107) is untouched.
+
+### save() / checkpoint() semantics; the dirty flag under journaling
+
+- **`save()`** under journaling = flush the dense WAL to its durability level
+  (`syncJournal()`), O(1) — *not* a rewrite. The sidecars are **not** written
+  (they are derived). `mutationGeneration`/`savedGeneration` keep their exact
+  meaning: `save()` sets `saved = mutation` iff no mutation interleaved, so
+  `hasUnsavedChanges` means "mutations not yet flushed to the WAL's durability
+  level" (only ever non-trivially true under `.manual`; under `.everyBatch` /
+  `.everyRecord` each mutation is already flushed as it lands). The
+  serialized-operation discipline and lost-update protection are inherited
+  intact.
+- **`checkpoint()`** under journaling = the periodic O(corpus) fold: compact →
+  write a fresh v3 base (generation bumped, `F_FULLFSYNC`) → reset the WAL →
+  rewrite the sidecar caches. For a non-journaled store `checkpoint()` is just a
+  full `save()`.
+
+### Crash semantics table
+
+Recovery = journaled `open` (drop the handle, reopen). "Survives" = present and
+internally consistent after recovery. `D` = default `.everyBatch`.
+
+| Event / file | `.everyRecord` | `.everyBatch` (default) | `.manual` |
+|---|---|---|---|
+| `add`/`remove` → dense WAL record | durable at call return (drive cache) | durable at call return (drive cache) | in OS page cache until `save()`/`checkpoint()` |
+| Crash after `save()` returned | full recovery | full recovery | full recovery (save flushed) |
+| Crash mid-ingest, no `save()` | recover longest valid WAL **prefix** | same | may lose the un-`save()`d tail (page cache) |
+| `docmap.json` (VectorStore sidecar) | **derived** — rebuilt from index on open; staleness/absence/corruption is harmless | same | same |
+| `index.pxbm` sparse leg (hybrid) | **derived** — rebuilt from dense metadata on open; a crash can never leave it behind the dense leg | same | same |
+| `hybrid.json` map cache | derived — ignored on journaled open | same | same |
+| Crash between `checkpoint()` base-rename and WAL reset | typed `walGenerationMismatch` on open (Stage 1 window, unchanged) | same | same |
+| Crash between base-rename and cache refresh | harmless — journaled open rebuilds caches from the index | same | same |
+
+Across every row the recovered store satisfies the blocker bar: the document map
+is an exact bijection with the dense index's live-id set (no orphan, no
+phantom), and for hybrid the sparse leg holds exactly that same id set (no leg
+divergence). Darwin honesty (Stage 1) still applies: `fsync` reaches the drive
+cache, only `F_FULLFSYNC` (checkpoint commit) forces the media.
+
+### CHA-107 compatibility statement
+
+`HybridVectorStore` still does not mutate `VectorStore`, and neither store's
+historical (non-journaled) initializers or semantics change. Journaling is a new
+opt-in `open` surface; `save()`/`load`/`loadDocumentMap` on a non-journaled
+store are byte-identical to before. A directory written by the old non-journaled
+path can be reopened journaled (its v2 base opens, a fresh WAL binds to its
+generation-0 base, the map rebuilds from the index metadata) — a clean forward
+migration with no format bump. PXWL v1 and the v3 `.pxkt` format are untouched.
+
+### Recovery tests (`StoreJournalRecoveryTests`)
+
+In-process, deterministic, asserting the blocker bar every time:
+`testIndexAheadOfStaleSidecarRecoversBoth` (WAL ahead of a stale `docmap.json`),
+`testPhantomSidecarIsIgnored` (sidecar-ahead / planted phantom rejected),
+`testTornWALTailStaysConsistent` + `testTornDenseWALKeepsLegsConsistent` (torn
+WAL tail under a store — both legs stay a bijection),
+`testGenerationMismatchIsTypedRejection` (stale WAL beside a newer base →
+typed `walGenerationMismatch`, never a trap), and
+`testSparseLegReconstructedFromDenseWAL` (the sparse leg, never persisted,
+fully rebuilt from the dense WAL — red-green proven: skipping the sparse rebuild
+leaves dense=7 / sparse=0 and fails).
+
+**Out-of-process SIGKILL** is not re-run at the store level, deliberately: the
+only crash-relevant durability a journaled store adds is the dense-leg WAL, and
+that exact WAL on this exact durability path is already SIGKILL-hammered ≥100
+iterations by `WALKillRecoveryTests`. The store's recovery step on top of it —
+rebuilding the map and sparse leg from `liveEntries()` — is pure in-memory
+computation with **zero additional persistence**, so an in-process drop-and-reopen
+reproduces post-kill recovery exactly. Adding a second spawn target would test
+the same WAL twice.

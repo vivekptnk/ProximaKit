@@ -58,6 +58,22 @@ public actor VectorStore {
     /// Tail of the compound-operation chain (see ``serialized(_:)``).
     private var operationTail: Task<Void, Never>?
 
+    /// Whether this store journals index mutations to a `.pxwal` sidecar
+    /// (ADR-013 store-level journaling). `false` for every store built through
+    /// the two historical initializers — their behavior is byte-identical to
+    /// before. Only ``open(name:embedder:storageDirectory:metric:config:durability:)``
+    /// sets it `true`.
+    private let journaling: Bool
+
+    /// WAL durability dial, used only when ``journaling`` is `true`.
+    private let durability: WALDurability
+
+    /// The base snapshot path (`index.pxkt`) inside the store directory.
+    private var indexURL: URL { storageURL.appendingPathComponent("index.pxkt") }
+
+    /// The write-ahead-log sidecar path (`index.pxwal`) inside the store directory.
+    private var walURL: URL { storageURL.appendingPathComponent("index.pxwal") }
+
     // MARK: - Initialization
 
     /// Creates a new vector store, or loads an existing one from disk.
@@ -106,6 +122,10 @@ public actor VectorStore {
                 config: config
             )
         }
+        // Historical (non-journaled) construction: save()/load() keep their
+        // exact all-or-nothing behavior. These fields never change that path.
+        self.journaling = false
+        self.durability = .everyBatch
     }
 
     /// Creates a VectorStore wrapping an existing index (for testing or advanced use).
@@ -125,6 +145,112 @@ public actor VectorStore {
         self.index = index
         self.embedder = embedder
         self.storageURL = storageDirectory.appendingPathComponent(name)
+        self.journaling = false
+        self.durability = .everyBatch
+    }
+
+    /// Designated initializer for the journaled open path. Private: journaling
+    /// is established only through ``open(name:embedder:storageDirectory:metric:config:durability:)``,
+    /// which does the async index open + WAL replay + document-map rebuild
+    /// before handing the fully-recovered state here.
+    private init(
+        name: String,
+        index: HNSWIndex,
+        embedder: any TextEmbedder,
+        storageDirectory: URL,
+        journaling: Bool,
+        durability: WALDurability,
+        documentMap: [String: Set<UUID>]
+    ) {
+        self.name = name
+        self.index = index
+        self.embedder = embedder
+        self.storageURL = storageDirectory.appendingPathComponent(name)
+        self.journaling = journaling
+        self.durability = durability
+        self.documentMap = documentMap
+    }
+
+    // MARK: - Journaled Lifecycle (ADR-013 store-level journaling, opt-in)
+
+    /// Opens a **journaled** vector store: index mutations stream to a
+    /// `.pxwal` sidecar as they happen, and the document → UUID map is rebuilt
+    /// from the recovered index rather than trusted from a separate file.
+    ///
+    /// Additive and opt-in — the two historical initializers are untouched and
+    /// keep their exact all-or-nothing save semantics (CHA-107 contract
+    /// preserved). Choose this factory for continuous-mutation (agentic)
+    /// workloads where a full-corpus rewrite per save is prohibitive.
+    ///
+    /// ## Crash consistency
+    /// The dense index + its WAL are the **single source of truth**. On open,
+    /// the document map is reconstructed from ``HNSWIndex/liveEntries()`` after
+    /// WAL replay, so it can never be a mapping newer or older than the index
+    /// it describes: every recovered vector is mapped and every mapping points
+    /// at a live vector, by construction. Any `docmap.json` left on disk from a
+    /// prior ``checkpoint()`` is a load-time cache for the non-journaled
+    /// reload path only and is **ignored** here (it cannot resurrect a phantom
+    /// mapping).
+    ///
+    /// ## Fresh vs. existing directory
+    /// - No `index.pxkt` yet → an empty index is created and immediately
+    ///   checkpointed (generation 1 base + fresh WAL).
+    /// - An existing base (including a plain v2 base written by the historical
+    ///   `save()`) → it is opened and any WAL replayed over it; a base with no
+    ///   WAL yet starts a fresh one bound to the base's generation.
+    ///
+    /// - Parameter durability: WAL flush policy (default `.everyBatch`).
+    public static func open(
+        name: String,
+        embedder: any TextEmbedder,
+        storageDirectory: URL,
+        metric: any DistanceMetric = CosineDistance(),
+        config: HNSWConfiguration = HNSWConfiguration(),
+        durability: WALDurability = .everyBatch
+    ) async throws -> VectorStore {
+        let storeDir = storageDirectory.appendingPathComponent(name)
+        let indexURL = storeDir.appendingPathComponent("index.pxkt")
+        let walURL = storeDir.appendingPathComponent("index.pxwal")
+
+        let index: HNSWIndex
+        if FileManager.default.fileExists(atPath: indexURL.path) {
+            index = try await HNSWIndex.open(baseURL: indexURL, walURL: walURL, durability: durability)
+        } else {
+            try FileManager.default.createDirectory(at: storeDir, withIntermediateDirectories: true)
+            let fresh = HNSWIndex(dimension: embedder.dimension, metric: metric, config: config)
+            try await fresh.checkpoint(baseURL: indexURL, walURL: walURL, durability: durability)
+            index = fresh
+        }
+
+        let map = rebuildDocumentMap(from: await index.liveEntries())
+        return VectorStore(
+            name: name,
+            index: index,
+            embedder: embedder,
+            storageDirectory: storageDirectory,
+            journaling: true,
+            durability: durability,
+            documentMap: map
+        )
+    }
+
+    /// Rebuilds the document → UUID map from the index's live nodes by decoding
+    /// each node's ``ChunkMetadata``. A node whose metadata is absent or not a
+    /// `ChunkMetadata` (e.g. a vector added straight through ``index`` rather
+    /// than ``addChunks(_:metadata:)``) is simply not a tracked document chunk —
+    /// exactly the historical contract, where the map only ever held what
+    /// `addChunks` inserted.
+    private static func rebuildDocumentMap(
+        from entries: [(id: UUID, metadata: Data?)]
+    ) -> [String: Set<UUID>] {
+        let decoder = JSONDecoder()
+        var map: [String: Set<UUID>] = [:]
+        for entry in entries {
+            guard let data = entry.metadata,
+                  let meta = try? decoder.decode(ChunkMetadata.self, from: data) else { continue }
+            map[meta.documentId, default: []].insert(entry.id)
+        }
+        return map
     }
 
     // MARK: - Operation Serialization
@@ -308,6 +434,19 @@ public actor VectorStore {
     private func performSave() async throws {
         guard isDirty else { return }
 
+        // ── Journaled path (ADR-013): mutations already streamed to the WAL as
+        // they happened; save() is just a durability flush, not a rewrite. The
+        // document map is derived from the index on the next open, so it is not
+        // persisted here — there is no separate file to fall behind the WAL.
+        if journaling {
+            let generation = mutationGeneration
+            try await index.syncJournal()
+            if mutationGeneration == generation {
+                savedGeneration = generation
+            }
+            return
+        }
+
         // Snapshot the generation and document map before any suspension
         // point so the docmap written below matches the index snapshot even
         // if a mutation were ever to interleave with this save.
@@ -337,11 +476,71 @@ public actor VectorStore {
         }
     }
 
+    /// Folds the accumulated WAL back into a fresh base snapshot and refreshes
+    /// the on-disk caches. No-op-equivalent (a full ``save()``) for a
+    /// non-journaled store.
+    ///
+    /// Under journaling, ``save()`` is a cheap WAL flush; `checkpoint()` is the
+    /// periodic O(corpus) fold that compacts the index, writes a new v3 base
+    /// (generation bumped, `F_FULLFSYNC`-ed), resets the WAL, and rewrites the
+    /// `docmap.json` cache so a subsequent *non-journaled* reload still works.
+    /// Call it when ``needsCheckpoint`` reports `true` (or on graceful
+    /// shutdown). Because a journaled ``open(name:embedder:storageDirectory:metric:config:durability:)``
+    /// always rebuilds the map from the index, a crash between the base rewrite
+    /// and the cache refresh cannot produce an inconsistent recovery — the
+    /// stale cache is ignored.
+    public func checkpoint() async throws {
+        try await serialized {
+            try await self.performCheckpoint()
+        }
+    }
+
+    /// Whether the accumulated WAL warrants a ``checkpoint()`` under `policy`.
+    /// Always `false` for a non-journaled store.
+    public func needsCheckpoint(policy: WALCheckpointPolicy = WALCheckpointPolicy()) async -> Bool {
+        guard journaling else { return false }
+        return await index.needsCheckpoint(policy: policy)
+    }
+
+    /// Performs the fold. Must only run inside ``serialized(_:)``.
+    private func performCheckpoint() async throws {
+        guard journaling else {
+            // A non-journaled store has no WAL to fold; a checkpoint is just a
+            // full, atomic save (the historical all-or-nothing snapshot).
+            try await performSave()
+            return
+        }
+
+        let generation = mutationGeneration
+        let mapSnapshot = documentMap.mapValues { Array($0) }
+
+        // Fold the WAL into a fresh v3 base + reset the WAL (the commit point).
+        try await index.checkpoint(baseURL: indexURL, walURL: walURL, durability: durability)
+
+        // Refresh the docmap.json cache for the non-journaled reload path. This
+        // is derived data; a crash before it lands is harmless because journaled
+        // open rebuilds the map from the freshly-checkpointed index.
+        let mapURL = storageURL.appendingPathComponent("docmap.json")
+        let mapData = try JSONEncoder().encode(mapSnapshot)
+        try mapData.write(to: mapURL, options: .atomic)
+
+        if mutationGeneration == generation {
+            savedGeneration = generation
+        }
+    }
+
     /// Loads the document map from disk if it exists.
     ///
     /// Call this after loading from persistence to restore
     /// the document → UUID mapping without scanning all metadata.
+    ///
+    /// - Note: A no-op for a journaled store (opened via
+    ///   ``open(name:embedder:storageDirectory:metric:config:durability:)``):
+    ///   its map is the authoritative projection of the index rebuilt at open,
+    ///   so loading a possibly-stale `docmap.json` over it would be a
+    ///   regression, not a restore.
     public func loadDocumentMap() throws {
+        guard !journaling else { return }
         let mapURL = storageURL.appendingPathComponent("docmap.json")
         guard FileManager.default.fileExists(atPath: mapURL.path) else {
             return
@@ -375,4 +574,9 @@ public actor VectorStore {
 
     /// Whether the store has unsaved changes.
     public var hasUnsavedChanges: Bool { isDirty }
+
+    /// Every UUID tracked by the document map (union over all documents).
+    /// Internal diagnostic hook: recovery tests assert this equals the index's
+    /// live-id set exactly, proving no orphaned vector and no phantom mapping.
+    internal var trackedIDs: Set<UUID> { Set(documentMap.values.flatMap { $0 }) }
 }
