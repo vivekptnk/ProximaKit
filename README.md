@@ -39,7 +39,7 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 | **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)); opt-in WAL incremental saves + paged vector region make index mutations O(change) instead of O(corpus), *(new)* now wired all the way to `VectorStore`/`HybridVectorStore.open(...)` with derivation-based crash consistency ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
 | **Embedding providers** | Apple NaturalLanguage, Vision, and bring-your-own CoreML (BERT/MiniLM via WordPiece tokenizer) |
 | **Concurrency** | Every index is a Swift `actor`; `Sendable` API surface, built with `StrictConcurrency` |
-| **Proof** | 400+ tests, recall floors enforced in CI, cross-library benchmark harness vs FAISS/ScaNN running nightly |
+| **Proof** | ~590 tests, recall floors enforced in CI, cross-library benchmark harness vs FAISS/ScaNN running nightly |
 
 <table>
 <tr>
@@ -143,6 +143,30 @@ dependencies: [
 ```
 
 ## Quick Start
+
+### Add a Vector, Search It
+
+With ProximaKit added as a dependency (above), semantic search is three steps — embed, index, search:
+
+```swift
+import ProximaKit
+import ProximaEmbeddings
+
+let embedder = try NLEmbeddingProvider(language: .english)
+let index = HNSWIndex(dimension: embedder.dimension, metric: CosineDistance())
+
+// Index a couple of sentences
+for text in ["Dogs love playing fetch in the park",
+             "Fresh pasta tastes better than dried"] {
+    try await index.add(embedder.embed(text), id: UUID())
+}
+
+// Search by meaning — no shared keywords required
+let query = try await embedder.embed("animals playing outside")
+let hits = await index.search(query: query, k: 3)   // → the dog sentence ranks first
+```
+
+Apple's built-in language model does the embedding on-device — no downloads, no API key. Want metadata, per-user filtering, or the distances behind each hit? See [Search Text by Meaning](#search-text-by-meaning) below.
 
 ### Run the Demo
 
@@ -662,8 +686,13 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 # Build
 swift build
 
-# Unit + integration tests (fast)
+# CI-equivalent functional suite — ~590 tests, no recall benchmarks.
+# Not a quick check: ~20-30 min locally on Apple Silicon, measured
+# 33-38 min on CI's shared macos-15 runner (this is what CI actually runs).
 swift test --skip RecallBenchmarkTests
+
+# Fast inner loop while iterating — one test class runs in seconds
+swift test --filter VectorStoreTests
 
 # Full recall benchmarks (slow, needs Release mode)
 swift test -c release --filter RecallBenchmarkTests
@@ -672,7 +701,7 @@ swift test -c release --filter RecallBenchmarkTests
 swift package generate-documentation --target ProximaKit
 ```
 
-CI runs the full functional suite (400+ tests; benchmark classes run separately), SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR — plus a benchmark smoke-slice regression gate on PRs that touch the core index.
+CI runs the full functional suite (~590 tests; benchmark classes run separately), SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR — plus a benchmark smoke-slice regression gate on PRs that touch the core index.
 
 
 ## Roadmap
@@ -687,7 +716,8 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
 | Paged PQ originals — restore 32× compression with exact reranking | **Shipped** ([ADR-014](docs/adr/ADR-014-paged-originals.md)) — PQHW v3 format, v2→v3 migration rewriter (both families, plus `ProximaBench migrate`), and the paged originals read path |
 | Jensen-Shannon divergence metric | **Shipped** — `JensenShannonDistance()`, serializable (`DistanceMetricType` raw value 7) |
 | Background HNSW compaction policy | Planned |
-| Demo app — CoreML model download UI, benchmark tab, result export | Planned |
+| Demo app — Benchmark tab (in-app seeded `efSearch` sweep 16–256, recall@10-vs-latency SwiftUI Charts) | **Shipped** |
+| Demo app — CoreML model download UI, result export (CSV / JSON) | Planned |
 
 
 ## License

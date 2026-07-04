@@ -33,6 +33,44 @@ import Foundation
 /// Lumen opt-in path: swap `VectorStore` for `HybridVectorStore` in the RAG
 /// pipeline. Same public API shape (`addChunks`, `query`, `removeDocument`,
 /// `save`) so the integration site is a one-line change.
+///
+/// ## Journaled vs. non-journaled
+///
+/// `HybridVectorStore` supports two lifecycles:
+///
+/// 1. **Non-journaled** (shown above): the synchronous
+///    ``init(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:)``
+///    or ``init(name:index:dense:sparse:embedder:storageDirectory:)``
+///    initializers, paired with ``save()`` and ``loadDocumentMap()``. Each
+///    ``save()`` rewrites both leg snapshots (O(corpus) per save), and
+///    reopening a persisted store requires an explicit ``loadDocumentMap()``
+///    call to restore the document → UUID map.
+/// 2. **Journaled** (ADR-013): the async static
+///    ``open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)``
+///    factory. The dense leg streams mutations to a `.pxwal` sidecar, giving
+///    O(change) saves via ``checkpoint()``/``needsCheckpoint(policy:)``, and
+///    both the sparse leg and the document map are rebuilt automatically
+///    from the recovered dense leg on open — no manual ``loadDocumentMap()``
+///    call needed.
+///
+/// Prefer
+/// ``open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)``
+/// for continuous-mutation (agentic) workloads with frequent small writes.
+/// The synchronous initializers remain fully supported for batch-style
+/// workloads that build once and save occasionally.
+///
+/// ## Topics
+///
+/// ### Journaled Lifecycle
+/// - ``open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)``
+/// - ``save()``
+/// - ``checkpoint()``
+/// - ``needsCheckpoint(policy:)``
+///
+/// ### Non-journaled Lifecycle
+/// - ``init(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:)``
+/// - ``init(name:index:dense:sparse:embedder:storageDirectory:)``
+/// - ``loadDocumentMap()``
 public actor HybridVectorStore {
 
     // MARK: - Properties
@@ -109,6 +147,11 @@ public actor HybridVectorStore {
     ///   ``removeDocument(id:)`` throws
     ///   ``VectorStoreError/documentNotFound(_:)`` for documents that are
     ///   present in the legs. Vector-level queries work immediately.
+    ///
+    /// - Note: For continuous-mutation (agentic) workloads, prefer
+    ///   ``open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)``
+    ///   instead, which streams dense-leg mutations to a WAL for O(change)
+    ///   saves and rebuilds the sparse leg and document map automatically.
     public init(
         name: String,
         embedder: any TextEmbedder,
@@ -158,6 +201,11 @@ public actor HybridVectorStore {
     /// The dense and sparse legs of the provided index must be an `HNSWIndex`
     /// and a `SparseIndex` respectively; passing other conformers through this
     /// ctor is unsupported.
+    ///
+    /// For continuous-mutation (agentic) workloads, prefer the journaled
+    /// ``open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)``
+    /// factory instead, which gives O(change) saves and rebuilds the sparse
+    /// leg and document map automatically on open.
     public init(
         name: String,
         index: HybridIndex,

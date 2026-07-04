@@ -24,6 +24,43 @@ import Foundation
 /// let results = try await store.query("key findings", k: 5)
 /// try await store.save()
 /// ```
+///
+/// ## Journaled vs. non-journaled
+///
+/// `VectorStore` supports two lifecycles:
+///
+/// 1. **Non-journaled** (shown above): the synchronous
+///    ``init(name:embedder:storageDirectory:metric:config:)`` or
+///    ``init(name:index:embedder:storageDirectory:)`` initializers, paired with
+///    ``save()`` and ``loadDocumentMap()``. Each ``save()`` rewrites the whole
+///    index snapshot (O(corpus) per save), and reopening a persisted store
+///    requires an explicit ``loadDocumentMap()`` call to restore the
+///    document → UUID map.
+/// 2. **Journaled** (ADR-013): the async static
+///    ``open(name:embedder:storageDirectory:metric:config:durability:)``
+///    factory. Mutations stream to a `.pxwal` sidecar as they happen, giving
+///    O(change) saves via ``checkpoint()``/``needsCheckpoint(policy:)`` instead
+///    of a full rewrite, and the document map is rebuilt automatically from
+///    the recovered index on open — no manual ``loadDocumentMap()`` call
+///    needed.
+///
+/// Prefer ``open(name:embedder:storageDirectory:metric:config:durability:)``
+/// for continuous-mutation (agentic) workloads with frequent small writes.
+/// The synchronous initializers remain fully supported for batch-style
+/// workloads that build once and save occasionally.
+///
+/// ## Topics
+///
+/// ### Journaled Lifecycle
+/// - ``open(name:embedder:storageDirectory:metric:config:durability:)``
+/// - ``save()``
+/// - ``checkpoint()``
+/// - ``needsCheckpoint(policy:)``
+///
+/// ### Non-journaled Lifecycle
+/// - ``init(name:embedder:storageDirectory:metric:config:)``
+/// - ``init(name:index:embedder:storageDirectory:)``
+/// - ``loadDocumentMap()``
 public actor VectorStore {
 
     // MARK: - Properties
@@ -91,6 +128,11 @@ public actor VectorStore {
     ///   present in the index. Vector-level operations (``query(_:k:efSearch:filter:)``)
     ///   work immediately.
     ///
+    /// - Note: For continuous-mutation (agentic) workloads, prefer
+    ///   ``open(name:embedder:storageDirectory:metric:config:durability:)``
+    ///   instead, which streams mutations to a WAL for O(change) saves and
+    ///   rebuilds the document map automatically on open.
+    ///
     /// - Parameters:
     ///   - name: The collection name (used as the directory name within `storageDirectory`).
     ///   - embedder: The text embedder to use for auto-embedding operations.
@@ -129,6 +171,11 @@ public actor VectorStore {
     }
 
     /// Creates a VectorStore wrapping an existing index (for testing or advanced use).
+    ///
+    /// For continuous-mutation (agentic) workloads, prefer the journaled
+    /// ``open(name:embedder:storageDirectory:metric:config:durability:)``
+    /// factory instead, which gives O(change) saves and rebuilds the
+    /// document map automatically on open.
     ///
     /// - Parameters:
     ///   - name: The collection name.

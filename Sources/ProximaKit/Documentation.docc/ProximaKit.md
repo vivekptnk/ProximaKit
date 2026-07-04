@@ -116,7 +116,7 @@ let results = await index.search(query: queryVector, k: 10)
 
 ### Streaming Persistence (WAL, opt-in)
 
-- ``HNSWIndex/open(baseURL:walURL:durability:)``
+- ``HNSWIndex/open(baseURL:walURL:durability:mode:)``
 - ``HNSWIndex/checkpoint(baseURL:walURL:durability:)``
 - ``HNSWIndex/syncJournal()``
 - ``HNSWIndex/needsCheckpoint(policy:)``

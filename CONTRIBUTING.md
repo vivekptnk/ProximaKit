@@ -25,11 +25,20 @@ swift build
 ### Run Tests
 
 ```bash
-# Standard test suite (fast, ~30s)
+# CI-equivalent functional suite — mirrors CI's Run Tests step exactly
+# (includes SIMDBenchmarkTests). ~590 tests, no recall benchmarks:
+# ~20-30 min locally on Apple Silicon, measured 33-38 min on CI's shared macos-15 runner.
 swift test --skip RecallBenchmarkTests
 
-# Full suite including recall benchmarks (~2-5 min)
+# Fast inner loop while iterating — one test class runs in seconds
+swift test --filter VectorStoreTests
+
+# Bare `swift test` runs the same ~590 functional tests and is safe: RecallBenchmarkTests
+# self-skips unless PROXIMA_RECALL_BENCH=1 is set, so it won't hang on the 20+-minute sweeps.
 swift test
+
+# To include the recall benchmarks (each 10K sweep takes 20+ min; use Release mode):
+PROXIMA_RECALL_BENCH=1 swift test -c release
 ```
 
 ### Run Lint
@@ -159,6 +168,8 @@ func testBenchmarkBatchL2_1K_384d()
 | Recall benchmarks | `--filter RecallBenchmarkTests` | HNSW accuracy vs brute force |
 | SIMD benchmarks | `--filter SIMDBenchmarkTests` | vDSP vs naive loop speedup |
 | Embedding tests | `--filter ProximaEmbeddingsTests` | NL, Vision, CoreML providers |
+
+> The **Unit tests** filter above additionally skips `SIMDBenchmarkTests` for a narrower, faster local-only correctness subset. It is *not* the same as the suite in [Run Tests](#run-tests) — `swift test --skip RecallBenchmarkTests`, which mirrors CI exactly and *does* run `SIMDBenchmarkTests`.
 
 ### Coverage Expectations
 

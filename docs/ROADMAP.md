@@ -112,7 +112,7 @@ Delivered: the `.pxwal` v1 sidecar (CRC-framed records, deterministic replay via
 
 - **Incremental delete:** current `remove(id:)` marks nodes as deleted (tombstone). Dangling-incoming-edge repair is now O(in-degree) via a maintained reverse-adjacency map (post-1.5.0; map rebuilt on load, format unchanged).
 - **Compaction — Shipped:** `compact()` is a public, synchronous API that snapshots every live node, resets storage, and re-inserts each one — physically reclaiming tombstoned slots (`count` becomes `== liveCount`) and fully relinking the graph, in O(n log n). It also runs automatically: `remove(id:)` invokes it whenever `liveCount / count` drops below `HNSWConfiguration.autoCompactionThreshold` (persisted in the format header, default `0.7`); covered by `CompactionTests`. What remains open is scheduling it off the hot path — today's compaction always runs inline on the calling task, blocking the triggering `remove(id:)` through the full rebuild, and an incremental or asynchronous/background-thread pass that avoids that stall has no design yet.
-- **Hierarchical NSW variant with dynamic `M`:** vary the number of connections per layer based on layer height to improve recall at low `efSearch` values.
+- **Hierarchical NSW variant with dynamic `M`:** vary the number of connections per layer based on layer height to improve recall at low `efSearch` values. **Deferred, measurement-gated ([ADR-016](adr/ADR-016-dynamic-m.md)):** the paper's `mMax0 = 2m` layer-0 heuristic is already shipped, so "dynamic M" means an *upper-layer-only* schedule (adjacency is count-prefixed, so **no format change**; config travels with the file, so **no replay-determinism change**). No named consumer needs it and the shipped levers (`m`, `efSearch`) already trade for low-ef recall, so the ADR recommends **not building now** — with the exact offline harness + GO threshold (≥ +2 pp recall@10 at `ef = 16`, and a Pareto gate vs. raising uniform `m` at equal memory) that would reopen it. Leaning NO-GO, the ADR-009 register.
 - **Serialisation versioning:** a magic number (`PXKT`) and format version field are already written and validated on load (`PersistenceError.unsupportedVersion`). The format-evolution policy (monotonic version bumps, N-1 reads, documented defaults, mandatory corruption tests) is settled in [ADR-010](adr/ADR-010-format-evolution.md); format v2 shipped under it.
 
 ---
@@ -130,6 +130,8 @@ Delivered: the `.pxwal` v1 sidecar (CRC-framed records, deterministic replay via
 | ADR-012 | Full-precision reranking for quantized HNSW (`retainOriginals` + `rerankDepth`, PQHW v2) | Accepted |
 | ADR-013 | Streaming persistence: WAL incremental saves (Stage 1) + paged vector region (Stage 2) | Accepted — both stages shipped |
 | ADR-014 | Paged originals for quantized reranking — PQHW v3 section table + 16 KiB-padded originals, paged rerank reads, and the v2→v3 upgrade path for both format families ([ADR-014](adr/ADR-014-paged-originals.md)) | Accepted — both stages shipped |
+| ADR-015 | Agent-memory integration — ProximaKit as tinybrain's on-device memory substrate: store-level auto-checkpoint hook (`checkpointAutomatically:`, closes `api-ergo-01`), paged dense leg in journaled stores (M5-F49 `dense:` param), `HNSWIndex.load(from:mode:)` mirror (`api-ergo-02`), and a unified `IndexResidency` open-mode name (`api-ergo-03`); one journaled paged store meets the memory bound at the stated agent scale, with the two-tier hot/cold shape endorsed as a consumer-composed pattern over journaled HNSW + PQHW-paged (ADR-014), not new store API ([ADR-015](adr/ADR-015-agent-memory-integration.md)) | Proposed — design only |
+| ADR-016 | Dynamic-`M` HNSW — per-layer-height connection schedules. The paper's `mMax0 = 2m` is already shipped (`HNSWIndex.swift:71`), so the only new lever is an *upper-layer-only* schedule; count-prefixed adjacency needs no format change and file-borne config needs no replay-determinism change. **Deferred, measurement-gated:** no named consumer, a proven alternative lever (`m`/`efSearch`), and a weak literature prior — recommend not building now, with a declared offline recall threshold + Pareto-vs-uniform-`m` gate that would reopen it ([ADR-016](adr/ADR-016-dynamic-m.md)) | Proposed — design only (DEFER, leaning NO-GO) |
 
 ---
 
@@ -141,7 +143,7 @@ The `ProximaDemoApp` (macOS SwiftUI) ships with the repo and demonstrates semant
 |------|----------|
 | iOS / iPadOS / visionOS target | **Shipped** — single multiplatform SwiftUI target (compact tab layout on iPhone; split view on iPad; spatial panel on Vision Pro) |
 | CoreML model download UI — browse HuggingFace Hub, download `.mlpackage`, hot-swap embedding provider | High |
-| Benchmark tab — run efSearch sweep in-app and display a recall vs. latency chart | Medium |
+| Benchmark tab — run efSearch sweep in-app and display a recall vs. latency chart | **Shipped** — seeded `efSearch` sweep (16–256) charting recall@10 against query latency with SwiftUI Charts, recall measured against an exact `BruteForceIndex` ground truth |
 | Export results to CSV / JSON | Medium |
 | Custom corpus loading — import a folder of `.txt` / `.md` files into the index | Medium |
 | Index inspector — visualise the HNSW layer graph as a force-directed diagram | Low |
