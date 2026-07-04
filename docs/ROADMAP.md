@@ -1,7 +1,7 @@
 # ProximaKit Roadmap
 
 **Updated:** 2026-07-03
-**Current release:** v1.6.1
+**Current release:** v1.7.0
 
 This document tracks planned improvements across the library, benchmarking harness, and demo experience. Items are grouped by theme, not by release, because ordering depends on dependencies and measured impact.
 

@@ -108,10 +108,13 @@ public enum PQHWOpenMode: Sendable {
 
     /// Serve the originals section from a read-only file mapping, faulted in on
     /// demand, keeping the graph, codes, ids, levels, and metadata resident.
-    /// Requires a padded v3 base that retains originals (written by
-    /// `save(to:layout: .pagedV3)` or produced by `upgradeToV3(at:)`). Restores
-    /// the 32× compression story on the vector payload while keeping rerank
-    /// exact; the post-beam rerank reads are bit-identical to `.resident`.
+    /// Requires a padded v3 base that retains originals — produced by
+    /// `save(to:layout: .pagedV3)` on a retaining index, or by `upgradeToV3(at:)`
+    /// on a v2 file that already retained originals (the upgrade repads and
+    /// reformats an existing originals section; it cannot add originals that
+    /// were never retained). Restores the 32× compression story on the vector
+    /// payload while keeping rerank exact; the post-beam rerank reads are
+    /// bit-identical to `.resident`.
     case paged
 }
 
@@ -209,7 +212,11 @@ extension QuantizedHNSWIndex {
     /// - `.resident` is byte-identical to ``save(to:)`` (v2).
     /// - `.pagedV3` stamps v3 with the originals section 16 KiB-aligned and a
     ///   section-table trailer WHEN originals are retained; with no originals it
-    ///   falls back to v2 (nothing to page).
+    ///   falls back to v2 (nothing to page). This fallback is silent — requesting
+    ///   `.pagedV3` on a non-retaining index writes v2 with no error or signal at
+    ///   the call site; check the written file's version byte, or reopen and
+    ///   check `originalsArePaged` / `retainsOriginals`, if the distinction
+    ///   matters to your caller.
     public func save(to url: URL, layout: PQHWSaveLayout) throws {
         switch layout {
         case .resident:
@@ -385,7 +392,9 @@ extension QuantizedHNSWIndex {
         }
         guard core.hasOriginals else {
             throw PersistenceError.corruptedData(
-                "paged open has nothing to page: this PQHW base retains no originals (flag 0)")
+                "paged open has nothing to page: this PQHW base retains no originals (flag 0); "
+                + "rebuild the index with retainOriginals: true (upgradeToV3 cannot add originals "
+                + "that were never retained)")
         }
         // Resolve + validate the mapped section (alignment, length, bounds), then
         // map it. The resolver's guards produce the actionable typed errors for
@@ -463,7 +472,9 @@ extension QuantizedHNSWIndex {
         let flag = data.loadLE(UInt32.self, at: 48)
         guard flag == 1 else {
             throw PersistenceError.corruptedData(
-                "paged open has nothing to page: this PQHW base retains no originals (flag \(flag))")
+                "paged open has nothing to page: this PQHW base retains no originals (flag \(flag)); "
+                + "rebuild the index with retainOriginals: true (upgradeToV3 cannot add originals "
+                + "that were never retained)")
         }
         let trailer = try PQHWTrailer.parse(data)
         let entry = trailer.sections[qhOriginalsSectionIndex]

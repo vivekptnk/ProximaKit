@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [1.7.0] — 2026-07-03
+
 ### Added
 - **PQHW v3 format + v2-to-v3 migration rewriter ([ADR-014](docs/adr/ADR-014-paged-originals.md)
   Stage 1).** The format-and-migration half of paged PQ originals: a 56-byte

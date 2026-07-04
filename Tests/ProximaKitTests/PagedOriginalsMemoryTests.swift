@@ -28,9 +28,13 @@
 // counts freshly-copied anonymous originals pages at their COMPRESSED size, so
 // phys_footprint captures only ~30% of the theoretical payload on the resident
 // side (measured 43.1 MB of 146.5 MB, a ratio stable across fixture sizes) — an
-// OS accounting reality, not a residency leak. Gating on the payload fraction
-// (the HNSW test's aspirational gate) would be unachievable here; gating on the
-// measured paged-vs-payload and paged-vs-resident ratios is the honest test.
+// OS accounting reality, not a residency leak — the sibling
+// `PagedVectorMemoryTests` (raw `.pxkt` Float32 vectors, ADR-013) recovers
+// more, 57.7%, for the same reason in reverse: different allocation patterns
+// compress differently under the same compressor. Gating on the payload
+// fraction (the HNSW test's aspirational gate) would be unachievable here;
+// gating on the measured paged-vs-payload and paged-vs-resident ratios — as
+// both sibling tests do — is the honest test.
 
 import XCTest
 @testable import ProximaKit
@@ -90,7 +94,7 @@ final class PagedOriginalsMemoryTests: XCTestCase {
         let base = dir.appendingPathComponent("index.qhnsw")
 
         // Matches the HNSW Stage-2 `PagedVectorMemoryTests` fixture scale
-        // (100K × 384d, ~153.6 MB payload) so the originals payload dominates
+        // (100K × 384d, ~146.5 MB payload) so the originals payload dominates
         // allocator noise and phys_footprint cleanly captures the resident cost
         // — a 40K × 256d fixture (~39 MB) sat near the noise floor and made the
         // resident-vs-paged delta unreliable (measured on this machine, ADR-014

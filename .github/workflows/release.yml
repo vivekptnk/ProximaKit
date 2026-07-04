@@ -23,10 +23,12 @@ jobs:
       - name: Extract CHANGELOG section for this version
         run: |
           version="${GITHUB_REF_NAME#v}"
-          # Print the body of the '## [<version>]' section (up to the next '## [').
+          # Print the body of the '## [<version>]' section (up to the next '## ['
+          # or a trailing '---' separator, whichever comes first).
           awk -v ver="$version" '
             $0 ~ "^## \\[" ver "\\]" { found = 1; next }
             found && /^## \[/ { exit }
+            found && /^---$/ { exit }
             found { print }
           ' CHANGELOG.md > release-notes.md
           if [[ ! -s release-notes.md ]]; then
