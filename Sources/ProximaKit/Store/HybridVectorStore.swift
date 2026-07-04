@@ -292,7 +292,9 @@ public actor HybridVectorStore {
     /// ``removeDocument(id:)``, so it cannot interleave with another mutation.
     /// A failed automatic fold is rethrown by the mutation call that triggered
     /// it, but the triggering mutation has already been applied and made
-    /// durable. Do not retry that mutation: `addChunks` assigns fresh UUIDs, so
+    /// durable — to the extent of the active ``WALDurability`` dial (see the
+    /// `checkpointAutomatically` parameter for the `.manual` caveat). Do not
+    /// retry that mutation: `addChunks` assigns fresh UUIDs, so
     /// retrying would duplicate chunks. The store remains consistent, and the
     /// next mutation, ``save()``, or ``checkpoint()`` re-attempts the fold.
     ///
@@ -301,7 +303,10 @@ public actor HybridVectorStore {
     ///   dense WAL after serialized mutation batches. `nil` keeps the manual
     ///   ``needsCheckpoint(policy:)`` / ``checkpoint()`` lifecycle. If an
     ///   automatic fold fails, the triggering mutation is already applied and
-    ///   durable; do not retry it.
+    ///   durable to the extent of the active ``WALDurability`` dial — under
+    ///   `.manual`, that durability is bounded to the OS page cache until the
+    ///   next ``save()`` or checkpoint commit reaches disk. Do not retry it
+    ///   regardless of the dial.
     /// - Parameter dense: How the dense index materializes base vectors.
     ///   `.resident` is byte-identical to the historical open path; `.paged`
     ///   maps the base vector section from the checkpointed v3 file.

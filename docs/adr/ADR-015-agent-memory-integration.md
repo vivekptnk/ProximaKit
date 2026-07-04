@@ -2,11 +2,20 @@
 
 ## Status
 
-**Proposed — design only.**
+**Accepted (Stages A+B implemented; Stage C proposed).** Stage A (the opt-in
+`checkpointAutomatically:` auto-fold hook on `VectorStore.open` /
+`HybridVectorStore.open`) and Stage B (the paged dense leg plus the
+`HNSWIndex.load(from:mode:)` mirror, over the canonical `IndexResidency` enum)
+have both been implemented since this design was written; see the
+**Implementation notes (Stages A+B)** addendum at the end of this document for
+what was built and where it deviated from this design. Stage C (the
+`PQHWSaveLayout` -> `IndexSaveLayout` save-layout rename and the broader
+agent-memory / pattern documentation) remains proposed and is not yet
+implemented.
 **Date:** 2026-07-04
 **Author:** Designer — ProximaKit
 **HEAD:** `aaaab80` (v1.7.0). Every `file:line` citation below is at this commit and was read, not inferred.
-**Scope:** This ADR contains no code. It maps an agentic on-device consumer's
+**Scope:** This ADR maps an agentic on-device consumer's
 memory lifecycle onto the already-shipped ProximaKit surface (ADR-006, ADR-011/012,
 ADR-013, ADR-014), adjudicates the three open API-ergonomics findings the mission-5
 audit confirmed (`api-ergo-01/02/03`), settles the M5-F49 store-level paging

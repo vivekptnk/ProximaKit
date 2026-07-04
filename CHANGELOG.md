@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [1.8.0] — 2026-07-04
+
 ### Fixed
 - **PQHW v3 empty-retaining index round-trips — writer and reader now agree
   on `(0, 0)` originals.** Mission-5 fresh-eyes audit HIGH: a retaining
@@ -42,14 +48,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   moment `needsCheckpoint(policy:)` trips after `addChunks`/`removeDocument`,
   so a concurrent batch cannot land between apply and fold (the default
   `nil` preserves today's manual `needsCheckpoint`/`checkpoint` lifecycle,
-  byte-identical). The error contract is stated precisely on both factories:
+  byte-identical). The error contract is stated on both factories:
   "A failed automatic fold is rethrown by the mutation call that triggered
   it, but the triggering mutation has already been applied and made
   durable. Do not retry that mutation" — `addChunks` assigns fresh UUIDs, so
   retrying would duplicate chunks; the store remains consistent, and the
-  next mutation, `save()`, or `checkpoint()` re-attempts the fold. This was
-  verified to hold honestly across both fold-failure families the tests'
-  fixtures produce. Per-turn ingest ceremony drops from 4 awaited calls to 2
+  next mutation, `save()`, or `checkpoint()` re-attempts the fold. The tests'
+  fixtures pin this contract for the one fold-failure family they actually
+  produce — a throw *after* the WAL-truncation commit point, during the
+  post-fold `docmap.json` / `hybrid.json` cache-refresh write; the other
+  family (a throw *before* that commit point, inside the fold itself) is not
+  fixture-tested but holds by the append-fsync argument — under the default
+  `.everyBatch` dial the triggering mutation's own WAL record is already
+  fsynced at append, so its durability never depended on the fold's outcome.
+  Per-turn ingest ceremony drops from 4 awaited calls to 2
   (manual folds 2 → 0); the README store example now leads with the 2-call
   loop, with manual checkpointing demoted to an advanced option. Two more
   additive pieces round out the surface: `HNSWIndex.load(from:mode:)`
@@ -63,9 +75,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   typealias`es of it (both spellings compile-tested), with the
   `PQHWSaveLayout` → `IndexSaveLayout` rename explicitly deferred to a Stage
   C. 8 new `StoreAutoCheckpointTests` plus a 55-test store blast-radius
-  regression run, all green, cover the fold-under-mutation interleaving,
-  both fold-failure families, and the paged/resident dense-leg branches on
-  fresh-store and reopen paths.
+  regression run, all green, cover the fold-under-mutation interleaving, the
+  fold-failure family the fixtures produce (a throw during the
+  post-commit-point cache-refresh write; the other family holds by the
+  append-fsync argument, not a fixture), and the paged/resident dense-leg
+  branches on fresh-store and reopen paths.
 - **Demo phase 2: Index Inspector, custom corpus import, results export
   (`Examples/ProximaDemoApp`).** Three new screens, taking the demo from
   three to six (Search, Persistence, Benchmark, Inspector, Import, Export).
