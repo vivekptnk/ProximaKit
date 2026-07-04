@@ -8,7 +8,184 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+- **PQHW v3 empty-retaining index round-trips — writer and reader now agree
+  on `(0, 0)` originals.** Mission-5 fresh-eyes audit HIGH: a retaining
+  `QuantizedHNSWIndex` with every node removed saved successfully as
+  `.pagedV3`, but wrote a trailer shape the library's own reader rejected (a
+  zero-length originals section at a nonzero padded offset) — save-then-reload
+  permanently broke at the empty edge, while v2 round-tripped fine. The writer
+  now emits the parser-legal `(0, 0)` entry, unpadded, exactly when the
+  retained originals are empty; the flag stays truthful (`1` = retains
+  originals, zero of them). The reader accepts that shape only when the
+  expected originals byte count is zero — the existing exact-count guard
+  backstops the relaxation — and a new byte-patch test
+  (`testEmptyOriginalsEntryWithNonzeroOffsetThrows`) proves a crafted
+  zero-length-at-nonzero-offset trailer is still rejected, with
+  `PersistenceError.corruptedData` naming "empty originals section must have
+  offset 0". `upgradeToV3(at:)` now succeeds on a valid v2 empty-retaining
+  base (same legal shape, idempotent, inheriting the temp-verify-atomic-replace
+  crash safety), and a paged open of the empty shape is safe by
+  construction — the mapped region special-cases zero length and never calls
+  `mmap`. Built by the Codex coder tier; adversarially judged (opus), which
+  traced all four corrupt-shape families, re-ran five suites (71/71), and
+  transiently perturbed the writer to confirm the new tests bite on the exact
+  audited error string.
+
+### Added
+- **Agent-memory ergonomics — `checkpointAutomatically:`,
+  `HNSWIndex.load(from:mode:)`, store-level dense residency, `IndexResidency`
+  ([ADR-015](docs/adr/ADR-015-agent-memory-integration.md), Stages A+B).**
+  `VectorStore.open(...)` and `HybridVectorStore.open(...)` gain an optional
+  `checkpointAutomatically: WALCheckpointPolicy? = nil`: when set, the WAL
+  folds automatically inside the actor's serialized mutation chain the
+  moment `needsCheckpoint(policy:)` trips after `addChunks`/`removeDocument`,
+  so a concurrent batch cannot land between apply and fold (the default
+  `nil` preserves today's manual `needsCheckpoint`/`checkpoint` lifecycle,
+  byte-identical). The error contract is stated precisely on both factories:
+  "A failed automatic fold is rethrown by the mutation call that triggered
+  it, but the triggering mutation has already been applied and made
+  durable. Do not retry that mutation" — `addChunks` assigns fresh UUIDs, so
+  retrying would duplicate chunks; the store remains consistent, and the
+  next mutation, `save()`, or `checkpoint()` re-attempts the fold. This was
+  verified to hold honestly across both fold-failure families the tests'
+  fixtures produce. Per-turn ingest ceremony drops from 4 awaited calls to 2
+  (manual folds 2 → 0); the README store example now leads with the 2-call
+  loop, with manual checkpointing demoted to an advanced option. Two more
+  additive pieces round out the surface: `HNSWIndex.load(from:mode:)`
+  mirrors the quantized family's WAL-free paged loader, closing the
+  asymmetry where only `QuantizedHNSWIndex` had one; and both stores gain
+  `dense: IndexResidency = .resident`, plumbing `.paged` through to the
+  dense leg so a journaled store's base vectors can be served from a
+  read-only mapping instead of held resident. `IndexResidency`
+  (`.resident` / `.paged`) is now the single canonical residency enum;
+  `HNSWOpenMode` and `PQHWOpenMode` become zero-breakage `public
+  typealias`es of it (both spellings compile-tested), with the
+  `PQHWSaveLayout` → `IndexSaveLayout` rename explicitly deferred to a Stage
+  C. 8 new `StoreAutoCheckpointTests` plus a 55-test store blast-radius
+  regression run, all green, cover the fold-under-mutation interleaving,
+  both fold-failure families, and the paged/resident dense-leg branches on
+  fresh-store and reopen paths.
+- **Demo phase 2: Index Inspector, custom corpus import, results export
+  (`Examples/ProximaDemoApp`).** Three new screens, taking the demo from
+  three to six (Search, Persistence, Benchmark, Inspector, Import, Export).
+  The **Index Inspector** renders a seeded, pausable, force-directed
+  visualization of the live HNSW graph in SwiftUI `Canvas`/`TimelineView` —
+  46 live vectors, 892 layer-0 links (the Inspector's own on-screen stat
+  reports an average degree of 32, consistent with `m = 16`), a layer
+  histogram, and tap-to-select showing a node's
+  stored document text and metadata. **Custom corpus import** adds
+  `.txt`/`.md` files or folders through a verified-balanced security-scoped
+  resource flow (guarded start, deferred release, reads complete before
+  scope exit), chunking → embedding → indexing with progress UI and
+  per-file skip errors, confirmed to persist across relaunch (46 → 48
+  vectors on-disk). **Results export** writes CSV and JSON of the live
+  search results (query, ids, full-precision scores, titles, categories,
+  text; fixed field order via `.sortedKeys`) via `ShareLink` on
+  iOS/visionOS and `NSSavePanel` on macOS. Built by the Codex coder tier and
+  verified end-to-end by an adversarial judge acting as the build/runtime
+  rig (the builder's sandbox has no `xcodebuild`/simulator access):
+  **BUILD SUCCEEDED** on macOS, the iPhone 16 simulator, and the Apple
+  Vision Pro 4K simulator, with all three new screens exercised live on
+  iPhone and iPad simulators. Launch hooks extend to `-demoScreen
+  inspector|import|export` (`index` kept as a backward-compatible alias for
+  `inspector`). Non-blocking followups recorded: an additive read-only
+  `liveGraphSnapshot()` library accessor as the proper long-term replacement
+  for the Inspector's current reuse of the public `persistenceSnapshot()`
+  save/compaction path (judged safe here because the demo Search index is
+  append-only and the Persistence lab uses a separate index instance), and
+  iPhone canvas centering.
+- **`ProximaBench` gains `paged-access-bench` and `embed-bench`.**
+  `paged-access-bench` quantifies the copy-on-access overhead
+  [ADR-013](docs/adr/ADR-013-streaming-persistence.md)/[ADR-014](docs/adr/ADR-014-paged-originals.md)
+  deferred as a future optimization — paged-vs-resident HNSW search and PQ
+  rerank, plus a local unsafe-mmap-read isolation diagnostic — against a
+  pre-declared threshold (default `--threshold-percent 5.0`). `embed-bench`
+  compares Core ML embedding throughput across `cpuOnly`/`cpuAndGPU`/
+  `cpuAndNeuralEngine` compute units against a pre-declared speedup bar
+  (default `--threshold-speedup 1.5`), seeded, with per-unit first-load
+  latency recorded, and writes a NEEDS-MODEL report when no local model is
+  available. Both join the existing `insert-shape`/`distance-kernel`/
+  `migrate` subcommands; findings and decisions below.
+
+### Changed
+- **Paged-access overhead measured: zero-copy scoped GO, gate corrected
+  ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)/[ADR-014](docs/adr/ADR-014-paged-originals.md)).**
+  Verdict, upheld by an adversarial methodology judge who independently
+  re-measured (2 seeds, reps=11, an 8-measurement run with an observed floor
+  of 8.75% and a mean of ~12%, against the pre-declared 5% threshold):
+  **scoped GO** for a zero-copy design pass on the paged HNSW search path
+  only — the rerank path stays copy-on-access (≤3.3% overhead at realistic
+  rerank depths) and is out of scope. Zero-copy *implementation* itself is
+  deferred to a future mission gated on consumer-hardware re-measurement.
+  The judge mandated three artifact corrections, all carried in this
+  commit: the automated gate now keys only on the **observed**
+  paged-vs-resident delta (it previously could print GO on an
+  isolation-extrapolation number that was noise-prone); the metric is
+  relabeled "paged-overhead fraction" with an honest framing that the delta
+  is copy **+ mmap page locality**, so a zero-copy change recovers only the
+  alloc/memcpy component — **realizable benefit ≤ the observed 9–17%
+  warm-best-case**, not the full delta; and the original two runs are now
+  disclosed as one seed-42 realization with the judge's independent seed-7
+  series as confirmation. Ride-along: the platform probe now reports the
+  compiler version with `compiler(>=)` instead of the incorrect `swift(>=)`.
+- **ANE embedding measured: NO-GO, CoreML defaults stay.** Measured (local
+  MiniLM `.mlpackage`, batch 512, 5 reps, seeded, release): `cpuOnly` 117.64
+  texts/s, `cpuAndGPU` 117.93, `cpuAndNeuralEngine` 117.48 — **0.9986×**,
+  dead even against the pre-declared ≥1.5× bar needed to justify a public
+  `computeUnits` knob; ANE first-load additionally pays 213.88 ms versus
+  88.03 ms for CPU (the classic compile tax). Decision: **NO-GO** — no
+  public `computeUnits` knob ships; CoreML's defaults stay. Honest caveat
+  recorded: the local model emits **NaN embeddings** through the provider
+  path, so these are CoreML runtime-dispatch throughput numbers only, not a
+  semantic-quality validation; the reopen condition names a finite-output
+  sentence-embedding artifact re-measured on consumer hardware. Completes
+  the measure-first triptych: Metal NO-GO, zero-copy scoped-GO (above,
+  deferred), ANE NO-GO — zero speculative code shipped on any of the three.
+- **Two new design-only ADRs.**
+  [ADR-015](docs/adr/ADR-015-agent-memory-integration.md) (Proposed) maps
+  tinybrain's agent-memory lifecycle onto the existing ProximaKit surface
+  and recommends the single-journaled-store-with-a-paged-dense-leg shape
+  over a two-tier hot/cold split, quantified by labeled arithmetic: a
+  50-turns/day, 2-chunks/turn agent profile holds **~17.5 MB** resident at
+  1 year on a paged dense leg versus **~73.6 MB** full-precision resident
+  (**~87.6 MB** vs **~367.9 MB** at 5 years) — comfortably in an iPhone
+  app's budget either way, so the two-tier shape is endorsed as a
+  *consumer-composed pattern* over already-shipped primitives (journaled
+  HNSW + PQHW `.paged`), not new store API; `distill()` is named an explicit
+  non-goal (it needs an LLM ProximaKit does not have). The Stages A+B
+  surface above ships ahead of the ADR's own formal acceptance; Stage C
+  (the `PQHWSaveLayout` → `IndexSaveLayout` rename and broader agent-memory
+  docs) remains pending.
+  [ADR-016](docs/adr/ADR-016-dynamic-m.md) (Proposed) recommends **DEFER,
+  leaning NO-GO** on hierarchical-NSW dynamic-`M`: the paper's `mMax0 = 2m`
+  layer-0 schedule already ships, so "dynamic M" can only mean an
+  *upper-layer-only* schedule, and since only ~6.25% of nodes reach layer
+  ≥ 1 (arithmetic: `exp(-1/mL) = 1/m` at `m = 16`), the residual lever is
+  worth **< 0.25%** of resident memory against ADR-011/013's ≈200 B/node
+  adjacency baseline. No format change would be needed (adjacency is
+  already count-prefixed, never padded to `mMax0`) and no named consumer
+  asks for it; a pre-committed measurement gate (≥ +2.0 pp recall@10 at
+  `ef = 16`, no regression past −0.5 pp at `ef ≥ 64`, a Pareto gate against
+  simply raising uniform `m` at equal memory, and `Q ≥ 1000` queries to
+  clear the noise floor) is declared to reopen the question.
+- **Five confirmed mission-5 audit findings fixed.**
+  `VectorStore`/`HybridVectorStore` type docs now steer continuous-mutation
+  consumers to `open(...)` (journaled-vs-non-journaled Discussion and
+  Topics blocks, per-initializer steering) — the journaled surface was
+  previously invisible from the page most adopters land on. A stale DocC
+  link for `open(baseURL:walURL:durability:mode:)` is fixed (a 21-link
+  catalog sweep found no other drift). The README/ROADMAP contradiction
+  over the demo Benchmark tab's status is reconciled to **Shipped**
+  (CoreML-download UI and result export stayed **Planned** at doc time;
+  export has since shipped, see Added above). Test-suite timing claims are
+  made honest: the old "~30s (fast)" claim had survived three releases
+  while being **~60–70× off** measured CI reality; docs now state **~600
+  tests / 33–38 min on CI**, name the seconds-scale `--filter` inner loop
+  for local iteration, and document the `PROXIMA_RECALL_BENCH=1` local-skip
+  gate; two stale "400+ tests" mentions are reconciled to ~600. The README
+  Quick Start is reordered: a 12-line, signature-verified add-and-search
+  snippet now leads, with the demo-clone detour following.
 
 ---
 

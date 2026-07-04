@@ -39,7 +39,7 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 | **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)); opt-in WAL incremental saves + paged vector region make index mutations O(change) instead of O(corpus), *(new)* now wired all the way to `VectorStore`/`HybridVectorStore.open(...)` with derivation-based crash consistency ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
 | **Embedding providers** | Apple NaturalLanguage, Vision, and bring-your-own CoreML (BERT/MiniLM via WordPiece tokenizer) |
 | **Concurrency** | Every index is a Swift `actor`; `Sendable` API surface, built with `StrictConcurrency` |
-| **Proof** | ~590 tests, recall floors enforced in CI, cross-library benchmark harness vs FAISS/ScaNN running nightly |
+| **Proof** | ~600 tests, recall floors enforced in CI, cross-library benchmark harness vs FAISS/ScaNN running nightly |
 
 <table>
 <tr>
@@ -244,7 +244,7 @@ And on Apple Vision Pro, the same target renders as a spatial glass panel (real 
   <img src="docs/assets/screenshot-visionos.png" alt="ProximaDemoApp on Apple Vision Pro: the search interface floats as a translucent glass panel in a simulated living room" width="760" />
 </p>
 
-Beyond Search, the app now ships two more screens. A **Persistence lab** opens the index journaled (WAL), shows live WAL state — generation, bytes on disk, ops since checkpoint — checkpoints into a page-aligned base, and demonstrates the library's honest typed-error path: a `.paged` open on an unpadded base is refused with a "Paged open blocked" banner, not silently faked. It also measures resident-vs-paged process memory **live, in-app**, via the same `task_vm_info.phys_footprint` probe the library's `PagedVectorMemoryTests` use — the exact figure varies run to run and simulator vs device, so it's captured in the screenshot rather than quoted here. A **Benchmark** tab runs a seeded `efSearch` sweep (16–256) and charts recall@10 against latency with SwiftUI Charts, recall measured against an exact `BruteForceIndex` ground truth.
+Beyond Search, the app now ships two more screens. A **Persistence lab** opens the index journaled (WAL), shows live WAL state — generation, bytes on disk, ops since checkpoint — checkpoints into a page-aligned base, and demonstrates the library's honest typed-error path: a `.paged` open on an unpadded base is refused with a "Paged open blocked" banner, not silently faked. It also measures resident-vs-paged process memory **live, in-app**, via the same `task_vm_info.phys_footprint` probe the library's `PagedVectorMemoryTests` use — the exact figure varies run to run and simulator vs device, so it's captured in the screenshot rather than quoted here. A **Benchmark** tab runs a seeded `efSearch` sweep (16–256) and charts recall@10 against latency with SwiftUI Charts, recall measured against an exact `BruteForceIndex` ground truth. Three more screens round out the demo: an **Index Inspector** that visualizes the live HNSW graph as a force-directed diagram (SwiftUI `Canvas`/`TimelineView`, tap a node to see its stored text and metadata), **Import** for adding your own `.txt`/`.md` files or folders into the live index, and **Export** for writing the current search results to CSV or JSON.
 
 <p align="center">
   <img src="docs/assets/screenshot-iphone-persistence-memory.png" alt="ProximaDemoApp on iPhone: the Persistence tab after a checkpoint, showing a resident-vs-paged memory card with live-measured process-footprint numbers from task_vm_info.phys_footprint" width="280" />
@@ -684,6 +684,8 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-012](docs/adr/ADR-012-pq-reranking.md): Full-precision reranking for quantized HNSW
 - [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — Stage 1 (WAL incremental saves) **shipped**; Stage 2 (paged vectors) **shipped**; store-level journaling (`VectorStore`/`HybridVectorStore.open(...)`, derivation-based crash consistency) **shipped**
 - [ADR-014](docs/adr/ADR-014-paged-originals.md): Paged originals for quantized reranking — PQHW v3 format + migration (Stage 1) **shipped**; paged read path (Stage 2) **shipped**
+- [ADR-015](docs/adr/ADR-015-agent-memory-integration.md): Agent-memory integration for on-device agents — store-level auto-checkpoint, `HNSWIndex.load(from:mode:)` mirror, paged dense-leg store residency, and the unified `IndexResidency` naming foundation (Stages A+B **shipped**); the `PQHWSaveLayout` → `IndexSaveLayout` rename and the two-tier hot/cold pattern as consumer-composed docs (Stage C) remain **Proposed**
+- [ADR-016](docs/adr/ADR-016-dynamic-m.md): Dynamic-`M` HNSW schedules — **Deferred, measurement-gated, leaning NO-GO**; a declared recall-uplift + Pareto-vs-uniform-`m` gate would reopen it
 
 
 ## Building & Testing
@@ -692,7 +694,7 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 # Build
 swift build
 
-# CI-equivalent functional suite — ~590 tests, no recall benchmarks.
+# CI-equivalent functional suite — ~600 tests, no recall benchmarks.
 # Not a quick check: ~20-30 min locally on Apple Silicon, measured
 # 33-38 min on CI's shared macos-15 runner (this is what CI actually runs).
 swift test --skip RecallBenchmarkTests
@@ -707,7 +709,7 @@ swift test -c release --filter RecallBenchmarkTests
 swift package generate-documentation --target ProximaKit
 ```
 
-CI runs the full functional suite (~590 tests; benchmark classes run separately), SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR — plus a benchmark smoke-slice regression gate on PRs that touch the core index.
+CI runs the full functional suite (~600 tests; benchmark classes run separately), SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR — plus a benchmark smoke-slice regression gate on PRs that touch the core index.
 
 
 ## Roadmap
@@ -719,11 +721,14 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
 | Graph-aware filtered search — higher recall under selective filters | **Shipped** for `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` ([ADR-008 addenda](docs/adr/ADR-008-filtered-search.md)); `SparseIndex` stays post-filter (no beam to route through) |
 | GPU acceleration | v1 shipped: `MetalBatchDistance` batch utility ([ADR-009](docs/adr/ADR-009-metal-backend.md)). Index build/search integration measured and decided **NO-GO** — vDSP (AMX) wins at every tested scale, no crossover |
 | Streaming persistence — incremental saves (WAL) + paged vectors | **Shipped** ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) — index-level WAL + opt-in paged vector region, plus store-level journaling on `VectorStore`/`HybridVectorStore` |
+| Agent-memory ergonomics — store-level auto-checkpoint, `HNSWIndex.load(from:mode:)` mirror, paged dense-leg store option, unified `IndexResidency` | **Shipped**, Stages A+B ([ADR-015](docs/adr/ADR-015-agent-memory-integration.md), design status Proposed) — the `PQHWSaveLayout` rename and the two-tier hot/cold pattern as consumer docs (Stage C) remain open |
 | Paged PQ originals — restore 32× compression with exact reranking | **Shipped** ([ADR-014](docs/adr/ADR-014-paged-originals.md)) — PQHW v3 format, v2→v3 migration rewriter (both families, plus `ProximaBench migrate`), and the paged originals read path |
 | Jensen-Shannon divergence metric | **Shipped** — `JensenShannonDistance()`, serializable (`DistanceMetricType` raw value 7) |
 | Background HNSW compaction policy | Planned |
+| Hierarchical NSW variant with dynamic `M` | **Deferred, measurement-gated** ([ADR-016](docs/adr/ADR-016-dynamic-m.md)) — leaning NO-GO; a declared recall/Pareto gate would reopen it |
 | Demo app — Benchmark tab (in-app seeded `efSearch` sweep 16–256, recall@10-vs-latency SwiftUI Charts) | **Shipped** |
-| Demo app — CoreML model download UI, result export (CSV / JSON) | Planned |
+| Demo app — Index Inspector, custom corpus import, results export (CSV / JSON) | **Shipped** |
+| Demo app — CoreML model download UI | Planned |
 
 
 ## License

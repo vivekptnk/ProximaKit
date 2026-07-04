@@ -41,7 +41,7 @@ Runs a seeded `efSearch` sweep (16 / 32 / 64 / 128 / 256) over a reproducible sy
 
 Visualizes the live HNSW graph behind the Search screen:
 
-- Uses the public `HNSWIndex.persistenceSnapshot()` surface to read node ids, node levels, metadata, and true layer-0 adjacency without touching library internals
+- Reuses the public `HNSWIndex.persistenceSnapshot()` API to read node ids, node levels, metadata, and true layer-0 adjacency. `persistenceSnapshot()` is the library's save/compaction-path snapshot (it compacts tombstoned slots first), not a dedicated read-only accessor — safe here because the Search index is append-only, so that compaction is always a no-op. A non-mutating `liveGraphSnapshot()` library accessor is the tracked follow-up
 - Renders a deterministic, pausable force-directed graph in SwiftUI `Canvas` / `TimelineView`
 - Caps graph rendering at 150 sampled live nodes for legibility and labels the sample honestly as "showing N of M"
 - Sizes/rings nodes by HNSW layer height and draws sampled layer-0 links
@@ -191,7 +191,7 @@ Bundle identifier: `com.vivekptnk.ProximaDemoApp`.
 ### Inspector
 
 1. The Inspector requests `SearchEngine.makeInspectorGraph(sampleLimit:)`.
-2. The engine calls the public `HNSWIndex.persistenceSnapshot()` actor method and projects `nodeToUUID`, `nodeLevels`, `metadata`, and `layers[0]` into display nodes and sampled layer-0 links.
+2. The engine calls the public `HNSWIndex.persistenceSnapshot()` actor method — the library's save/compaction-path snapshot, reused here as a read because the Search index is append-only (so its tombstone compaction is a no-op) — and projects `nodeToUUID`, `nodeLevels`, `metadata`, and `layers[0]` into display nodes and sampled layer-0 links.
 3. `IndexInspectorView` runs a deterministic force simulation in `TimelineView` and draws the graph in `Canvas`.
 4. Node selection reads the same decoded metadata used by Search results, so imported chunks, notes, images, and sample sentences all display their real stored text.
 

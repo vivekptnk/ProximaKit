@@ -117,6 +117,7 @@ let results = await index.search(query: queryVector, k: 10)
 ### Streaming Persistence (WAL, opt-in)
 
 - ``HNSWIndex/open(baseURL:walURL:durability:mode:)``
+- ``HNSWIndex/load(from:mode:)``
 - ``HNSWIndex/checkpoint(baseURL:walURL:durability:)``
 - ``HNSWIndex/syncJournal()``
 - ``HNSWIndex/needsCheckpoint(policy:)``
@@ -125,14 +126,15 @@ let results = await index.search(query: queryVector, k: 10)
 - ``HNSWIndex/journalRecordCount``
 - ``HNSWIndex/currentGeneration``
 - ``HNSWIndex/liveEntries()``
+- ``IndexResidency``
 - ``WALDurability``
 - ``WALCheckpointPolicy``
 
 ### Store Journaling (opt-in)
 
-- ``VectorStore/open(name:embedder:storageDirectory:metric:config:durability:)``
+- ``VectorStore/open(name:embedder:storageDirectory:metric:config:durability:checkpointAutomatically:dense:)``
 - ``VectorStore/checkpoint()``
 - ``VectorStore/needsCheckpoint(policy:)``
-- ``HybridVectorStore/open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)``
+- ``HybridVectorStore/open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:checkpointAutomatically:dense:)``
 - ``HybridVectorStore/checkpoint()``
 - ``HybridVectorStore/needsCheckpoint(policy:)``

@@ -373,6 +373,77 @@ PROXIMA_RESIDENT_BENCH=1 swift test -c release --filter ResidentRerankBenchTests
 
 ---
 
+## Paged-Access Overhead — Zero-Copy Decision Probe
+
+**What it measures:** whether the copy-on-access step that both ADR-013 Stage 2 (paged HNSW vector reads) and ADR-014 (paged PQHW rerank reads) chose over raw pointer access costs enough of a warm per-query overhead to justify a scoped zero-copy design pass — the ADR text left this an explicit possible future optimization ("Zero-copy scoped access remains a possible future optimization under ADR-005 measurement" / "zero-copy stays on the deferred list"). The new `ProximaBench paged-access-bench` subcommand measures three things against the same fixture: an isolated copy-vs-raw-unsafe-mmap-read microbenchmark, warm resident-vs-paged HNSW search, and warm resident-vs-paged PQ rerank.
+
+### Pre-declared gate
+
+GO only if the **observed** paged-vs-resident delta on a warm per-query median exceeds 5.0% of that median; otherwise NO-GO. The gate keys on this observed delta alone. An earlier draft of the gate additionally weighted an isolation-microbench extrapolation, which could print GO on measurement noise unrelated to in-search cost; that extrapolation is now retained as a diagnostic only (below) and does not feed the decision.
+
+### HNSW search — measured, scoped GO
+
+Fixture: 50,000 × 384d, `m = 16`, `efConstruction = 64`, `efSearch = 50`, `k = 10`, 200 queries, warm pages (pre-faulted before timing). Eight independent warm measurements: the original two timing passes (reps 7, seed 42), plus an adversarial methodology judge's independent re-measurement of six more passes (reps 11 each) judge-replicated across two fixture seeds — three further replicates at seed 42 and three at the independent seed-7 fixture:
+
+| | floor | max | mean |
+|---|---|---|---|
+| Observed paged-overhead fraction | 8.75% | 17.01% | 11.89% |
+
+**Machine:** Apple M4 Max, 36 GB, macOS 26.0.1, Swift 6.2, release. All eight measurements clear the 5.0% threshold. **Decision: scoped GO** for a zero-copy design pass on the paged HNSW search path only — implementation is deferred to a future mission, gated on re-measurement on target consumer hardware. The observed delta is copy-allocation cost *plus* mmap page-locality effects (cache/TLB/residency behavior), not pure memcpy time, so a zero-copy change recovers at most the allocation/memcpy component: realizable benefit is bounded by, and likely below, the observed 8.75–17.01% warm-best-case delta above.
+
+### PQ rerank — measured, stays copy-on-access
+
+Same eight-measurement protocol over a retained-originals `PQHW` fixture (`rerankDepth = 40`, PQ subspaces = 32): observed paged-overhead fraction ranges **0.00%–3.28%**, well under the 5.0% gate. **Decision: no change** — the rerank path stays copy-on-access; only a future change to `rerankDepth` or candidate selection large enough to cross the threshold would reopen it.
+
+### Non-transferable diagnostic
+
+The isolated copy-vs-raw-read microbenchmark reported roughly 175–219 ns/access at 384d in isolation during this mission's session, with the marginal cost actually observed inside HNSW search only ~35 ns/access on average — distance computation hides most of the access latency once it's in context. These ns-level figures are a session measurement, not reproducible from the committed artifacts in this repository (the backing harness JSON lives only in local, gitignored scratch output) — rerun `paged-access-bench` below to regenerate them. The isolation number is kept only as a diagnostic sanity check; it never feeds the GO/NO-GO decision above.
+
+**Warm-run scope, honestly stated:** these figures are a warm best case for exposing paged-access overhead — pages are pre-faulted before timing, which emphasizes steady-state allocation/memcpy/locality cost. Cold, fault-dominated workloads (paging's actual reason to exist) dilute this overhead toward zero, since major page faults and I/O dominate query time there. Raw per-run JSON lives in the mission's local benchmark harness output, not in this repository.
+
+**Run the paged-access bench:**
+
+```bash
+swift build -c release --package-path Benchmarks
+Benchmarks/.build/release/ProximaBench paged-access-bench --out out/paged-access.json
+```
+
+---
+
+## Embedding Compute-Units — ANE Decision Probe
+
+**What it measures:** whether Core ML's Apple Neural Engine dispatch (`MLComputeUnits.cpuAndNeuralEngine`) beats CPU-only batch embedding throughput by enough to justify exposing a public `computeUnits` knob on `CoreMLEmbeddingProvider` (today it configures none — Core ML picks its own default dispatch). The new `ProximaBench embed-bench` subcommand runs the same seeded batch through `cpuOnly`, `cpuAndGPU`, and `cpuAndNeuralEngine` and reports median batch throughput plus first-load latency for each.
+
+### Pre-declared gate
+
+GO only if `cpuAndNeuralEngine` median batch throughput is ≥ 1.50× `cpuOnly`; otherwise NO-GO — keep Core ML defaults, ship no knob.
+
+### Results — measured, NO-GO
+
+Local MiniLM `.mlpackage`, batch 512, 5 reps (1 warmup), SplitMix64 seed 42 (deterministic inputs, no system RNG):
+
+| computeUnits | median texts/s | spread | first-load total (ms) |
+|---|---|---|---|
+| cpuOnly | 117.64 | 4.76% | 88.03 |
+| cpuAndGPU | 117.93 | 0.39% | 84.23 |
+| cpuAndNeuralEngine | 117.48 | 0.46% | 213.88 |
+
+**Machine:** Apple M4 Max, 36 GB, macOS 26.0.1, Swift 6.2, release. Observed gate: `cpuAndNeuralEngine / cpuOnly` = **0.9986×** — dead even, well under the 1.50× threshold. ANE additionally pays roughly 126 ms more first-load latency than CPU (213.88 ms vs. 88.03 ms — the classic Core ML compile tax on the ANE path). **Decision: NO-GO.** No public `computeUnits` knob ships; `CoreMLEmbeddingProvider` keeps Core ML's own dispatch default.
+
+**NaN-model caveat:** the local model used for this probe emits `NaN` through the full `CoreMLEmbeddingProvider` path (`CoreMLEmbeddingProviderTests/testEmbedText` fails asserting a non-zero, and therefore non-finite, embedding), so the table above is a **CoreML runtime-dispatch throughput measurement, not a semantic-correctness validation** — the raw report's checksum field is `null` for every row for exactly this reason. Reopening this decision needs a finite-output sentence-embedding artifact (`.mlpackage` / `.mlmodel` / `.mlmodelc` with `input_ids` / `attention_mask` MLMultiArray inputs) re-measured on consumer hardware, at the same pre-declared 1.50× threshold.
+
+**Run the embedding compute-units bench:**
+
+```bash
+swift build -c release --package-path Benchmarks
+Benchmarks/.build/release/ProximaBench embed-bench \
+    --model Models/MiniLM-L6-v2.mlpackage \
+    --batch-size 512 --reps 5 --warmup 1 --seed 42 \
+    --out out/embed-bench.json
+```
+
+---
+
 ## Filtered Search Recall — Graph-Aware Beam on Quantized Indexes
 
 **What it measures:** Recall@10 of `QuantizedHNSWIndex` (PQ, both pure-ADC and reranked) and `ScalarQuantizedHNSWIndex` (SQ) filtered search against `BruteForceIndex`-filtered ground truth, at three predicate selectivities, now that both indexes have adopted the graph-aware layer-0 beam `HNSWIndex` shipped first ([ADR-008](adr/ADR-008-filtered-search.md) addendum → second addendum).

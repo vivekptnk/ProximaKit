@@ -364,13 +364,27 @@ if await index.needsCheckpoint() {
   raises an uncatchable SIGBUS — the same risk class the `.mappedIfSafe`
   decode pass already carries at load time, now extended to the paged
   index's whole lifetime.
+- **Unified residency vocabulary + store-level residency (ADR-015 Stages
+  A/B, opt-in).** `IndexResidency` (`.resident` / `.paged`) is now the
+  canonical enum shared by both HNSW-graph families; `HNSWOpenMode` (above)
+  and `PQHWOpenMode` (Quantization Layer, below) are zero-breakage
+  typealiases for it — both spellings compile and mean the same thing.
+  `HNSWIndex.load(from:mode:)` mirrors `QuantizedHNSWIndex.load(from:mode:)`:
+  `.resident` is byte-identical to `load(from:)`, and `.paged` loads through
+  the same `MappedVectorRegion` path described above, throwing a typed
+  `PersistenceError` (never a trap) when the base isn't a padded v3 file.
+  At the store layer, `VectorStore.open(...)` and `HybridVectorStore.open(...)`
+  (see "Store-level journaling" below) accept `dense: IndexResidency =
+  .resident`, plumbed straight to the dense leg's `HNSWIndex.open(...,
+  mode:)` — a journaled store with a paged dense leg is a one-parameter
+  opt-in, not a second code path.
 
 ### Store-level journaling (opt-in, closes ADR-013 deviation 5)
 
 `VectorStore` and `HybridVectorStore` gain async `open(...)` factories —
-`VectorStore.open(name:embedder:storageDirectory:metric:config:durability:)`
+`VectorStore.open(name:embedder:storageDirectory:metric:config:durability:checkpointAutomatically:dense:)`
 and
-`HybridVectorStore.open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)`
+`HybridVectorStore.open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:checkpointAutomatically:dense:)`
 — that establish WAL journaling at the store level: a fresh directory
 creates an empty index and checkpoints it immediately (generation-1 base +
 fresh WAL); an existing base, including a plain v2 base written by the
@@ -406,6 +420,20 @@ the authoritative projection. The CHA-107 contract (`HybridVectorStore` never
 mutates `VectorStore`) is untouched; PXWL v1 and the v3 `.pxkt` format are
 untouched too — this is store-layer wiring over the already-shipped
 index-level WAL, not a new format.
+
+**Automatic checkpointing (opt-in, ADR-015 Stage A).** Both `open(...)`
+factories additionally accept `checkpointAutomatically: WALCheckpointPolicy?
+= nil`. When set, the store checks the policy after every serialized
+mutation batch (`addChunks`, `removeDocument`) and folds the WAL inside that
+same actor-serialized mutation chain, so a concurrent batch can never land
+between the apply and the fold. The honest failure contract: if the fold
+itself throws, the error surfaces from the mutation call that triggered it,
+but that triggering mutation has already been applied and made durable — do
+not retry it, since `addChunks` assigns fresh UUIDs and there is no
+idempotency key to make a retry safe. There is no failure latch: the store
+stays consistent, and the next mutation, `save()`, or `checkpoint()` simply
+re-attempts the fold. The default `nil` path is untouched and byte-identical
+to before this option existed.
 
 ## Store Layer
 
