@@ -467,3 +467,28 @@ Left to the implementer and to tinybrain's stabilizing policy:
 5. **`IndexResidency` canonical vs. alias** — reuse `HNSWOpenMode` as canonical
    (lowest churn, but "HNSW" misnames the quantized family) or introduce the neutral
    `IndexResidency` (chosen here)? Confirm at implementation against source-compat cost.
+
+## Implementation notes (Stages A+B)
+
+Shipped in this implementation:
+
+- **Stage A** — `VectorStore.open` and `HybridVectorStore.open` now accept
+  `checkpointAutomatically: WALCheckpointPolicy? = nil`. When non-nil, the store
+  checks the policy after each serialized mutation batch and calls the existing
+  checkpoint fold inside that same serialized chain. Automatic fold errors are
+  rethrown by the mutation call that triggered the fold; the default `nil` path
+  preserves the manual `needsCheckpoint` / `checkpoint` lifecycle.
+- **Stage B** — `HNSWIndex.load(from:mode:)` mirrors the quantized loader and wraps
+  the existing paged HNSW loader, while store opens now accept `dense:
+  IndexResidency = .resident` and plumb it to the dense HNSW open path.
+- **Naming foundation** — `IndexResidency` is the canonical residency enum, with
+  `HNSWOpenMode` and `PQHWOpenMode` retained as source-compatible typealiases.
+
+Still pending:
+
+- **Stage C save-layout rename** — the `PQHWSaveLayout` -> `IndexSaveLayout`
+  rename is explicitly deferred to Stage C. Stages A+B did not fold it into the
+  residency-alias work.
+- **Stage C docs/pattern work** beyond the shared residency naming foundation:
+  broader agent-memory documentation, metadata-filter pattern docs, and any future
+  staged deprecation annotations for old residency spellings.

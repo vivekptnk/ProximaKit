@@ -404,17 +404,23 @@ Recovery is prefix-safe: a crash mid-write truncates to the longest valid WAL re
 That's index-level. `VectorStore` and `HybridVectorStore` wire the same WAL in at the document layer through an async `open`:
 
 ```swift
-let store = try await VectorStore.open(name: "notes", embedder: embedder, storageDirectory: storageDirectory)
-
-try await store.addChunks(
-    ["Fresh pasta tastes better than dried"],
-    metadata: [ChunkMetadata(documentId: "doc-1", chunkIndex: 0, text: "Fresh pasta tastes better than dried")]
+let store = try await VectorStore.open(
+    name: "notes",
+    embedder: embedder,
+    storageDirectory: storageDirectory,
+    checkpointAutomatically: WALCheckpointPolicy()
 )
 
-try await store.save()  // O(1): flushes the dense WAL, does not rewrite the corpus
+for note in notes {
+    _ = try await store.addChunks(
+        [note.text],
+        metadata: [ChunkMetadata(documentId: note.id, chunkIndex: 0, text: note.text)]
+    )
+    try await store.save()  // O(1): flushes the dense WAL, does not rewrite the corpus
+}
 ```
 
-`HybridVectorStore.open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)` takes the same shape. Under journaling, `save()` becomes an O(1) durability flush rather than a full rewrite; `checkpoint()` still does the periodic O(corpus) fold. The honest guarantee: after any crash, the next `open` rebuilds the document map — and, for hybrid, the entire WAL-less BM25 sparse leg — from the recovered dense index's own live entries, never from the sidecar files on disk, so a doc-map or sparse entry surviving without a live vector behind it is structurally impossible. The historical (non-`open`) initializers and their `save()` semantics are unchanged. Design and Stage 1 notes, plus the store-level journaling addendum: [ADR-013](docs/adr/ADR-013-streaming-persistence.md).
+`HybridVectorStore.open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:checkpointAutomatically:dense:)` takes the same shape. Under journaling, `save()` becomes an O(1) durability flush rather than a full rewrite; `checkpointAutomatically:` makes the store fold the WAL when the policy trips, so the common ingest loop stays at `addChunks` + `save`. Manual `needsCheckpoint(policy:)` / `checkpoint()` remains available when you want to schedule the O(corpus) fold yourself. The honest guarantee: after any crash, the next `open` rebuilds the document map — and, for hybrid, the entire WAL-less BM25 sparse leg — from the recovered dense index's own live entries, never from the sidecar files on disk, so a doc-map or sparse entry surviving without a live vector behind it is structurally impossible. The historical (non-`open`) initializers and their `save()` semantics are unchanged. Design and Stage 1 notes, plus the store-level journaling addendum: [ADR-013](docs/adr/ADR-013-streaming-persistence.md).
 
 ### Paged Vectors (mmap)
 

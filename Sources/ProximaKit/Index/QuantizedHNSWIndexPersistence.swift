@@ -97,27 +97,8 @@ public enum PQHWSaveLayout: Sendable {
     case pagedV3
 }
 
-/// How ``QuantizedHNSWIndex/load(from:mode:)`` materializes a base's retained
-/// originals section (ADR-014 Stage 2). Additive; `.resident` is the default and
-/// preserves the historical fully-resident behavior byte for byte. Mirrors
-/// `HNSWOpenMode`.
-public enum PQHWOpenMode: Sendable {
-    /// Decode every section (including the originals) into resident memory — the
-    /// original behavior. Fastest warm rerank, highest residency.
-    case resident
-
-    /// Serve the originals section from a read-only file mapping, faulted in on
-    /// demand, keeping the graph, codes, ids, levels, and metadata resident.
-    /// Requires a padded v3 base that retains originals — produced by
-    /// `save(to:layout: .pagedV3)` on a retaining index, or by `upgradeToV3(at:)`
-    /// on a v2 file that already retained originals (the upgrade repads and
-    /// reformats an existing originals section; it cannot add originals that
-    /// were never retained). Restores the 32× compression story on the vector
-    /// payload while keeping rerank exact; the post-beam rerank reads are
-    /// bit-identical to `.resident`. A retaining base with zero live nodes opens
-    /// successfully as an empty paged originals store.
-    case paged
-}
+/// Backward-compatible spelling for ``IndexResidency`` on PQHW load APIs.
+public typealias PQHWOpenMode = IndexResidency
 
 extension QuantizedHNSWIndex {
 
@@ -379,7 +360,7 @@ extension QuantizedHNSWIndex {
     ///   originals (nothing to page), or has an unaligned originals section.
     ///   A flag-1 v3 base with zero nodes opens successfully with an empty
     ///   mapped originals store.
-    public static func load(from url: URL, mode: PQHWOpenMode) throws -> QuantizedHNSWIndex {
+    public static func load(from url: URL, mode: IndexResidency) throws -> QuantizedHNSWIndex {
         switch mode {
         case .resident:
             return try load(from: url)

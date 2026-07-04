@@ -37,14 +37,14 @@ import Foundation
 ///    requires an explicit ``loadDocumentMap()`` call to restore the
 ///    document → UUID map.
 /// 2. **Journaled** (ADR-013): the async static
-///    ``open(name:embedder:storageDirectory:metric:config:durability:)``
+///    ``open(name:embedder:storageDirectory:metric:config:durability:checkpointAutomatically:dense:)``
 ///    factory. Mutations stream to a `.pxwal` sidecar as they happen, giving
 ///    O(change) saves via ``checkpoint()``/``needsCheckpoint(policy:)`` instead
 ///    of a full rewrite, and the document map is rebuilt automatically from
 ///    the recovered index on open — no manual ``loadDocumentMap()`` call
 ///    needed.
 ///
-/// Prefer ``open(name:embedder:storageDirectory:metric:config:durability:)``
+/// Prefer ``open(name:embedder:storageDirectory:metric:config:durability:checkpointAutomatically:dense:)``
 /// for continuous-mutation (agentic) workloads with frequent small writes.
 /// The synchronous initializers remain fully supported for batch-style
 /// workloads that build once and save occasionally.
@@ -52,7 +52,7 @@ import Foundation
 /// ## Topics
 ///
 /// ### Journaled Lifecycle
-/// - ``open(name:embedder:storageDirectory:metric:config:durability:)``
+/// - ``open(name:embedder:storageDirectory:metric:config:durability:checkpointAutomatically:dense:)``
 /// - ``save()``
 /// - ``checkpoint()``
 /// - ``needsCheckpoint(policy:)``
@@ -104,6 +104,11 @@ public actor VectorStore {
 
     /// WAL durability dial, used only when ``journaling`` is `true`.
     private let durability: WALDurability
+
+    /// Optional policy that folds the WAL after a serialized mutation batch
+    /// trips ``needsCheckpoint(policy:)``. `nil` preserves the historical
+    /// caller-polled checkpoint lifecycle.
+    private let checkpointAutomatically: WALCheckpointPolicy?
 
     /// The base snapshot path (`index.pxkt`) inside the store directory.
     private var indexURL: URL { storageURL.appendingPathComponent("index.pxkt") }
@@ -168,6 +173,7 @@ public actor VectorStore {
         // exact all-or-nothing behavior. These fields never change that path.
         self.journaling = false
         self.durability = .everyBatch
+        self.checkpointAutomatically = nil
     }
 
     /// Creates a VectorStore wrapping an existing index (for testing or advanced use).
@@ -194,10 +200,11 @@ public actor VectorStore {
         self.storageURL = storageDirectory.appendingPathComponent(name)
         self.journaling = false
         self.durability = .everyBatch
+        self.checkpointAutomatically = nil
     }
 
     /// Designated initializer for the journaled open path. Private: journaling
-    /// is established only through ``open(name:embedder:storageDirectory:metric:config:durability:)``,
+    /// is established only through ``open(name:embedder:storageDirectory:metric:config:durability:checkpointAutomatically:dense:)``,
     /// which does the async index open + WAL replay + document-map rebuild
     /// before handing the fully-recovered state here.
     private init(
@@ -207,6 +214,7 @@ public actor VectorStore {
         storageDirectory: URL,
         journaling: Bool,
         durability: WALDurability,
+        checkpointAutomatically: WALCheckpointPolicy?,
         documentMap: [String: Set<UUID>]
     ) {
         self.name = name
@@ -215,6 +223,7 @@ public actor VectorStore {
         self.storageURL = storageDirectory.appendingPathComponent(name)
         self.journaling = journaling
         self.durability = durability
+        self.checkpointAutomatically = checkpointAutomatically
         self.documentMap = documentMap
     }
 
@@ -246,14 +255,50 @@ public actor VectorStore {
     ///   `save()`) → it is opened and any WAL replayed over it; a base with no
     ///   WAL yet starts a fresh one bound to the base's generation.
     ///
+    /// ## Automatic checkpointing
+    /// Set `checkpointAutomatically` to fold the WAL after any serialized
+    /// mutation batch that trips the supplied policy. The fold runs in the same
+    /// mutation chain as ``addChunks(_:metadata:)`` and
+    /// ``removeDocument(id:)``, so it cannot interleave with another mutation.
+    /// A failed automatic fold is rethrown by the mutation call that triggered
+    /// it, but the triggering mutation has already been applied and made
+    /// durable. Do not retry that mutation: `addChunks` assigns fresh UUIDs, so
+    /// retrying would duplicate chunks. The store remains consistent, and the
+    /// next mutation, ``save()``, or ``checkpoint()`` re-attempts the fold.
+    ///
+    /// ```swift
+    /// let store = try await VectorStore.open(
+    ///     name: "agent-memory",
+    ///     embedder: embedder,
+    ///     storageDirectory: appSupport,
+    ///     checkpointAutomatically: WALCheckpointPolicy(),
+    ///     dense: .paged
+    /// )
+    ///
+    /// for turn in turns {
+    ///     _ = try await store.addChunks(turn.chunks, metadata: turn.metadata)
+    ///     try await store.save()
+    /// }
+    /// ```
+    ///
     /// - Parameter durability: WAL flush policy (default `.everyBatch`).
+    /// - Parameter checkpointAutomatically: Optional policy for folding the
+    ///   WAL after serialized mutation batches. `nil` keeps the manual
+    ///   ``needsCheckpoint(policy:)`` / ``checkpoint()`` lifecycle. If an
+    ///   automatic fold fails, the triggering mutation is already applied and
+    ///   durable; do not retry it.
+    /// - Parameter dense: How the dense index materializes base vectors.
+    ///   `.resident` is byte-identical to the historical open path; `.paged`
+    ///   maps the base vector section from the checkpointed v3 file.
     public static func open(
         name: String,
         embedder: any TextEmbedder,
         storageDirectory: URL,
         metric: any DistanceMetric = CosineDistance(),
         config: HNSWConfiguration = HNSWConfiguration(),
-        durability: WALDurability = .everyBatch
+        durability: WALDurability = .everyBatch,
+        checkpointAutomatically: WALCheckpointPolicy? = nil,
+        dense: IndexResidency = .resident
     ) async throws -> VectorStore {
         let storeDir = storageDirectory.appendingPathComponent(name)
         let indexURL = storeDir.appendingPathComponent("index.pxkt")
@@ -261,12 +306,22 @@ public actor VectorStore {
 
         let index: HNSWIndex
         if FileManager.default.fileExists(atPath: indexURL.path) {
-            index = try await HNSWIndex.open(baseURL: indexURL, walURL: walURL, durability: durability)
+            index = try await HNSWIndex.open(
+                baseURL: indexURL, walURL: walURL, durability: durability, mode: dense
+            )
         } else {
             try FileManager.default.createDirectory(at: storeDir, withIntermediateDirectories: true)
             let fresh = HNSWIndex(dimension: embedder.dimension, metric: metric, config: config)
             try await fresh.checkpoint(baseURL: indexURL, walURL: walURL, durability: durability)
-            index = fresh
+            switch dense {
+            case .paged:
+                await fresh.closeJournal()
+                index = try await HNSWIndex.open(
+                    baseURL: indexURL, walURL: walURL, durability: durability, mode: dense
+                )
+            case .resident:
+                index = fresh
+            }
         }
 
         let map = rebuildDocumentMap(from: await index.liveEntries())
@@ -277,6 +332,7 @@ public actor VectorStore {
             storageDirectory: storageDirectory,
             journaling: true,
             durability: durability,
+            checkpointAutomatically: checkpointAutomatically,
             documentMap: map
         )
     }
@@ -358,7 +414,9 @@ public actor VectorStore {
         }
 
         return try await serialized {
-            try await self.performAddChunks(chunks, metadata: metadata)
+            let ids = try await self.performAddChunks(chunks, metadata: metadata)
+            try await self.performAutomaticCheckpointIfNeeded()
+            return ids
         }
     }
 
@@ -432,7 +490,9 @@ public actor VectorStore {
     @discardableResult
     public func removeDocument(id: String) async throws -> Int {
         try await serialized {
-            try await self.performRemoveDocument(id: id)
+            let removed = try await self.performRemoveDocument(id: id)
+            try await self.performAutomaticCheckpointIfNeeded()
+            return removed
         }
     }
 
@@ -547,6 +607,15 @@ public actor VectorStore {
     public func needsCheckpoint(policy: WALCheckpointPolicy = WALCheckpointPolicy()) async -> Bool {
         guard journaling else { return false }
         return await index.needsCheckpoint(policy: policy)
+    }
+
+    /// Runs the opt-in automatic fold after a serialized mutation batch.
+    /// Must only run inside ``serialized(_:)``.
+    private func performAutomaticCheckpointIfNeeded() async throws {
+        guard journaling, let policy = checkpointAutomatically else { return }
+        if await index.needsCheckpoint(policy: policy) {
+            try await performCheckpoint()
+        }
     }
 
     /// Performs the fold. Must only run inside ``serialized(_:)``.

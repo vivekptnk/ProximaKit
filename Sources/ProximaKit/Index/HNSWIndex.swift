@@ -94,23 +94,8 @@ struct SplitMix64: RandomNumberGenerator {
     }
 }
 
-/// How ``HNSWIndex/open(baseURL:walURL:durability:mode:)`` materializes the
-/// base snapshot's vector section (ADR-013 Stage 2). Additive; `.resident` is
-/// the default and preserves the historical fully-resident behavior byte for
-/// byte.
-public enum HNSWOpenMode: Sendable {
-    /// Decode every section (including vectors) into resident memory — the
-    /// original behavior. Fastest warm search, highest residency.
-    case resident
-
-    /// Serve the vector section from a read-only file mapping, faulted in on
-    /// demand, keeping only the graph, ids, levels, metadata, and a resident
-    /// tail of post-snapshot adds in memory. Requires a padded v3 base (written
-    /// by any `checkpoint`). Trades a slower first-search-after-open (page
-    /// faults) for corpus-larger-than-RAM residency; warm results are
-    /// bit-identical to `.resident`.
-    case paged
-}
+/// Backward-compatible spelling for ``IndexResidency`` on full-precision HNSW APIs.
+public typealias HNSWOpenMode = IndexResidency
 
 /// Approximate nearest-neighbor index using Hierarchical Navigable Small World graphs.
 ///
@@ -698,6 +683,24 @@ public actor HNSWIndex: VectorIndex {
         try PersistenceEngine.loadHNSW(from: url)
     }
 
+    /// Loads an HNSW index in the requested residency `mode`.
+    ///
+    /// `.resident` is byte-identical to ``load(from:)``; `.paged` serves the
+    /// base vector section from a read-only file mapping (`MappedVectorRegion`)
+    /// instead of copying it into `[Vector]`.
+    ///
+    /// - Throws: for `.paged`, a typed `PersistenceError` (never a trap) when
+    ///   the base is not a padded v3 file. Checkpoint the index first to write
+    ///   the paged-capable v3 base.
+    public static func load(from url: URL, mode: IndexResidency = .resident) throws -> HNSWIndex {
+        switch mode {
+        case .resident:
+            return try load(from: url)
+        case .paged:
+            return try PersistenceEngine.loadHNSWPaged(from: url)
+        }
+    }
+
     // ── Streaming persistence: WAL journaling (ADR-013, Stage 1, opt-in) ─
     //
     // Additive surface. `save(to:)`/`load(from:)` above are untouched (full
@@ -731,7 +734,7 @@ public actor HNSWIndex: VectorIndex {
         baseURL: URL,
         walURL: URL,
         durability: WALDurability = .everyBatch,
-        mode: HNSWOpenMode = .resident
+        mode: IndexResidency = .resident
     ) async throws -> HNSWIndex {
         let index: HNSWIndex
         switch mode {
@@ -927,6 +930,12 @@ public actor HNSWIndex: VectorIndex {
 
     /// Records appended to the WAL since the last checkpoint.
     public var journalRecordCount: Int { journal?.recordCount ?? 0 }
+
+    /// Whether this index currently serves base vectors from a read-only file
+    /// mapping (`.paged`) rather than keeping the full base vector payload in a
+    /// resident array. Post-snapshot WAL replay and live adds may still occupy
+    /// the resident tail until the next checkpoint.
+    public var vectorsArePaged: Bool { vectorProvider.isPaged }
 
     /// The generation of the base this index is currently bound to.
     public var currentGeneration: UInt64 { snapshotGeneration }
