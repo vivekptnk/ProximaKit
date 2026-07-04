@@ -63,11 +63,15 @@ enum PlatformProbe {
     }
 
     private static func swiftVersion() -> String {
-        #if swift(>=6.0)
+        #if compiler(>=6.2)
+        return "6.2"
+        #elseif compiler(>=6.1)
+        return "6.1"
+        #elseif compiler(>=6.0)
         return "6.0"
-        #elseif swift(>=5.10)
+        #elseif compiler(>=5.10)
         return "5.10"
-        #elseif swift(>=5.9)
+        #elseif compiler(>=5.9)
         return "5.9"
         #else
         return "unknown"

@@ -30,6 +30,8 @@ struct ProximaBenchCLI {
                 try await runInsertShape(args: Array(args.dropFirst(2)))
             case "search-provider-bench":
                 try await runSearchProviderBench(args: Array(args.dropFirst(2)))
+            case "paged-access-bench":
+                try await runPagedAccessBench(args: Array(args.dropFirst(2)))
             case "migrate":
                 try MigrateCommand.run(args: Array(args.dropFirst(2)))
             case "-h", "--help", "help":
@@ -142,6 +144,36 @@ struct ProximaBenchCLI {
         try await SearchProviderBench.run(opts)
     }
 
+    // MARK: - paged-access-bench (ADR-013/014 zero-copy GO/NO-GO)
+
+    static func runPagedAccessBench(args: [String]) async throws {
+        let f = Flags(args)
+        let opts = PagedAccessBench.Options(
+            count: f.int("--count") ?? 50_000,
+            dimension: f.int("--dim") ?? 384,
+            isolationDimensions: intList(f.string("--isolation-dims") ?? "128,384,768"),
+            accessesPerRep: f.int("--accesses") ?? 200_000,
+            queryCount: f.int("--query-count") ?? 200,
+            reps: f.int("--reps") ?? 7,
+            warmup: f.int("--warmup") ?? 2,
+            m: f.int("--m") ?? 16,
+            efConstruction: f.int("--efc") ?? 64,
+            efSearch: f.int("--ef") ?? 50,
+            k: f.int("--k") ?? 10,
+            rerankDepth: f.int("--rerank-depth") ?? 40,
+            pqSubspaces: f.int("--pq-subspaces") ?? 32,
+            pqTrainingIterations: f.int("--pq-iters") ?? 3,
+            seed: UInt64(f.int("--seed") ?? 42),
+            thresholdPercent: f.double("--threshold-percent") ?? 5.0,
+            reuseFixtures: f.int("--reuse-fixtures") == 1,
+            libraryVersion: f.string("--version") ?? "1.5.0-dev",
+            notes: f.string("--notes") ?? "",
+            workDir: f.string("--work-dir") ?? ".harness/scratch/m5-zerocopy/work",
+            outputPath: f.required("--out")
+        )
+        try await PagedAccessBench.run(opts)
+    }
+
     /// Parses a comma-separated list of ints (e.g. "384,768").
     static func intList(_ s: String) -> [Int] {
         s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
@@ -192,6 +224,18 @@ struct ProximaBenchCLI {
                 base (no decode, payload bytes bit-identical). Family is
                 auto-detected from the magic when omitted. Idempotent.
 
+          ProximaBench paged-access-bench     (ADR-013/014 zero-copy decision)
+                --out PATH
+                [--work-dir .harness/scratch/m5-zerocopy/work]
+                [--count 50000] [--dim 384] [--isolation-dims 128,384,768]
+                [--query-count 200] [--accesses 200000]
+                [--m 16] [--efc 64] [--ef 50] [--k 10]
+                [--rerank-depth 40] [--pq-subspaces 32] [--pq-iters 3]
+                [--reps 7] [--warmup 2] [--seed 42]
+                [--threshold-percent 5.0] [--reuse-fixtures 0]
+                Measures paged copy-on-access vs a local unsafe mmap read,
+                warm resident-vs-paged HNSW search, and warm PQ rerank.
+
         The hnsw / ground-truth subcommands emit documents following
         Benchmarks/JSON_SCHEMA.md.
 
@@ -225,6 +269,7 @@ struct Flags {
 
     func string(_ key: String) -> String? { map[key] }
     func int(_ key: String) -> Int? { map[key].flatMap(Int.init) }
+    func double(_ key: String) -> Double? { map[key].flatMap(Double.init) }
     func required(_ key: String) -> String {
         guard let v = map[key] else {
             FileHandle.standardError.write(Data("[ProximaBench] missing required flag \(key)\n".utf8))
