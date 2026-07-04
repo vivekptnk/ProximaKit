@@ -8,7 +8,117 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **PQHW v3 format + v2-to-v3 migration rewriter ([ADR-014](docs/adr/ADR-014-paged-originals.md)
+  Stage 1).** The format-and-migration half of paged PQ originals: a 56-byte
+  header and body byte-identical to v2, plus a new 128-byte `"PQH3"` trailer
+  appending a `UInt64` seven-section offset/length table and a reserved
+  snapshot generation; the originals section start pads to 16 KiB. Writer
+  policy is conservative and additive — the default `save(to:)` still writes
+  v2 byte-for-byte; the new `save(to:layout:)` with `.pagedV3` writes v3 only
+  when originals are retained, falling back to v2 otherwise. **Migration:**
+  `QuantizedHNSWIndex.upgradeToV3(at:)` (PQHW) and
+  `PersistenceEngine.upgradeToV3(at:)` (`.pxkt`) are pure section-copy
+  rewriters — payload bytes bit-identical, no graph decode — with a
+  full-checksum read-back verification, temp-file + atomic replace, and a
+  no-op on an already-migrated file; both let an iPhone app self-upgrade an
+  existing base to a paging-capable v3 without a rebuild. `ProximaBench`
+  gains a `migrate --path PATH [--family pxkt|pqhw]` subcommand wrapping both
+  upgraders (family auto-detected from the file magic). The `metadataOffset`
+  4 GiB ceiling is lifted with **no `.pxkt` version bump**: the v3 trailer's
+  `UInt64` offset is authoritative, and the legacy `UInt32` header field
+  carries a documented `0xFFFF_FFFF` sentinel only when the true offset
+  exceeds `UInt32.max`. 28 new tests: format byte-identity/alignment/rerank
+  parity (7), trailer corruption matrix — truncation, magic, counts,
+  overflow, contiguity, flag mismatches (10), migration round-trip fidelity
+  including per-section bit-identity and fingerprint equality (9), and
+  crash-safety truncation sweeps proving every torn output is rejected typed
+  while the source stays untouched (2, 432 assertions).
+- **Paged PQ originals — [ADR-014](docs/adr/ADR-014-paged-originals.md)
+  complete (Stage 2, status now Accepted).** A retaining `QuantizedHNSWIndex`
+  can serve rerank originals from a read-only mmap of its v3 file instead of
+  holding them resident, closing the arc [ADR-012](docs/adr/ADR-012-pq-reranking.md)
+  opened. `OriginalsStore` (`.resident([Vector])` / `.paged(MappedVectorRegion)`)
+  replaces the resident originals array, copying on access inside one
+  synchronous scope so no pointer ever crosses an actor suspension —
+  deliberately not `VectorProvider`, since a quantized index has no
+  `add()`/resident tail. `MappedVectorRegion` is generalized behind a layout
+  resolver; the new PQHW resolver reads only the header + trailer to bind the
+  padded originals section (the `.pxkt` path is untouched). The new opt-in
+  `load(from:mode:)` — `.resident` (default, byte-identical to before) /
+  `.paged` — rejects a paged open of a v2, flag-0-v3, or unaligned-v3 base
+  with a typed, actionable `PersistenceError` (the same file still loads
+  `.resident`), closing the Stage-1-deferred corruption items. Accounting is
+  now honest: `originalStorageBytes` reports 0 when paged (the originals live
+  on flash), `mappedOriginalStorageBytes` and `originalsArePaged` are new,
+  and `memorySavingsRatio` rises back to the pure-PQ (32×) ratio for a paged
+  index instead of counting mapped bytes as resident cost. **Measured, Apple
+  M4 Max, release:** a 100,000 × 384d retaining fixture (146.5 MB originals
+  payload) shows a paged open costing **8.0 MB** — 18× less than the 146.5 MB
+  payload — versus **43.1 MB** resident (5.4× more than paged), and stays
+  flat (8.2 MB) after 50 warm reranks (`PagedOriginalsMemoryTests`); a
+  resident rerank A/B on the same benchmark
+  shows **no regression** (median ~3.6% faster, though re-measurement puts
+  the true delta near 0–2% with sign varying run-to-run — noise at this
+  scale; the ±2% bail-out bound applies to regressions only and was never
+  approached — `ResidentRerankBenchTests`). `PagedOriginalsParityTests`
+  proves paged results are bit-identical to resident across rerank on/off,
+  filtered, post-remove, and save/reload. Ride-along: migration failures are
+  now wrapped in a typed `PersistenceError.migrationFailed(String)` preserving
+  the underlying error, with new fixtures for v1 PQHW, v1 `.pxkt`, and
+  unpadded-v3 migration paths.
+- **Journaled stores — `VectorStore`/`HybridVectorStore` WAL wiring
+  ([ADR-013](docs/adr/ADR-013-streaming-persistence.md), closes deviation
+  5).** New async `VectorStore.open(name:embedder:storageDirectory:metric:config:durability:)`
+  and `HybridVectorStore.open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)`
+  factories stream mutations to the dense leg's WAL, so `save()` becomes an
+  **O(1) durability flush** (`syncJournal()`) instead of a full rewrite, and
+  `checkpoint()` / `needsCheckpoint(policy:)` provide the periodic O(corpus)
+  fold. The multi-file crash-consistency problem — a replayed dense index
+  running ahead of its sidecars (`docmap.json`; for hybrid, the whole
+  WAL-less sparse `index.pxbm` leg) — is solved by **derivation, not
+  ordering**: the dense index + its WAL are the single source of truth, and
+  a new additive `HNSWIndex.liveEntries()` hook lets a journaled `open`
+  rebuild the document map (and, for hybrid, the entire BM25 sparse leg)
+  from the recovered index's live entries. A doc-map or sparse entry exists
+  iff a live dense vector exists, so orphaned vectors and phantom mappings
+  are structurally impossible after any crash, and any stale or corrupt
+  sidecar cache on disk is simply ignored rather than reconciled. 9 recovery
+  tests (`StoreJournalRecoveryTests`) prove it for both store types:
+  index-ahead-of-stale-sidecar, phantom-sidecar-ignored, torn-WAL-tail
+  bijection, sparse-leg-rebuilt-from-dense-WAL, remove-then-recover, and
+  typed `walGenerationMismatch` rejection. The historical initializers,
+  `save()`, `query()`, `addChunks`, `removeDocument`, and
+  `loadDocumentMap()` are unchanged for non-journaled stores — byte-identical
+  behavior, `CHA-107` contract untouched, existing store test suites pass
+  unmodified.
+
+### Changed
+- **Memory-acceptance benches recalibrated to measured-baseline ratio gates
+  (macOS 26 compressor reality).** Both `PagedVectorMemoryTests`
+  ([ADR-013](docs/adr/ADR-013-streaming-persistence.md) Stage 2, HNSW
+  vectors) and the new `PagedOriginalsMemoryTests`
+  ([ADR-014](docs/adr/ADR-014-paged-originals.md) Stage 2, PQ originals)
+  moved off an absolute "≥60% of payload recovered" gate. macOS 26's memory
+  compressor counts freshly-copied anonymous pages at their **compressed**
+  size, so `phys_footprint` captures only a fraction of the theoretical
+  payload on the resident side — an OS accounting reality, not a residency
+  leak — and the old gate demonstrably flaked (measured 57.7%/60.5% across
+  two runs against its 60% threshold, Apple M4 Max, release). Both benches
+  now gate on the measured baseline with margin: the paged-open delta must
+  be a small fraction of the payload (HNSW: < payload/3, measured 22.6 MB of
+  146.5 MB; PQHW: < payload/8, measured 8.0 MB of 146.5 MB), the resident
+  open must cost materially more (> 2.5× paged, both), the recovered slice
+  must clear a floor (HNSW: > payload/4; PQHW: > payload/8), and a warm
+  search/rerank sweep must stay bounded (both: < paged open + payload/4) —
+  with the compressor rationale documented in both test file headers and in
+  the ADR-013 Stage 2 and ADR-014 Stage 2 notes.
+- **`docs.yml` deploy-pages step gains an if-failure retry.**
+  `actions/deploy-pages@v4` flaked transiently 4 times in 24h with a
+  "Deployment failed, try again later" error even though the artifact was
+  always fine — a rerun healed every one — so the workflow now retries the
+  deploy step automatically (`if: failure()`) instead of requiring a human
+  to run `gh run rerun --failed`.
 
 ---
 

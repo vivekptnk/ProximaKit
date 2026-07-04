@@ -31,12 +31,12 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 |------------|---------|
 | **HNSW graph search** | From-scratch multi-layer implementation — heuristic neighbour selection, tombstone deletes, auto-compaction, reproducible builds via `levelSeed` |
 | **Hybrid retrieval** | BM25 + dense fusion (`HybridIndex`, `HybridVectorStore`) with Reciprocal Rank Fusion or weighted sum |
-| **Product quantization** | 32× vector compression with asymmetric distance computation, plus *(new)* opt-in exact reranking — retain the originals and `search` re-scores the top ADC candidates at full precision (`QuantizedHNSWIndex`, [ADR-011](docs/adr/ADR-011-pq-codec.md), [ADR-012](docs/adr/ADR-012-pq-reranking.md)) |
+| **Product quantization** | 32× vector compression with asymmetric distance computation, plus opt-in exact reranking — retain the originals and `search` re-scores the top ADC candidates at full precision; *(new)* paged originals restore the full 32× story even with reranking on (`load(from:mode: .paged)` maps originals from disk instead of residenting them), and existing bases self-upgrade in place with `upgradeToV3(at:)` / `ProximaBench migrate` (`QuantizedHNSWIndex`, [ADR-011](docs/adr/ADR-011-pq-codec.md), [ADR-012](docs/adr/ADR-012-pq-reranking.md), [ADR-014](docs/adr/ADR-014-paged-originals.md)) |
 | **INT8 scalar quantization** | ~4× less vector memory, **works with any metric**, no training phase (`ScalarQuantizedHNSWIndex`, [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md)) |
 | **Filtered search** | `@Sendable` predicate on every index and store; graph-aware on `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` — the layer-0 beam applies the filter during traversal with adaptive widening, so selective filters still fill `k` (`SparseIndex` keeps post-filter — no beam to route through) ([ADR-008](docs/adr/ADR-008-filtered-search.md)) |
 | **GPU batch distance (v1)** | `MetalBatchDistance` — standalone one-query-to-N squared-L2/cosine utility with automatic vDSP fallback. Measured **NO-GO** on wiring it into `HNSWIndex` build/search — vDSP (AMX) wins at every tested scale, no crossover ([ADR-009 addendum](docs/adr/ADR-009-metal-backend.md)) |
 | **9 distance metrics** | Cosine, Euclidean, dot product, Manhattan, Hamming, Chebyshev, Bray-Curtis, Mahalanobis, Jensen-Shannon — all vDSP-accelerated where it pays |
-| **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)); *(new)* opt-in WAL incremental saves + paged vector region make mutations O(change) instead of O(corpus) ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
+| **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)); opt-in WAL incremental saves + paged vector region make index mutations O(change) instead of O(corpus), *(new)* now wired all the way to `VectorStore`/`HybridVectorStore.open(...)` with derivation-based crash consistency ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
 | **Embedding providers** | Apple NaturalLanguage, Vision, and bring-your-own CoreML (BERT/MiniLM via WordPiece tokenizer) |
 | **Concurrency** | Every index is a Swift `actor`; `Sendable` API surface, built with `StrictConcurrency` |
 | **Proof** | 400+ tests, recall floors enforced in CI, cross-library benchmark harness vs FAISS/ScaNN running nightly |
@@ -315,6 +315,23 @@ Need to go further? `QuantizedHNSWIndex` (product quantization) compresses 32× 
 
 If recall matters more than the memory win, build the PQ index with `retainOriginals: true`: search then re-scores the top quantized candidates with exact distances before returning, recovering recall@10 to a CI-asserted ≥ 0.90 floor — observed 0.99–1.00 on the seeded fixtures ([ADR-012](docs/adr/ADR-012-pq-reranking.md)). Be aware of the trade — retaining originals stores the Float32 vectors again, so you give up the compression story for accuracy.
 
+### Paged PQ Originals (mmap)
+
+Retaining originals normally gives that memory back up — the Float32 vectors sit resident again. Opening `.paged` restores the compression story by keeping them on disk instead, faulted in only for the rerank step:
+
+```swift
+let index = try QuantizedHNSWIndex.load(from: fileURL, mode: .paged)
+```
+
+`.paged` requires a v3 base that retains originals — write one with `try index.save(to: fileURL, layout: .pagedV3)`, or self-upgrade an existing base in place without a rebuild:
+
+```swift
+try QuantizedHNSWIndex.upgradeToV3(at: fileURL)   // PQHW: section-copy, checksum-verified, atomic replace
+try PersistenceEngine.upgradeToV3(at: fileURL)    // .pxkt: same shape, for HNSWIndex bases
+```
+
+Or from the command line: `ProximaBench migrate --path index.qhnsw` (family auto-detected from the file's magic bytes). Measured, Apple M4 Max, release: a 146.5 MB originals payload costs **8.0 MB** resident opened `.paged` — 18× less than the payload — versus **43.1 MB** opened `.resident` (5.4× more than paged), flat across warm reranks, with search results bit-identical either way. `.resident` stays the default. Design and measured numbers: [ADR-014](docs/adr/ADR-014-paged-originals.md).
+
 
 ## Search Images
 
@@ -358,7 +375,22 @@ if await index.needsCheckpoint() {
 }
 ```
 
-Recovery is prefix-safe: a crash mid-write truncates to the longest valid WAL record and never corrupts the base — proven with an out-of-process `SIGKILL` rig, not just asserted in-process. `save(to:)`/`load(from:)` above are untouched; journaling is additive and opt-in. On Darwin, a plain `fsync(2)` only reaches the drive cache — checkpoint commits force media with `F_FULLFSYNC`, and the `durability` dial (`.everyRecord` / `.everyBatch` / `.manual`) documents exactly what each level guarantees. Store-level wiring (`VectorStore`/`HybridVectorStore`) isn't shipped yet — this is index-level only. Design and Stage 1 notes: [ADR-013](docs/adr/ADR-013-streaming-persistence.md).
+Recovery is prefix-safe: a crash mid-write truncates to the longest valid WAL record and never corrupts the base — proven with an out-of-process `SIGKILL` rig, not just asserted in-process. `save(to:)`/`load(from:)` above are untouched; journaling is additive and opt-in. On Darwin, a plain `fsync(2)` only reaches the drive cache — checkpoint commits force media with `F_FULLFSYNC`, and the `durability` dial (`.everyRecord` / `.everyBatch` / `.manual`) documents exactly what each level guarantees.
+
+That's index-level. `VectorStore` and `HybridVectorStore` wire the same WAL in at the document layer through an async `open`:
+
+```swift
+let store = try await VectorStore.open(name: "notes", embedder: embedder, storageDirectory: storageDirectory)
+
+try await store.addChunks(
+    ["Fresh pasta tastes better than dried"],
+    metadata: [ChunkMetadata(documentId: "doc-1", chunkIndex: 0, text: "Fresh pasta tastes better than dried")]
+)
+
+try await store.save()  // O(1): flushes the dense WAL, does not rewrite the corpus
+```
+
+`HybridVectorStore.open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)` takes the same shape. Under journaling, `save()` becomes an O(1) durability flush rather than a full rewrite; `checkpoint()` still does the periodic O(corpus) fold. The honest guarantee: after any crash, the next `open` rebuilds the document map — and, for hybrid, the entire WAL-less BM25 sparse leg — from the recovered dense index's own live entries, never from the sidecar files on disk, so a doc-map or sparse entry surviving without a live vector behind it is structurally impossible. The historical (non-`open`) initializers and their `save()` semantics are unchanged. Design and Stage 1 notes, plus the store-level journaling addendum: [ADR-013](docs/adr/ADR-013-streaming-persistence.md).
 
 ### Paged Vectors (mmap)
 
@@ -511,7 +543,7 @@ Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full me
 | `HNSWIndex` | **Most cases.** Fast approximate search, O(log n). | Full (Float32) |
 | `BruteForceIndex` | Under 1,000 items. 100% exact accuracy, O(n). | Full (Float32) |
 | `ScalarQuantizedHNSWIndex` | Memory-constrained, any metric, no training. | **~4× smaller** |
-| `QuantizedHNSWIndex` | Maximum compression, L2 workloads, can afford training. Opt-in exact reranking recovers recall — but stores originals again ([ADR-012](docs/adr/ADR-012-pq-reranking.md)). | **32× smaller** |
+| `QuantizedHNSWIndex` | Maximum compression, L2 workloads, can afford training. Opt-in exact reranking recovers recall; resident retention stores originals again, or open `.paged` to keep the 32× story ([ADR-012](docs/adr/ADR-012-pq-reranking.md), [ADR-014](docs/adr/ADR-014-paged-originals.md)). | **32× smaller** |
 | `SparseIndex` | Keyword/BM25 search, no embeddings needed. | Postings lists |
 | `HybridIndex` | Best of both: semantic + exact-term recall. | Dense + sparse legs |
 
@@ -576,7 +608,7 @@ try await index.add(newVector, id: UUID())
 | `HNSWIndex` | Fast approximate search (use this one). |
 | `BruteForceIndex` | Exact search (for small datasets). |
 | `ScalarQuantizedHNSWIndex` | INT8-compressed HNSW (~4×, any metric). |
-| `QuantizedHNSWIndex` | PQ-compressed HNSW (32×, L2 ADC). |
+| `QuantizedHNSWIndex` | PQ-compressed HNSW (32×, L2 ADC). Opt-in `.paged` open keeps retained originals on disk. |
 | `SparseIndex` | BM25 keyword index (Okapi, Lucene-style IDF). |
 | `HybridIndex` | Dense + sparse fusion (RRF / weighted sum). |
 | `VectorStore` | Document-level layer: chunks, metadata, saves. |
@@ -587,8 +619,8 @@ try await index.add(newVector, id: UUID())
 | `SearchResult` | Result: `id`, `distance`, `metadata`. |
 | `HNSWConfiguration` | Tuning: `m`, `efConstruction`, `efSearch`, `autoCompactionThreshold`, `levelSeed`. |
 | `BM25Configuration` | Tuning: `k1`, `b`, `autoCompactionThreshold`. |
-| `PersistenceEngine` | Versioned binary save/load with memory mapping. |
-| `WALDurability` / `WALCheckpointPolicy` | Opt-in `HNSWIndex` journaling: fsync dial and checkpoint-trigger policy for `open`/`checkpoint`. |
+| `PersistenceEngine` | Versioned binary save/load with memory mapping; `upgradeToV3(at:)` self-upgrades a `.pxkt` base to the paging-capable v3 format in place. |
+| `WALDurability` / `WALCheckpointPolicy` | Opt-in journaling: fsync dial and checkpoint-trigger policy for `HNSWIndex.open`/`.checkpoint` and `VectorStore`/`HybridVectorStore.open`/`.checkpoint`. |
 
 ### ProximaEmbeddings (content to vectors)
 
@@ -620,7 +652,8 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-010](docs/adr/ADR-010-format-evolution.md): Persistence format evolution policy
 - [ADR-011](docs/adr/ADR-011-pq-codec.md): Product quantization codec
 - [ADR-012](docs/adr/ADR-012-pq-reranking.md): Full-precision reranking for quantized HNSW
-- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — Stage 1 (WAL incremental saves) **shipped**; Stage 2 (paged vectors) **shipped**
+- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — Stage 1 (WAL incremental saves) **shipped**; Stage 2 (paged vectors) **shipped**; store-level journaling (`VectorStore`/`HybridVectorStore.open(...)`, derivation-based crash consistency) **shipped**
+- [ADR-014](docs/adr/ADR-014-paged-originals.md): Paged originals for quantized reranking — PQHW v3 format + migration (Stage 1) **shipped**; paged read path (Stage 2) **shipped**
 
 
 ## Building & Testing
@@ -650,7 +683,8 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
 |------|--------|
 | Graph-aware filtered search — higher recall under selective filters | **Shipped** for `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` ([ADR-008 addenda](docs/adr/ADR-008-filtered-search.md)); `SparseIndex` stays post-filter (no beam to route through) |
 | GPU acceleration | v1 shipped: `MetalBatchDistance` batch utility ([ADR-009](docs/adr/ADR-009-metal-backend.md)). Index build/search integration measured and decided **NO-GO** — vDSP (AMX) wins at every tested scale, no crossover |
-| Streaming persistence — incremental saves (WAL) + paged vectors | **Shipped** ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) — both stages: WAL incremental saves + opt-in paged vector region |
+| Streaming persistence — incremental saves (WAL) + paged vectors | **Shipped** ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) — index-level WAL + opt-in paged vector region, plus store-level journaling on `VectorStore`/`HybridVectorStore` |
+| Paged PQ originals — restore 32× compression with exact reranking | **Shipped** ([ADR-014](docs/adr/ADR-014-paged-originals.md)) — PQHW v3 format, v2→v3 migration rewriter (both families, plus `ProximaBench migrate`), and the paged originals read path |
 | Jensen-Shannon divergence metric | **Shipped** — `JensenShannonDistance()`, serializable (`DistanceMetricType` raw value 7) |
 | Background HNSW compaction policy | Planned |
 | Demo app — CoreML model download UI, benchmark tab, result export | Planned |

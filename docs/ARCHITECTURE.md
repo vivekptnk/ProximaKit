@@ -138,10 +138,12 @@ The two differ in how search computes distances:
   beam still runs on ADC/compressed distances, but `search(rerankDepth:)`
   re-scores the top `rerankDepth` live, filter-passing candidates with exact
   Euclidean distance against those retained originals before the final sort
-  — reranked recall@10 is asserted ≥ 0.90 in `PQRerankTests`. Retention
-  forfeits the compression story above (originals cost the full `4·d`
-  bytes/vector again); the default (`retainOriginals: false`) behaves exactly
-  as described in step 3.
+  — reranked recall@10 is asserted ≥ 0.90 in `PQRerankTests`. **Resident**
+  retention forfeits the compression story above (originals cost the full
+  `4·d` bytes/vector again); an opt-in **paged** open restores it while
+  keeping rerank exact (ADR-014 — see "Paged originals for reranking" under
+  Quantization Layer, below). The default (`retainOriginals: false`) behaves
+  exactly as described in step 3.
 - **INT8** (`ScalarQuantizedHNSWIndex`): each candidate is dequantized on the
   fly and fed to the configured metric, so cosine, euclidean, dot product,
   Manhattan, Chebyshev, and Bray-Curtis all work. 384d: 1536 B → 388 B ≈
@@ -158,6 +160,36 @@ The two differ in how search computes distances:
   training phase, no codebook to persist; handles zero vectors and subnormal
   scales explicitly.
 
+### Paged originals for reranking (ADR-014, opt-in)
+
+A retaining `QuantizedHNSWIndex` (`retainOriginals: true`) holds its
+full-precision originals behind an internal `OriginalsStore` — `.resident`
+(an array, the historical and still-default behavior) or `.paged` (a
+read-only file mapping). `.paged` serves the **single** rerank read site
+inside `search(rerankDepth:)` copy-on-access from a `MappedVectorRegion` over
+a `PQHW` v3 base's originals section — the same mapping machinery ADR-013
+Stage 2 built for `.pxkt` vector sections, generalized to a resolved layout
+rather than duplicated. The ADC beam itself never touches originals, so the
+fault ceiling is bounded by `rerankDepth` and lands entirely *after* the beam
+completes, never on the traversal critical path. Copy-on-access — the same
+Stage-2 discipline — makes paged rerank results bit-identical to resident by
+construction: the single read site is `originalsStore.vector(at:)`, a value
+copied out of the mapping inside one synchronous, actor-isolated call.
+
+Opt in with `QuantizedHNSWIndex.load(from:mode: .paged)` on a base written
+`save(to:layout: .pagedV3)` (or upgraded in place from an existing v2 base via
+`upgradeToV3(at:)` — see the persistence format table below); `.resident`
+stays the default and is byte-identical to `load(from:)` before this ADR.
+Accounting stays honest about which mode is active: a paged index reports
+`originalStorageBytes == 0` (its originals are on flash, not resident) and
+exposes the on-flash size separately via `mappedOriginalStorageBytes`;
+`originalsArePaged` distinguishes the two `retainsOriginals` modes, and
+`memorySavingsRatio` rises back to the pure-PQ ratio once paged, since
+`originalStorageBytes` no longer counts against it. Measured (100K × 384d,
+146.5 MB originals payload): paged open resident at 8.0 MB versus 43.1 MB for
+the same base opened resident — see `docs/BENCHMARKS.md` for the full table
+and the memory-accounting caveat it documents.
+
 ## Persistence Layer
 
 One engine plus per-format codecs, all little-endian binary with
@@ -168,7 +200,7 @@ magic + version headers (ADR-003, ADR-010):
 | `.pxkt` | `PXKT` | 2 / 1 (v3 max-readable¹) | `PersistenceEngine` | `HNSWIndex`, `BruteForceIndex` |
 | `.pxwal` (sidecar) | `PXWL` | 1 / 1 | `WALFormat` / `WALJournal` | `HNSWIndex`, opt-in journaling only |
 | `.pxbm` | `PXBM` | 2 / 1 | `SparseIndexPersistence` | `SparseIndex` |
-| quantized HNSW | `PQHW` | 2 / 1 | `QuantizedHNSWIndexPersistence` | `QuantizedHNSWIndex` |
+| quantized HNSW | `PQHW` | 2 / 1 (v3 max-readable²) | `QuantizedHNSWIndexPersistence` | `QuantizedHNSWIndex` |
 | scalar-quantized HNSW | `SQHW` | 1 | `ScalarQuantizedHNSWIndexPersistence` | `ScalarQuantizedHNSWIndex` |
 | PQ codebooks | `PQTT` | 1 | `ProductQuantizerPersistence` | `ProductQuantizer` |
 
@@ -184,6 +216,26 @@ Apple-Silicon page size) so it can be mapped read-only for paged access
 (Stage 2, below); the section table records the padded offset, and padded
 and unpadded v3 bases both still decode identically through the resident
 path.
+
+² `PQHW` v3 (ADR-014) mirrors the `.pxkt` v3 shape: the 56-byte header and the
+v2 body (codebooks → codes → UUIDs → node levels → adjacency → metadata) stay
+byte-for-byte identical, and a 128-byte trailer is appended — a seven-section
+`UInt64` offset/length table plus a reserved `snapshotGeneration`. When
+originals are retained, the originals section is additionally zero-padded to
+start on a 16 KiB boundary so it can be mapped read-only. **Writers stay
+conservative by default:** `save(to:)` always writes v2, unchanged and
+byte-identical to prior releases; `save(to:layout: .pagedV3)` is the new
+opt-in surface, and it falls back to v2 when there is nothing to page (no
+retained originals). `qhMinSupportedVersion` stays 1, so v1/v2/v3 all load
+`.resident`; `load(from:mode: .paged)` additionally requires a padded v3 base
+that retains originals (see "Paged originals for reranking" above).
+`PersistenceEngine.upgradeToV3(at:)` (`.pxkt`) and
+`QuantizedHNSWIndex.upgradeToV3(at:)` (`PQHW`) rewrite an existing v1/v2 (or
+unpadded-v3) base to a padded v3 base **in place**, without decoding the graph
+or materializing a single vector — a pure section-copy (bit-identical
+payloads, full-checksum-verified, temp-file + atomic replace) so an on-device
+app can enable paging on a base it already has without a full rebuild. See
+`docs/BENCHMARKS.md` for the migration-cost arithmetic.
 
 Shared invariants:
 
@@ -265,23 +317,27 @@ if await index.needsCheckpoint() {
   parent and asserting the same semantics — a 5-iteration smoke runs in
   every CI run, and a ≥100-iteration heavy class runs opt-in behind
   `PROXIMA_RUN_KILL_RIG` (`WALKillRecoveryTests`).
-- **Opt-in benchmark gates, one place.** Three env vars, each set to `1`,
-  unlock heavyweight test classes that stay out of default CI:
+- **Opt-in benchmark gates, one place.** A handful of env vars, each set to
+  `1`, unlock heavyweight test classes that stay out of default CI:
   `PROXIMA_RUN_KILL_RIG` is the SIGKILL rig's ≥100-iteration heavy class
-  above; `PROXIMA_PAGED_BENCH` unlocks `PagedVectorMemoryTests` (a
-  release-build test), which measures `phys_footprint` (via `task_vm_info`)
-  memory deltas between `.paged` and `.resident` open modes on the same base
-  file and backs the ADR-013 Stage 2 memory claims; and `PROXIMA_GPU_BENCH`
+  above; `PROXIMA_PAGED_BENCH` unlocks both `PagedVectorMemoryTests` (backs
+  the ADR-013 Stage 2 HNSW vector-region memory claims) and
+  `PagedOriginalsMemoryTests` (backs the ADR-014 `PQHW` originals memory
+  claims below), each a release-build test measuring `phys_footprint` (via
+  `task_vm_info`) deltas between `.paged` and `.resident` open modes on the
+  same base file; `PROXIMA_RESIDENT_BENCH` unlocks `ResidentRerankBenchTests`,
+  the ADR-014 resident-mode no-regression A/B; and `PROXIMA_GPU_BENCH`
   unlocks `MetalBuildIntegrationDecisionTests`, an opt-in Metal build-scale
   (N=100,000) GPU-vs-vDSP correctness/parity check behind the ADR-009
   insert-loop integration NO-GO decision, skipped whenever no Metal device is
-  present or the variable isn't set. None of the three run by default; each
-  earns its opt-in cost only when its specific question is being asked.
-- **Scope, honestly stated.** This is **index-level only**. Wiring
-  journaling into `VectorStore` / `HybridVectorStore` is a deferred,
-  documented follow-up — `HybridVectorStore` freezes the `VectorStore` v1
-  contract (CHA-107), the sparse leg has no WAL codec, and none of the
-  Stage 1 acceptance criteria required it. Auto-compaction is suppressed
+  present or the variable isn't set. None of these run by default; each earns
+  its opt-in cost only when its specific question is being asked.
+- **Scope, honestly stated.** Stage 1 shipped **index-level only** journaling;
+  wiring it into `VectorStore` / `HybridVectorStore` was a deferred follow-up
+  at the time — `HybridVectorStore` freezes the `VectorStore` v1 contract
+  (CHA-107), the sparse leg had no WAL codec, and none of the Stage 1
+  acceptance criteria required it. **That follow-up has since shipped** — see
+  "Store-level journaling" below. Auto-compaction is suppressed
   while a journal is attached (compaction changes `count` in a way an
   append-only WAL can't replay) and deferred to the next `checkpoint`.
   Checkpoint itself has one narrow crash window: the base rename is the
@@ -309,6 +365,48 @@ if await index.needsCheckpoint() {
   decode pass already carries at load time, now extended to the paged
   index's whole lifetime.
 
+### Store-level journaling (opt-in, closes ADR-013 deviation 5)
+
+`VectorStore` and `HybridVectorStore` gain async `open(...)` factories —
+`VectorStore.open(name:embedder:storageDirectory:metric:config:durability:)`
+and
+`HybridVectorStore.open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)`
+— that establish WAL journaling at the store level: a fresh directory
+creates an empty index and checkpoints it immediately (generation-1 base +
+fresh WAL); an existing base, including a plain v2 base written by the
+historical `save()`, opens and replays its WAL. Under journaling, `save()`
+becomes an O(1) durability flush of the dense leg's WAL (`syncJournal()`) —
+the sidecars are not rewritten, because **they are derived, not persisted
+authorities**. `checkpoint()` is the periodic O(corpus) fold: compact → write
+a fresh v3 base (generation bumped, `F_FULLFSYNC`) → reset the WAL → rewrite
+the `docmap.json` / `index.pxbm` / `hybrid.json` caches for the non-journaled
+reload path; `needsCheckpoint(policy:)` reports when to call it.
+
+**The multi-file crash-consistency problem is solved by derivation, not
+ordering.** A store is an index plus sidecars; naively journaling only the
+dense index would let a crash leave a replayed index *ahead of* its
+sidecars — an orphaned vector with no doc-map entry, or (worse, for hybrid)
+a document searchable in the dense leg but absent from the WAL-less sparse
+leg. Instead, the dense index and its WAL are the **single source of
+truth**, and a journaled `open` always *rebuilds* the document map — and,
+for `HybridVectorStore`, the entire BM25 sparse leg — from the recovered
+index's live entries via the new `HNSWIndex.liveEntries()` hook, rather than
+trusting whatever `docmap.json` / `index.pxbm` / `hybrid.json` happens to be
+on disk. Because both projections are computed *from* the recovered index,
+a doc-map entry exists iff a live dense vector exists, and a sparse entry
+exists iff a live dense vector exists — orphans and phantoms are
+structurally impossible, and any on-disk sidecar (stale, absent, or even
+hand-corrupted) is simply **ignored** on a journaled open, never reconciled.
+
+The historical (non-journaled) initializers, `save()`, `query()`,
+`addChunks`, `removeDocument`, and `loadDocumentMap()` are unchanged and
+byte-identical for every store not built through `open` —
+`loadDocumentMap()` is a no-op on a journaled store, since its map is already
+the authoritative projection. The CHA-107 contract (`HybridVectorStore` never
+mutates `VectorStore`) is untouched; PXWL v1 and the v3 `.pxkt` format are
+untouched too — this is store-layer wiring over the already-shipped
+index-level WAL, not a new format.
+
 ## Store Layer
 
 Document-level API over the indexes, designed for RAG pipelines (ADR-006):
@@ -328,6 +426,13 @@ through an internal operation chain**, and `save()` snapshots a monotonic
 mutation-generation counter — the store is only marked clean if no mutation
 landed while the write was in flight. This closes the actor-reentrancy
 lost-update window without blocking reads.
+
+Both stores additionally support an **opt-in journaled** construction path —
+`VectorStore.open(...)` / `HybridVectorStore.open(...)` — that streams
+mutations to the dense leg's WAL instead of paying a full rewrite on every
+`save()`; see "Store-level journaling" under Persistence Layer, above, for
+the derivation design that keeps the sidecars consistent across a crash. The
+historical initializers are untouched by this — journaling is opt-in.
 
 ## Data Flow
 

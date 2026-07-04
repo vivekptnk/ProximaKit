@@ -779,10 +779,12 @@ post-change tree, same machine:
 | After (Stage 2, `OriginalsStore.resident`) | 0.1594 | 0.1536 | 0.1645 |
 
 **Machine:** Apple M4 Max, 36 GB, macOS 26.0.1, Swift 6.2, release. The After
-median is **−3.6%** (marginally faster; the enum-`.resident`/array-subscript
-indirection is measured free against the vDSP distance, as the ADR predicted),
-with heavily overlapping spreads — **no regression**, well inside the ±2%
-bail-out band.
+median is **~3.6% faster** (the enum-`.resident`/array-subscript indirection
+is measured free against the vDSP distance, as the ADR predicted); a
+re-measurement puts the true delta closer to 0–2%, with the sign varying
+run-to-run — statistical noise at this scale, not a confirmed directional
+effect. Spreads heavily overlap and there is **no regression**; the ±2%
+bail-out bound constrains regressions only and was never approached.
 
 ### Measured — paged memory acceptance (criterion 1)
 

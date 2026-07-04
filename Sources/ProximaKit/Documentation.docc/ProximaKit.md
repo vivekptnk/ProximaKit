@@ -74,6 +74,16 @@ let results = await index.search(query: queryVector, k: 10)
 - ``ProductQuantizerError``
 - ``QuantizedIndexError``
 
+### Paged Originals for Quantized Reranking (ADR-014, opt-in)
+
+- ``QuantizedHNSWIndex/load(from:mode:)``
+- ``QuantizedHNSWIndex/save(to:layout:)``
+- ``QuantizedHNSWIndex/upgradeToV3(at:)``
+- ``PQHWOpenMode``
+- ``PQHWSaveLayout``
+- ``QuantizedHNSWIndex/originalsArePaged``
+- ``QuantizedHNSWIndex/mappedOriginalStorageBytes``
+
 ### Document Stores
 
 - ``VectorStore``
@@ -102,6 +112,7 @@ let results = await index.search(query: queryVector, k: 10)
 - ``BruteForceSnapshot``
 - ``SparseIndexSnapshot``
 - ``DistanceMetricType``
+- ``PersistenceEngine/upgradeToV3(at:)``
 
 ### Streaming Persistence (WAL, opt-in)
 
@@ -113,5 +124,15 @@ let results = await index.search(query: queryVector, k: 10)
 - ``HNSWIndex/journalByteCount``
 - ``HNSWIndex/journalRecordCount``
 - ``HNSWIndex/currentGeneration``
+- ``HNSWIndex/liveEntries()``
 - ``WALDurability``
 - ``WALCheckpointPolicy``
+
+### Store Journaling (opt-in)
+
+- ``VectorStore/open(name:embedder:storageDirectory:metric:config:durability:)``
+- ``VectorStore/checkpoint()``
+- ``VectorStore/needsCheckpoint(policy:)``
+- ``HybridVectorStore/open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:)``
+- ``HybridVectorStore/checkpoint()``
+- ``HybridVectorStore/needsCheckpoint(policy:)``

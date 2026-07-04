@@ -315,7 +315,7 @@ All numbers below are **asserted test thresholds**, not point measurements — r
 
 The observed bands are documented in the test sources next to the thresholds; the asserted bounds sit deliberately below them with margin. No rerank latency figures are published — reranking adds O(`rerankDepth` · d) exact distance computations per query, and that cost has not been measured under the [ADR-005](adr/ADR-005-benchmark-methodology.md) harness yet.
 
-**Memory honesty:** retaining originals pays the full `4·d` bytes/vector again on top of the codes, so a reranking index has *no* compression win — `memorySavingsRatio` drops below 1.0 and `originalStorageBytes` reports the cost. Reranking trades PQ's 32× memory story for recall (ADR-012).
+**Memory honesty:** retaining originals **resident** pays the full `4·d` bytes/vector again on top of the codes, so a resident reranking index has *no* compression win — `memorySavingsRatio` drops below 1.0 and `originalStorageBytes` reports the cost. Resident reranking trades PQ's 32× memory story for recall (ADR-012). **This is no longer the whole story:** ADR-014 adds an opt-in `.paged` open that serves the same retained originals from a read-only file mapping instead of the resident heap, restoring the 32× story on the vector payload while keeping rerank exact — see "Paged Originals" below for the measured numbers.
 
 ### PQ Training Determinism
 
@@ -326,6 +326,49 @@ The observed bands are documented in the test sources next to the thresholds; th
 ```bash
 swift test --filter PQRerankTests
 swift test --filter PQDeterminismTests
+```
+
+---
+
+## Paged Originals — Memory and Migration
+
+**What it measures:** whether the opt-in `.paged` open of a retaining `QuantizedHNSWIndex` ([ADR-014](adr/ADR-014-paged-originals.md)) actually keeps the retained originals off the resident heap, whether it costs any resident-mode search regression, and what a v2→v3 migration costs. The design and the addenda these numbers are copied from verbatim live in the ADR.
+
+### Resident-mode regression (bail-out gate) — measured
+
+Threading `OriginalsStore` through the single rerank read site must not regress the existing resident path. A/B on the same public-API benchmark (`ResidentRerankBenchTests`: 8K × 128d retained, k=10, rerankDepth=40, 9 reps × 400 queries), pre-change tree (HEAD `5057152`) vs. post-change tree, same machine:
+
+| Tree | median ms/query | p10 | p90 |
+|------|-----------------|-----|-----|
+| Before (resident `[Vector]?`) | 0.1654 | 0.1478 | 0.1687 |
+| After (`OriginalsStore.resident`) | 0.1594 | 0.1536 | 0.1645 |
+
+**Machine:** Apple M4 Max, 36 GB, macOS 26.0.1, Swift 6.2, release. The "after" median is **~3.6% faster** — an improvement, not a regression — though re-measurement puts the true delta closer to 0–2% faster with the sign varying run-to-run (statistical noise at this scale). The ±2% bail-out bound applies to regressions only and was never approached.
+
+### Paged memory acceptance — measured
+
+`PagedOriginalsMemoryTests` (env-gated `PROXIMA_PAGED_BENCH=1`, release-only, CI-excluded — same gate as `PagedVectorMemoryTests`), 100,000 × 384d retaining `PQHW` v3 base, originals payload = 146.5 MB, `phys_footprint` (`task_vm_info`) deltas opening the **same** base `.paged` vs. `.resident`:
+
+| Measurement | Value |
+|---|---|
+| Originals payload (theoretical) | 146.5 MB |
+| Paged open delta | 8.0 MB |
+| Paged open + 50 warm reranks | 8.2 MB |
+| Resident open delta | 43.1 MB |
+
+**Machine:** Apple M4 Max, 36 GB, macOS 26.0.1, Swift 6.2, release. The paged open costs **8.0 MB for a 146.5 MB payload (18× less)** and stays essentially flat (8.2 MB) after 50 reranked queries — the originals are demonstrably not resident, and warm faults are a bounded working set, not the corpus. The resident open of the same base costs **5.4× more** (43.1 MB).
+
+**Compressor-reality note (why the gate isn't "≥60% of payload recovered"):** on macOS 26, the memory compressor counts freshly-copied anonymous originals pages at their *compressed* size, so `phys_footprint` captures only **~30%** of the theoretical payload on the resident side — a ratio stable across fixture sizes (12.8 MB of 39 MB at 40K × 256d; 43.1 MB of 146.5 MB at 100K × 384d) — an OS accounting reality, not a residency leak. The acceptance test therefore gates on ratios derived from this measured baseline, with margin, rather than an absolute payload-fraction target: paged open `< payload / 8` (originals demonstrably not resident); resident `> 2.5×` paged (resident pays materially more); resident − paged `> payload / 8` (a substantial slice recovered); warm-rerank delta bounded by `payload / 4`.
+
+### Migration cost — arithmetic (unmeasured)
+
+Neither `PersistenceEngine.upgradeToV3(at:)` (`.pxkt`) nor `QuantizedHNSWIndex.upgradeToV3(at:)` (`PQHW`) decodes the graph or materializes a single vector — both are a pure section-copy: read the source once, copy its sections byte-for-byte into a new in-memory image (plus ≤16,383 B of alignment padding before the pageable section, ADR-014 arithmetic), write that image to a temp file, then re-read the whole temp file back and compare every section against the source before the atomic replace (the full-checksum verification gate). That fixed I/O shape — one full read of the source, one full write of the temp file, one full read-back of the temp file for verification — is **≈3× the source file size in I/O**, arithmetic against the upgrader's code shape, not a run: no migration wall-clock latency has been measured under the [ADR-005](adr/ADR-005-benchmark-methodology.md) harness for either family. Do not read the multiplier above as a throughput or latency claim.
+
+**Run the paged-originals benchmarks (both env-gated, release only):**
+
+```bash
+PROXIMA_PAGED_BENCH=1 swift test -c release --filter PagedOriginalsMemoryTests
+PROXIMA_RESIDENT_BENCH=1 swift test -c release --filter ResidentRerankBenchTests
 ```
 
 ---
