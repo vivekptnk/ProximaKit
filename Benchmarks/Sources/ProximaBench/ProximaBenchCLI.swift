@@ -32,6 +32,8 @@ struct ProximaBenchCLI {
                 try await runSearchProviderBench(args: Array(args.dropFirst(2)))
             case "paged-access-bench":
                 try await runPagedAccessBench(args: Array(args.dropFirst(2)))
+            case "embed-bench":
+                try await runEmbedBench(args: Array(args.dropFirst(2)))
             case "migrate":
                 try MigrateCommand.run(args: Array(args.dropFirst(2)))
             case "-h", "--help", "help":
@@ -174,6 +176,24 @@ struct ProximaBenchCLI {
         try await PagedAccessBench.run(opts)
     }
 
+    // MARK: - embed-bench (ANE offload decision probe)
+
+    static func runEmbedBench(args: [String]) async throws {
+        let f = Flags(args)
+        let opts = EmbedBench.Options(
+            modelPath: f.required("--model"),
+            batchSize: f.int("--batch-size") ?? 512,
+            reps: f.int("--reps") ?? 5,
+            warmup: f.int("--warmup") ?? 1,
+            seed: UInt64(f.int("--seed") ?? 42),
+            thresholdSpeedup: f.double("--threshold-speedup") ?? 1.5,
+            libraryVersion: f.string("--version") ?? "1.5.0-dev",
+            notes: f.string("--notes") ?? "",
+            outputPath: f.required("--out")
+        )
+        try await EmbedBench.run(opts)
+    }
+
     /// Parses a comma-separated list of ints (e.g. "384,768").
     static func intList(_ s: String) -> [Int] {
         s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
@@ -235,6 +255,15 @@ struct ProximaBenchCLI {
                 [--threshold-percent 5.0] [--reuse-fixtures 0]
                 Measures paged copy-on-access vs a local unsafe mmap read,
                 warm resident-vs-paged HNSW search, and warm PQ rerank.
+
+          ProximaBench embed-bench            (ANE Core ML decision probe)
+                --model PATH --out PATH
+                [--batch-size 512] [--reps 5] [--warmup 1]
+                [--seed 42] [--threshold-speedup 1.5]
+                [--version 1.5.0-dev] [--notes TEXT]
+                Compares Core ML embedding throughput for cpuOnly, cpuAndGPU,
+                and cpuAndNeuralEngine. Writes a NEEDS-MODEL report if the
+                requested local model path is absent or unusable.
 
         The hnsw / ground-truth subcommands emit documents following
         Benchmarks/JSON_SCHEMA.md.
