@@ -41,16 +41,21 @@ final class PQHWFormatV3CorruptionTests: XCTestCase {
     }
 
     private func makeTinyRetainedIndex() -> QuantizedHNSWIndex {
+        makeTinyRetainedIndexWithIDs().index
+    }
+
+    private func makeTinyRetainedIndexWithIDs() -> (index: QuantizedHNSWIndex, ids: [UUID]) {
         let config = PQConfiguration(subspaceCount: 2)
         let codebook = [Float](repeating: 0.5, count: 256 * 2)
         let quantizer = ProductQuantizer(dimension: 4, config: config, codebooks: [codebook, codebook])
         let ids = [UUID(), UUID()]
-        return QuantizedHNSWIndex(
+        let index = QuantizedHNSWIndex(
             dimension: 4, hnswConfig: HNSWConfiguration(m: 4, efConstruction: 20, efSearch: 10),
             quantizer: quantizer, layers: [[[1], [0]]], nodeLevels: [0, 0],
             entryPointNode: 0, maxLevel: 0, codes: [[1, 2], [3, 4]],
             nodeToUUID: ids, uuidToNode: [ids[0]: 0, ids[1]: 1], metadata: [nil, nil],
             originals: [Vector([1, 2, 3, 4]), Vector([5, 6, 7, 8])])
+        return (index, ids)
     }
 
     /// A padded v3, flag-1 file on disk.
@@ -128,6 +133,35 @@ final class PQHWFormatV3CorruptionTests: XCTestCase {
         patch64(&data, at: sectionLengthPos(data.count, 6), 0)
         try data.write(to: url)
         assertThrows(url, "flag 1 but empty originals entry")
+    }
+
+    func testEmptyOriginalsEntryWithNonzeroOffsetThrows() async throws {
+        let url = tempURL(); defer { cleanup(url) }
+        let (idx, ids) = makeTinyRetainedIndexWithIDs()
+        for id in ids {
+            let removed = await idx.remove(id: id)
+            XCTAssertTrue(removed, "fixture removes every live node")
+        }
+        try await idx.save(to: url, layout: .pagedV3)
+        var data = try Data(contentsOf: url)
+        XCTAssertEqual(data.loadLE(UInt32.self, at: 4), 3, "fixture must be v3")
+        XCTAssertEqual(data.loadLE(UInt32.self, at: 48), 1, "fixture must be retaining")
+        XCTAssertEqual(data.loadLE(UInt64.self, at: sectionOffsetPos(data.count, 6)), 0)
+        XCTAssertEqual(data.loadLE(UInt64.self, at: sectionLengthPos(data.count, 6)), 0)
+
+        let bodyEnd = UInt64(data.count - trailerSize)
+        XCTAssertGreaterThan(bodyEnd, 0)
+        patch64(&data, at: sectionOffsetPos(data.count, 6), bodyEnd)
+        try data.write(to: url)
+
+        XCTAssertThrowsError(try QuantizedHNSWIndex.load(from: url),
+                             "zero-length originals at nonzero offset") { error in
+            guard case PersistenceError.corruptedData(let detail) = error else {
+                return XCTFail("expected PersistenceError.corruptedData, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("empty originals section must have offset 0"),
+                          "unexpected error detail: \(detail)")
+        }
     }
 
     // ── (6b) flag 0 but nonzero originals entry ──────────────────────

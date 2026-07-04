@@ -114,7 +114,8 @@ public enum PQHWOpenMode: Sendable {
     /// reformats an existing originals section; it cannot add originals that
     /// were never retained). Restores the 32× compression story on the vector
     /// payload while keeping rerank exact; the post-beam rerank reads are
-    /// bit-identical to `.resident`.
+    /// bit-identical to `.resident`. A retaining base with zero live nodes opens
+    /// successfully as an empty paged originals store.
     case paged
 }
 
@@ -210,13 +211,14 @@ extension QuantizedHNSWIndex {
     /// Saves this quantized index in the requested on-disk `layout` (ADR-014).
     ///
     /// - `.resident` is byte-identical to ``save(to:)`` (v2).
-    /// - `.pagedV3` stamps v3 with the originals section 16 KiB-aligned and a
-    ///   section-table trailer WHEN originals are retained; with no originals it
-    ///   falls back to v2 (nothing to page). This fallback is silent — requesting
-    ///   `.pagedV3` on a non-retaining index writes v2 with no error or signal at
-    ///   the call site; check the written file's version byte, or reopen and
-    ///   check `originalsArePaged` / `retainsOriginals`, if the distinction
-    ///   matters to your caller.
+    /// - `.pagedV3` stamps v3 with a section-table trailer WHEN originals are
+    ///   retained. Non-empty originals are 16 KiB-aligned; retaining indexes with
+    ///   zero live nodes use a flag-1 empty `(0, 0)` originals entry. With no
+    ///   retained originals it falls back to v2 (nothing to page). This fallback
+    ///   is silent — requesting `.pagedV3` on a non-retaining index writes v2 with
+    ///   no error or signal at the call site; check the written file's version
+    ///   byte, or reopen and check `originalsArePaged` / `retainsOriginals`, if
+    ///   the distinction matters to your caller.
     public func save(to url: URL, layout: PQHWSaveLayout) throws {
         switch layout {
         case .resident:
@@ -321,14 +323,18 @@ extension QuantizedHNSWIndex {
         if let originals = live.originals {
             assert(originals.count == nodeCount,
                    "compacted originals must stay slot-aligned with codes")
-            if writeVersion == qhWriteVersionV3 && padOriginals {
-                padToAlignment(&data, alignment: qhOriginalsAlignment)
+            if originals.isEmpty {
+                sections.append((0, 0))
+            } else {
+                if writeVersion == qhWriteVersionV3 && padOriginals {
+                    padToAlignment(&data, alignment: qhOriginalsAlignment)
+                }
+                let start = data.count
+                for vector in originals {
+                    vector.components.withUnsafeBytes { data.append(contentsOf: $0) }
+                }
+                sections.append((start, data.count - start))
             }
-            let start = data.count
-            for vector in originals {
-                vector.components.withUnsafeBytes { data.append(contentsOf: $0) }
-            }
-            sections.append((start, data.count - start))
         } else {
             sections.append((0, 0))   // originals entry is (0, 0) when flag == 0
         }
@@ -371,6 +377,8 @@ extension QuantizedHNSWIndex {
     /// - Throws: for `.paged`, a typed `PersistenceError` (never a trap) when the
     ///   base is not a v3 file (upgrade it with ``upgradeToV3(at:)``), retains no
     ///   originals (nothing to page), or has an unaligned originals section.
+    ///   A flag-1 v3 base with zero nodes opens successfully with an empty
+    ///   mapped originals store.
     public static func load(from url: URL, mode: PQHWOpenMode) throws -> QuantizedHNSWIndex {
         switch mode {
         case .resident:
@@ -738,10 +746,6 @@ extension QuantizedHNSWIndex {
         if let trailer {
             let entry = trailer.sections[qhOriginalsSectionIndex]
             if hasOriginals {
-                guard entry.length > 0 else {
-                    throw PersistenceError.corruptedData(
-                        "Quantized index originals flag is 1 but the trailer originals entry is empty")
-                }
                 originalsReadOffset = entry.offset
             } else {
                 guard entry.offset == 0, entry.length == 0 else {
@@ -880,10 +884,12 @@ extension QuantizedHNSWIndex {
         // Padding + originals (iff retained).
         var originalsEntry = (offset: 0, length: 0)
         if layout.hasOriginals {
-            padToAlignment(&out, alignment: qhOriginalsAlignment)
-            let start = out.count
-            out.append(source[layout.originals.offset..<layout.originals.end])
-            originalsEntry = (offset: start, length: layout.originals.length)
+            if layout.originals.length > 0 {
+                padToAlignment(&out, alignment: qhOriginalsAlignment)
+                let start = out.count
+                out.append(source[layout.originals.offset..<layout.originals.end])
+                originalsEntry = (offset: start, length: layout.originals.length)
+            }
         }
 
         // Trailer with recomputed offsets (body offsets shift by the header —
@@ -1016,8 +1022,9 @@ struct PQHWTrailer {
                     "PQHW v3 section \(i) is not contiguous with section \(i - 1) (overlap/gap/non-monotonic)")
             }
         }
-        // Originals (index 6): either (0, 0) — no originals — or a section that
-        // begins at or after the metadata end.
+        // Originals (index 6): either (0, 0) for an empty/absent payload, or a
+        // section that begins at or after the metadata end. The header flag and
+        // expected byte count decide whether an empty payload is legal.
         let originals = sections[qhOriginalsSectionIndex]
         let metaEnd = sections[5].offset + sections[5].length
         if originals.length == 0 {

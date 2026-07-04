@@ -25,11 +25,16 @@ final class PQHWFormatV3Tests: XCTestCase {
 
     /// Deterministic tiny retained index (dim 4, M 2, 2 nodes) — exact offsets.
     private func makeTinyRetainedIndex(retained: Bool = true) -> QuantizedHNSWIndex {
+        makeTinyRetainedIndexWithIDs(retained: retained).index
+    }
+
+    private func makeTinyRetainedIndexWithIDs(retained: Bool = true)
+        -> (index: QuantizedHNSWIndex, ids: [UUID]) {
         let config = PQConfiguration(subspaceCount: 2)
         let codebook = [Float](repeating: 0.5, count: 256 * 2)
         let quantizer = ProductQuantizer(dimension: 4, config: config, codebooks: [codebook, codebook])
         let ids = [UUID(), UUID()]
-        return QuantizedHNSWIndex(
+        let index = QuantizedHNSWIndex(
             dimension: 4,
             hnswConfig: HNSWConfiguration(m: 4, efConstruction: 20, efSearch: 10),
             quantizer: quantizer,
@@ -42,6 +47,7 @@ final class PQHWFormatV3Tests: XCTestCase {
             uuidToNode: [ids[0]: 0, ids[1]: 1],
             metadata: [nil, nil],
             originals: retained ? [Vector([1, 2, 3, 4]), Vector([5, 6, 7, 8])] : nil)
+        return (index, ids)
     }
 
     private func clustered(count: Int, dim: Int, clusters: Int, seed: UInt64)
@@ -132,6 +138,79 @@ final class PQHWFormatV3Tests: XCTestCase {
         try await idx.save(to: url, layout: .pagedV3)
         XCTAssertEqual(try Data(contentsOf: url).loadLE(UInt32.self, at: 4), 2,
                        "no originals to page ⇒ .pagedV3 writes v2")
+    }
+
+    func testPagedV3EmptyRetainingRoundTripsResidentAndPaged() async throws {
+        let (idx, ids) = makeTinyRetainedIndexWithIDs()
+        for id in ids {
+            let removed = await idx.remove(id: id)
+            XCTAssertTrue(removed, "fixture removes every live node")
+        }
+        let url = tempURL(); defer { cleanup(url) }
+        try await idx.save(to: url, layout: .pagedV3)
+        let data = try Data(contentsOf: url)
+
+        XCTAssertEqual(data.loadLE(UInt32.self, at: 4), 3, "retaining empty index still stamps v3")
+        XCTAssertEqual(data.loadLE(UInt32.self, at: 48), 1, "retaining semantics stay truthful")
+        let trailerSize = 4 + 7 * 16 + 8 + 4
+        let ts = data.count - trailerSize
+        XCTAssertEqual(Int(data.loadLE(UInt64.self, at: ts + 4 + 6 * 16)), 0)
+        XCTAssertEqual(Int(data.loadLE(UInt64.self, at: ts + 4 + 6 * 16 + 8)), 0)
+
+        let resident = try QuantizedHNSWIndex.load(from: url, mode: .resident)
+        let residentCount = await resident.count
+        let residentRetains = await resident.retainsOriginals
+        let residentPaged = await resident.originalsArePaged
+        XCTAssertEqual(residentCount, 0)
+        XCTAssertTrue(residentRetains)
+        XCTAssertFalse(residentPaged)
+
+        let paged = try QuantizedHNSWIndex.load(from: url, mode: .paged)
+        let pagedCount = await paged.count
+        let pagedRetains = await paged.retainsOriginals
+        let pagedIsPaged = await paged.originalsArePaged
+        XCTAssertEqual(pagedCount, 0)
+        XCTAssertTrue(pagedRetains)
+        XCTAssertTrue(pagedIsPaged)
+        let hits = await paged.search(query: Vector([1, 2, 3, 4]), k: 5)
+        XCTAssertTrue(hits.isEmpty, "empty paged open is searchable and returns no hits")
+    }
+
+    func testUpgradeToV3AcceptsEmptyRetainingV2Base() async throws {
+        let (idx, ids) = makeTinyRetainedIndexWithIDs()
+        for id in ids {
+            let removed = await idx.remove(id: id)
+            XCTAssertTrue(removed, "fixture removes every live node")
+        }
+        let url = tempURL(); defer { cleanup(url) }
+        try await idx.save(to: url)
+
+        let source = try Data(contentsOf: url)
+        XCTAssertEqual(source.loadLE(UInt32.self, at: 4), 2)
+        XCTAssertEqual(source.loadLE(UInt32.self, at: 48), 1, "v2 base is retaining")
+
+        try QuantizedHNSWIndex.upgradeToV3(at: url)
+        let upgraded = try Data(contentsOf: url)
+        XCTAssertEqual(upgraded.loadLE(UInt32.self, at: 4), 3)
+        XCTAssertEqual(upgraded.loadLE(UInt32.self, at: 48), 1)
+        let trailerSize = 4 + 7 * 16 + 8 + 4
+        let ts = upgraded.count - trailerSize
+        XCTAssertEqual(Int(upgraded.loadLE(UInt64.self, at: ts + 4 + 6 * 16)), 0)
+        XCTAssertEqual(Int(upgraded.loadLE(UInt64.self, at: ts + 4 + 6 * 16 + 8)), 0)
+
+        let resident = try QuantizedHNSWIndex.load(from: url)
+        let residentCount = await resident.count
+        let residentRetains = await resident.retainsOriginals
+        XCTAssertEqual(residentCount, 0)
+        XCTAssertTrue(residentRetains)
+
+        let paged = try QuantizedHNSWIndex.load(from: url, mode: .paged)
+        let pagedCount = await paged.count
+        let pagedRetains = await paged.retainsOriginals
+        let pagedIsPaged = await paged.originalsArePaged
+        XCTAssertEqual(pagedCount, 0)
+        XCTAssertTrue(pagedRetains)
+        XCTAssertTrue(pagedIsPaged)
     }
 
     // ── v3 loads resident, rerank intact ─────────────────────────────
