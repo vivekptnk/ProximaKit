@@ -127,11 +127,20 @@ public actor HybridVectorStore {
     private let checkpointAutomatically: WALCheckpointPolicy?
 
     /// Dense base snapshot path (`index.pxkt`).
-    private var denseURL: URL { storageURL.appendingPathComponent("index.pxkt") }
+    private var denseURL: URL {
+        storageURL.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.index)
+    }
     /// Dense write-ahead-log sidecar path (`index.pxwal`).
-    private var walURL: URL { storageURL.appendingPathComponent("index.pxwal") }
+    private var walURL: URL {
+        storageURL.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.writeAheadLog)
+    }
     /// Sparse leg snapshot path (`index.pxbm`).
-    private var sparseURL: URL { storageURL.appendingPathComponent("index.pxbm") }
+    private var sparseURL: URL {
+        storageURL.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.sparseIndex)
+    }
 
     // MARK: - Initialization
 
@@ -173,8 +182,10 @@ public actor HybridVectorStore {
         let storeDir = storageDirectory.appendingPathComponent(name)
         self.storageURL = storeDir
 
-        let denseURL = storeDir.appendingPathComponent("index.pxkt")
-        let sparseURL = storeDir.appendingPathComponent("index.pxbm")
+        let denseURL = storeDir.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.index)
+        let sparseURL = storeDir.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.sparseIndex)
 
         let dense: HNSWIndex
         if FileManager.default.fileExists(atPath: denseURL.path) {
@@ -339,8 +350,10 @@ public actor HybridVectorStore {
         dense denseResidency: IndexResidency = .resident
     ) async throws -> HybridVectorStore {
         let storeDir = storageDirectory.appendingPathComponent(name)
-        let denseURL = storeDir.appendingPathComponent("index.pxkt")
-        let walURL = storeDir.appendingPathComponent("index.pxwal")
+        let denseURL = storeDir.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.index)
+        let walURL = storeDir.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.writeAheadLog)
 
         let dense: HNSWIndex
         if FileManager.default.fileExists(atPath: denseURL.path) {
@@ -578,8 +591,8 @@ public actor HybridVectorStore {
             try fm.createDirectory(at: storageURL, withIntermediateDirectories: true)
         }
 
-        try await _dense.save(to: storageURL.appendingPathComponent("index.pxkt"))
-        try await _sparse.save(to: storageURL.appendingPathComponent("index.pxbm"))
+        try await _dense.save(to: denseURL)
+        try await _sparse.save(to: sparseURL)
 
         // `.atomic` so a crash mid-write cannot leave a truncated/corrupt
         // hybrid.json behind.

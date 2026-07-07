@@ -14,4 +14,16 @@
 public enum ProximaKit {
     /// The current library version.
     public static let version = "1.8.0"
+
+    /// Public file-extension constants for ProximaKit persistence artifacts.
+    public enum FileExtension {
+        /// HNSW and brute-force snapshot files written and read by `PersistenceEngine`.
+        public static let index = "pxkt"
+
+        /// HNSW write-ahead-log sidecar files written and read by `WALJournal`.
+        public static let writeAheadLog = "pxwal"
+
+        /// BM25 sparse-index snapshot files written and read by `SparseIndexPersistence`.
+        public static let sparseIndex = "pxbm"
+    }
 }

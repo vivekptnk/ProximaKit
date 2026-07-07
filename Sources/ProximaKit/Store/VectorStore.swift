@@ -111,10 +111,16 @@ public actor VectorStore {
     private let checkpointAutomatically: WALCheckpointPolicy?
 
     /// The base snapshot path (`index.pxkt`) inside the store directory.
-    private var indexURL: URL { storageURL.appendingPathComponent("index.pxkt") }
+    private var indexURL: URL {
+        storageURL.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.index)
+    }
 
     /// The write-ahead-log sidecar path (`index.pxwal`) inside the store directory.
-    private var walURL: URL { storageURL.appendingPathComponent("index.pxwal") }
+    private var walURL: URL {
+        storageURL.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.writeAheadLog)
+    }
 
     // MARK: - Initialization
 
@@ -158,7 +164,8 @@ public actor VectorStore {
         let storeDir = storageDirectory.appendingPathComponent(name)
         self.storageURL = storeDir
 
-        let indexURL = storeDir.appendingPathComponent("index.pxkt")
+        let indexURL = storeDir.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.index)
 
         if FileManager.default.fileExists(atPath: indexURL.path) {
             self.index = try HNSWIndex.load(from: indexURL)
@@ -306,8 +313,10 @@ public actor VectorStore {
         dense: IndexResidency = .resident
     ) async throws -> VectorStore {
         let storeDir = storageDirectory.appendingPathComponent(name)
-        let indexURL = storeDir.appendingPathComponent("index.pxkt")
-        let walURL = storeDir.appendingPathComponent("index.pxwal")
+        let indexURL = storeDir.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.index)
+        let walURL = storeDir.appendingPathComponent("index")
+            .appendingPathExtension(ProximaKit.FileExtension.writeAheadLog)
 
         let index: HNSWIndex
         if FileManager.default.fileExists(atPath: indexURL.path) {
@@ -571,7 +580,6 @@ public actor VectorStore {
         }
 
         // Save the HNSW index.
-        let indexURL = storageURL.appendingPathComponent("index.pxkt")
         try await index.save(to: indexURL)
 
         // Save the document map for fast reload. `.atomic` so a crash

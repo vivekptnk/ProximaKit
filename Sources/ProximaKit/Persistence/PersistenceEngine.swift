@@ -695,7 +695,7 @@ public enum PersistenceEngine {
         guard let image = try buildPaddedV3Image(from: source) else {
             return   // already a padded v3 base
         }
-        let tmp = url.appendingPathExtension("pxktv3tmp")
+        let tmp = url.appendingPathExtension("\(ProximaKit.FileExtension.index)v3tmp")
         defer { try? FileManager.default.removeItem(at: tmp) }
         // Filesystem errors (disk full, permission denied) are wrapped in a typed
         // PersistenceError preserving the underlying cause; the source is left

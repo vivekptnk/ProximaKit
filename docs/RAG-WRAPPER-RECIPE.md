@@ -4,7 +4,7 @@
 
 ProximaKit ships two layers you can build RAG on. `VectorStore` / `HybridVectorStore` (see [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) → Store Layer) manage the document→chunk map for you and are the right default when you want text in, answers out. But plenty of real consumers already own a chunking pipeline — sentence splitters, overlap windows, per-source provenance, their own IDs — and want to drop embeddings straight into the graph and get their own records back on search. **Wrapping `HNSWIndex` directly is a first-class path, not an advanced hack.** This recipe is how you do it without giving up crash safety.
 
-The mechanism is proven in this repository twice over: it is the same per-vector-metadata pattern ProximaKit's own store layer is built on (see the derivation design in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)), and the full wrapper lifecycle — including crash recovery of chunk records through the WAL — is CI-verified by the recipe's companion test ([`CustomRAGWrapperRecipeTests`](../Tests/ProximaKitTests/CustomRAGWrapperRecipeTests.swift)). It is also the integration shape ProximaKit's agent-memory consumer ([ADR-015](adr/ADR-015-agent-memory-integration.md)) is adopting.
+The mechanism is proven in this repository twice over: it is the same per-vector-metadata pattern ProximaKit's own store layer is built on (see the derivation design in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)), and the full wrapper lifecycle — including crash recovery of chunk records through the WAL — is CI-verified by the recipe's companion test ([`CustomRAGWrapperRecipeTests`](../Tests/ProximaKitTests/CustomRAGWrapperRecipeTests.swift)). It is also shipping in practice: tinybrain — the agent-memory consumer [ADR-015](adr/ADR-015-agent-memory-integration.md) was designed around — persists its RAG index exactly this way (in-index chunk metadata, fingerprint-keyed cache acceptance) on its main branch.
 
 Every snippet below is extracted or adapted from a compiled, CI-verified template: [`Tests/ProximaKitTests/CustomRAGWrapperRecipeTests.swift`](../Tests/ProximaKitTests/CustomRAGWrapperRecipeTests.swift) — the `RecipeRAGIndex` actor and its four tests (snapshot round-trip, journaled WAL recovery, checkpoint-then-reopen, torn-WAL-tail prefix recovery). If a line here compiles in your head but not on your machine, the test file is the source of truth.
 
@@ -134,6 +134,10 @@ actor RecipeRAGIndex {
 
 Three levels, in increasing order of durability guarantee and moving-parts. Pick the lowest one that meets your needs.
 
+### Choosing static vs journaled persistence
+
+The decision rule, before the details below: a **static or rebuilt-rarely corpus wants plain `save`/`load`** (level 1) — one file, no lifecycle overhead; a **corpus that grows or mutates incrementally wants journaled `open` + a checkpoint policy** (level 2). The WAL earns its keep only when there is a delta between saves to protect: its entire value is turning incremental writes into O(change) appends instead of O(corpus) rewrites, and keeping that delta crash-safe until the next fold. A corpus that is built once and never mutated again has no inter-save delta — so a journal buys you a base file *plus* a `.pxwal` sidecar *plus* checkpoint bookkeeping (generation/dimension/metric cross-checks on open, a `needsCheckpoint()` policy, a checkpoint cadence to plan) for **zero durability or cost win over the single plain `save` you were always going to do**. Build-once, load-many: level 1. Grow-over-time: level 2. (This is the rule one consumer integration validated in practice.)
+
 ### 1. Plain save / load — one call each
 
 The default persistence path is untouched by any of the journaling machinery: `save(to:)` serializes vectors *and* their metadata into one atomically-rewritten `.pxkt` file; `load(from:)` restores both.
@@ -196,6 +200,41 @@ The template wrapper defaults to `.everyRecord` (strictest per-append flush); th
 ### Crash recovery is prefix-tolerant, not silently lossy
 
 WAL records are CRC-framed. On reopen, the decoder stops at the first torn or bit-damaged record and returns the **longest intact prefix** — a tail torn off by a crash mid-append is *expected*, recovers cleanly, and never throws. Only a damaged WAL *header* (or a stale generation) throws a typed error. The CI test `testTornWALTailRecoversLongestValidChunkMetadataPrefix` proves both halves: it truncates the WAL mid-record and asserts exactly the pre-truncation chunks recover; then it truncates below the header and asserts a typed `PersistenceError.fileTooSmall` — never a trap, never silent corruption. Your recovery code should expect "some suffix of my most recent chunks may be gone" and never "the file is unreadable so I lost everything".
+
+### Cache acceptance: validating a loaded index
+
+A successful `load(from:)` or `open(baseURL:walURL:...)` proves only that the file *parsed* — it does not prove the index is the one *this* run wants. A cache left by an earlier build can carry a different embedding dimension, a different vector count, or records your current `ChunkRecord` can no longer decode. **Before you trust a loaded index, validate it against what this run expects, and rebuild from source on any mismatch.** Three checks:
+
+- **(a) Dimension.** `index.dimension == expectedDimension`. `dimension` is a `nonisolated let` on the actor (`HNSWIndex.swift`), so it reads with **no `await`** even though `HNSWIndex` is an actor.
+- **(b) Live count.** `await index.liveCount == expectedCount`. `liveCount` *is* actor-isolated, so it takes `await` — and it counts live nodes only, unlike `count`, which still includes tombstones.
+- **(c) Every live record decodes.** Not just the records a query happens to surface — *every* id: `for (id, metadata) in await index.liveEntries()`, decoding each and treating missing or undecodable metadata as a validation failure. `liveEntries()` (`await` — actor-isolated) is the right hook here precisely because it is a **complete enumeration of every live `(id, metadata)` pair**, not the top-k neighbours of some probe query; sampling via `search` would leave the long tail of never-retrieved records unchecked. It is the same enumeration `VectorStore.open` leans on to rebuild its sidecar (Strategy B, below).
+
+```swift
+func accepts(_ index: HNSWIndex, dimension: Int, count: Int) async -> Bool {
+    guard index.dimension == dimension else { return false }        // nonisolated — no await
+    guard await index.liveCount == count else { return false }      // actor-isolated — await
+    for (_, metadata) in await index.liveEntries() {                // every live id, not top-k
+        guard let metadata,
+              (try? JSONDecoder().decode(ChunkRecord.self, from: metadata)) != nil
+        else { return false }
+    }
+    return true
+}
+
+func loadOrRebuild(url: URL, dimension: Int, count: Int,
+                   rebuild: () async throws -> HNSWIndex) async throws -> HNSWIndex {
+    if let index = try? HNSWIndex.load(from: url),                  // a throw is treated as a miss
+       await accepts(index, dimension: dimension, count: count) {
+        return index
+    }
+    try? FileManager.default.removeItem(at: url)                    // drop the cache…
+    return try await rebuild()                                      // …and rebuild from source
+}
+```
+
+Delete-and-rebuild is a **safe, total fallback for every failure mode**, not only the three checks above — because, as established under [Crash recovery is prefix-tolerant, not silently lossy](#crash-recovery-is-prefix-tolerant-not-silently-lossy), a corrupt or truncated load throws a typed `PersistenceError` rather than trapping or returning a half-decoded index. The `try?` on `load` folds that throw into the same *miss → rebuild* path as a failed check, so no failure mode slips past both the checks and the throw: whatever is wrong with the cache, you delete it and rebuild.
+
+*A pattern one consumer integration uses:* name the cache file after a hash of everything that would invalidate it — embedder identity, dimension, chunking config, corpus identity — e.g. `"\(fingerprint).pxkt"` where `fingerprint` is a hash over those four inputs. Any change to those inputs becomes a *different filename*, so a stale cache is never opened at all; the acceptance checks above then only have to catch corruption of a cache that already claims to match. It is a cheap first filter, not a full answer to cache naming and versioning.
 
 ---
 

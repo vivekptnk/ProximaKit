@@ -47,8 +47,10 @@ guard args.count == 6,
     exit(2)
 }
 let dir = URL(fileURLWithPath: args[1])
-let base = dir.appendingPathComponent("index.pxkt")
-let wal = dir.appendingPathComponent("index.pxwal")
+let base = dir.appendingPathComponent("index")
+    .appendingPathExtension(ProximaKit.FileExtension.index)
+let wal = dir.appendingPathComponent("index")
+    .appendingPathExtension(ProximaKit.FileExtension.writeAheadLog)
 let committed = dir.appendingPathComponent("committed.txt")
 
 let config = HNSWConfiguration(m: 6, efConstruction: 40, efSearch: 20,
