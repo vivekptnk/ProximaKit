@@ -77,6 +77,101 @@ jobs:
       - name: Check version / changelog consistency
         run: bash .github/ci-scripts/check_version.sh
 
+  # EXPERIMENTAL — shadow of build-and-test's `Run Tests` step. Exists purely
+  # to measure whether sharding the slow test run across a 4-way matrix cuts
+  # wall time from the current 31-38 min monolithic run down to roughly the
+  # slowest shard (~20 min, the M|N|P chunk), before anyone proposes it replace
+  # the monolithic step.
+  #
+  # Shadow-mode only — by construction it cannot redden the repo's CI signal:
+  # - `continue-on-error: true` is set at the JOB level (below), so a shard
+  #   failure can never fail the workflow run or flip the overall CI signal.
+  # - Nothing `needs:` this job, so it gates and blocks nothing.
+  # - `fail-fast: false` lets all 4 shards finish even if one fails, so every
+  #   shard's "Executed N tests" count is available for reconciliation.
+  #
+  # Acceptance criterion for later proposing the swap: the 4 shards' Executed
+  # counts must sum to the monolithic `Run Tests` total. The four --filter
+  # regexes partition the suite exactly when combined with the same
+  # --skip RecallBenchmarkTests (RecallBenchmarkTests starts with R, which
+  # falls inside the QRSTVW chunk, so that shard skips it explicitly). Each
+  # shard prints its "Executed N tests" line so the 4 counts can be summed and
+  # compared against the monolithic run's total.
+  test-sharded-experimental:
+    name: Sharded Tests (EXPERIMENTAL — shadow only)
+    runs-on: macos-15
+    # Job-level continue-on-error: this is the mechanism that makes it
+    # structurally impossible for this experimental job to redden CI. It is a
+    # sibling of runs-on/strategy/steps — NOT nested inside any step.
+    continue-on-error: true
+    strategy:
+      # All 4 shards must run to completion so their Executed counts can be
+      # reconciled — never cancel siblings when one shard fails.
+      fail-fast: false
+      matrix:
+        include:
+          - name: chunk-BCDFH
+            filter: '^ProximaKitTests\.(B|C|D|F|H)'
+            skip: ''
+          - name: chunk-MNP
+            filter: '^ProximaKitTests\.(M|N|P)'
+            skip: ''
+          - name: chunk-QRSTVW
+            filter: '^ProximaKitTests\.(Q|R|S|T|V|W)'
+            skip: 'RecallBenchmarkTests'
+          - name: chunk-embeddings
+            filter: '^ProximaEmbeddingsTests\.'
+            skip: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+
+      # Intentionally reuses build-and-test's EXACT cache key and restore-keys
+      # (same hashFiles glob list, same fallback) so this job benefits from —
+      # and contributes to — the same warm `.build` snapshot. That keeps the
+      # per-shard test-execution timing an apples-to-apples comparison against
+      # the monolithic step, which likewise runs tests off a fresh Debug build.
+      - name: Cache Swift build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Tests/**/*.swift', 'Examples/**/*.swift') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-
+
+      - name: Build (Debug)
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Build (Release)
+        run: swift build -c release
+
+      - name: Run Tests (shard ${{ matrix.name }})
+        # Shard the monolithic `swift test --skip RecallBenchmarkTests` into one
+        # matrix.filter regex per shard. `set +e` disables the runner's default
+        # `-e` so a failing shard still reaches the reconciliation output; the
+        # swift test exit status is captured from PIPESTATUS[0] (unaffected by
+        # the `tee`) and re-exited at the end to keep this step's own reported
+        # status honest — harmless given job-level continue-on-error above.
+        run: |
+          set +e
+          LOG="shard-${{ matrix.name }}.log"
+          if [ -n '${{ matrix.skip }}' ]; then
+            swift test --filter '${{ matrix.filter }}' --skip '${{ matrix.skip }}' 2>&1 | tee "$LOG"
+            status=${PIPESTATUS[0]}
+          else
+            swift test --filter '${{ matrix.filter }}' 2>&1 | tee "$LOG"
+            status=${PIPESTATUS[0]}
+          fi
+          echo "::group::Executed count — shard ${{ matrix.name }}"
+          grep -E 'Executed [0-9]+ tests?, with' "$LOG" \
+            || echo "(no 'Executed N tests' summary line found in $LOG)"
+          echo "::endgroup::"
+          exit "$status"
+
   # Package.swift declares iOS 17 and visionOS 1, but `swift build` on a macOS
   # runner only compiles for the macOS SDK. ProximaEmbeddings imports
   # CoreML/NaturalLanguage/Vision, which have per-platform availability
