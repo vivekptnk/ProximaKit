@@ -405,6 +405,7 @@ This example optimises for "readable in one sitting", not production retrieval q
 ## Where Next
 
 - [`README.md`](../README.md) — the full API tour: quantization, persistence, filtered search
+- [`docs/RAG-WRAPPER-RECIPE.md`](RAG-WRAPPER-RECIPE.md) — wrapping `HNSWIndex` yourself? crash-safe chunk records for consumers who own the chunk pipeline
 - [`docs/HYBRID.md`](HYBRID.md) — BM25 + dense fusion, the usual next step for RAG retrieval quality
 - [ADR-008](adr/ADR-008-filtered-search.md) — per-user / per-folder filtering on every search call
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — how the pieces fit
