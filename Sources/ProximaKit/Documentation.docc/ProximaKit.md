@@ -52,6 +52,7 @@ let results = await index.search(query: queryVector, k: 10)
 
 - ``VectorIndex``
 - ``HNSWConfiguration``
+- ``HNSWGraphSnapshot``
 - ``IndexError``
 
 ### Hybrid & Keyword Search

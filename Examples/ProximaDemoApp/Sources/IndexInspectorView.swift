@@ -41,7 +41,7 @@ struct IndexInspectorView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Index Inspector")
                     .font(.title2.weight(.semibold))
-                Text("Live HNSW layer-0 adjacency, levels, and metadata from the public persistence snapshot.")
+                Text("Live HNSW layer-0 adjacency, levels, and metadata from the read-only graph snapshot.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -163,7 +163,7 @@ struct IndexInspectorView: View {
                         Text("\(selected.degree)")
                     }
                     GridRow {
-                        Text("Internal node").foregroundStyle(.secondary)
+                        Text("Snapshot row").foregroundStyle(.secondary)
                         Text("\(selected.internalIndex)")
                     }
                 }

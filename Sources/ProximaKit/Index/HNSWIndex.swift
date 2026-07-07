@@ -97,6 +97,41 @@ struct SplitMix64: RandomNumberGenerator {
 /// Backward-compatible spelling for ``IndexResidency`` on full-precision HNSW APIs.
 public typealias HNSWOpenMode = IndexResidency
 
+/// A read-only, value-typed view of the live HNSW graph.
+///
+/// This is an inspection surface, not a persistence format: it carries UUIDs,
+/// node levels, live layer-0 neighbor UUIDs, and metadata, but deliberately
+/// omits vectors so callers can inspect topology without forcing a vector
+/// materialization.
+public struct HNSWGraphSnapshot: Sendable {
+    /// One live node in an ``HNSWGraphSnapshot``.
+    public struct Node: Sendable {
+        /// The external UUID stored for this live node.
+        public let id: UUID
+
+        /// The highest HNSW layer assigned to this node.
+        public let level: Int
+
+        /// This node's live layer-0 neighbors, expressed as external UUIDs.
+        public let layer0NeighborIDs: [UUID]
+
+        /// The optional metadata stored with this node.
+        public let metadata: Data?
+    }
+
+    /// Live nodes in internal node order.
+    public let nodes: [Node]
+
+    /// The number of live nodes represented by ``nodes``.
+    public let liveCount: Int
+
+    /// The highest level among live nodes, or `-1` when the snapshot is empty.
+    public let maxLevel: Int
+
+    /// Live-node counts per layer; index `0` is layer 0.
+    public let nodesPerLayer: [Int]
+}
+
 /// Approximate nearest-neighbor index using Hierarchical Navigable Small World graphs.
 ///
 /// The index organizes vectors into a multi-layer graph:
@@ -965,6 +1000,62 @@ public actor HNSWIndex: VectorIndex {
         return out
     }
 
+    /// A read-only snapshot of the live HNSW graph, in internal node order.
+    ///
+    /// Unlike ``persistenceSnapshot()``, this accessor never compacts and never
+    /// materializes vectors. It reads the layer arrays directly and returns
+    /// UUIDs, levels, layer-0 neighbors, and metadata only, keeping inspection
+    /// side-effect-free and O(live graph) instead of a save-path operation. It
+    /// does not touch the reverse-adjacency cache.
+    ///
+    /// The snapshot includes only live nodes. Layer-0 neighbors are filtered
+    /// with the same identity liveness test (`uuidToNode[uuid] == node`) used
+    /// by search and compaction, because a live node can still hold an edge to
+    /// a tombstoned slot; those dead neighbors are omitted from the returned
+    /// graph.
+    public func liveGraphSnapshot() -> HNSWGraphSnapshot {
+        var nodes: [HNSWGraphSnapshot.Node] = []
+        nodes.reserveCapacity(uuidToNode.count)
+
+        var snapshotMaxLevel = -1
+        var nodesPerLayer: [Int] = []
+
+        for (node, uuid) in nodeToUUID.enumerated() where uuidToNode[uuid] == node {
+            let level = nodeLevels[node]
+            snapshotMaxLevel = max(snapshotMaxLevel, level)
+            if nodesPerLayer.count <= level {
+                nodesPerLayer.append(contentsOf: repeatElement(0, count: level + 1 - nodesPerLayer.count))
+            }
+            for layer in 0...level {
+                nodesPerLayer[layer] += 1
+            }
+
+            let layer0NeighborIDs: [UUID]
+            if let layer0 = layers.first, node < layer0.count {
+                layer0NeighborIDs = layer0[node].compactMap { neighbor in
+                    let neighborID = nodeToUUID[neighbor]
+                    return uuidToNode[neighborID] == neighbor ? neighborID : nil
+                }
+            } else {
+                layer0NeighborIDs = []
+            }
+
+            nodes.append(HNSWGraphSnapshot.Node(
+                id: uuid,
+                level: level,
+                layer0NeighborIDs: layer0NeighborIDs,
+                metadata: metadata[node]
+            ))
+        }
+
+        return HNSWGraphSnapshot(
+            nodes: nodes,
+            liveCount: nodes.count,
+            maxLevel: snapshotMaxLevel,
+            nodesPerLayer: nodesPerLayer
+        )
+    }
+
     private func fullSyncFile(_ url: URL) throws {
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
@@ -1355,6 +1446,23 @@ public actor HNSWIndex: VectorIndex {
     }
 
     // ── Test Hooks (internal) ─────────────────────────────────────────
+
+    /// Test hook for constructing a dangling layer-0 edge after a removal.
+    /// Keeps `inEdges` in sync so only the intended liveness condition is
+    /// malformed.
+    internal func insertLayer0EdgeForTesting(from fromID: UUID, toStoredID toID: UUID) -> Bool {
+        guard let from = uuidToNode[fromID],
+              let to = nodeToUUID.firstIndex(of: toID),
+              let layer0 = layers.first,
+              from < layer0.count,
+              to < layer0.count else {
+            return false
+        }
+        if !layers[0][from].contains(to) {
+            addEdge(from: from, to: to, layer: 0)
+        }
+        return true
+    }
 
     /// Whether any adjacency list still references a tombstoned slot.
     /// Used by tests to verify `remove()` leaves no dangling incoming edges.

@@ -8,7 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **`HNSWGraphSnapshot` + `HNSWIndex.liveGraphSnapshot()`: read-only
+  live-graph inspection.** A read-only, value-typed view of the live HNSW
+  graph — live nodes (UUID, level, live-filtered layer-0 neighbor UUIDs,
+  metadata), `liveCount`, `maxLevel`, and per-layer live-node counts
+  (`nodesPerLayer`). Unlike `persistenceSnapshot()`, it never compacts and
+  never materializes vectors, reading the layer arrays directly and applying
+  the same liveness/tombstone filter search and compaction use — keeping
+  inspection side-effect-free and O(live graph) instead of a save-path
+  operation.
+
+### Changed
+- **Demo Index Inspector now reads through `liveGraphSnapshot()`
+  (`Examples/ProximaDemoApp/Sources/SearchEngine.swift`).** Closes the
+  v1.8.0 release-time followup: the Inspector previously reused the public
+  `persistenceSnapshot()` save/compaction path (judged safe at the time
+  because the demo Search index is append-only); it now calls the additive,
+  non-mutating accessor added above.
 
 ---
 

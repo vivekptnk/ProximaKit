@@ -418,58 +418,55 @@ final class SearchEngine {
 
     func makeInspectorGraph(sampleLimit: Int = 150) async throws -> IndexInspectorGraph {
         guard let index else { return .empty }
-        let snapshot = try await index.persistenceSnapshot()
-        let total = snapshot.nodeToUUID.count
+        let snapshot = await index.liveGraphSnapshot()
+        let total = snapshot.liveCount
         guard total > 0 else { return .empty }
 
-        let layer0 = snapshot.layers.first ?? []
-        let degrees = (0..<total).map { node in
-            node < layer0.count ? layer0[node].count : 0
-        }
         let sample = deterministicSampleIndices(total: total, limit: sampleLimit)
-        let included = Set(sample)
+        let includedIDs = Set(sample.map { snapshot.nodes[$0].id })
 
         let nodes = sample.map { node -> IndexInspectorNode in
-            let id = snapshot.nodeToUUID[node]
-            let metadata = node < snapshot.metadata.count ? snapshot.metadata[node] : nil
-            let sentence = decodeSentence(metadata)
+            let graphNode = snapshot.nodes[node]
+            let sentence = decodeSentence(graphNode.metadata)
             let title = sentence.map(displayTitle(for:)) ?? "Vector \(node + 1)"
             let category = sentence?.category ?? "Unknown"
             let text = sentence?.text ?? "No metadata text stored for this vector."
             let chunk = sentence?.chunkIndex.map { " · chunk \($0 + 1)" } ?? ""
-            let subtitle = "\(category)\(chunk) · \(id.uuidString.prefix(8))"
+            let subtitle = "\(category)\(chunk) · \(graphNode.id.uuidString.prefix(8))"
             return IndexInspectorNode(
-                id: id,
+                id: graphNode.id,
                 internalIndex: node,
                 title: title,
                 subtitle: subtitle,
                 text: text,
                 category: category,
-                level: snapshot.nodeLevels[safe: node] ?? 0,
-                degree: degrees[node])
+                level: graphNode.level,
+                degree: graphNode.layer0NeighborIDs.count)
         }
 
         var seenEdges = Set<String>()
         var edges: [IndexInspectorEdge] = []
-        for from in sample where from < layer0.count {
-            for to in layer0[from] where included.contains(to) && from != to {
-                let a = min(from, to)
-                let b = max(from, to)
+        for from in sample {
+            let source = snapshot.nodes[from]
+            for targetID in source.layer0NeighborIDs where includedIDs.contains(targetID) && source.id != targetID {
+                let a = min(source.id.uuidString, targetID.uuidString)
+                let b = max(source.id.uuidString, targetID.uuidString)
                 let key = "\(a)-\(b)"
                 guard seenEdges.insert(key).inserted else { continue }
                 edges.append(IndexInspectorEdge(
-                    source: snapshot.nodeToUUID[a],
-                    target: snapshot.nodeToUUID[b]))
+                    source: source.id,
+                    target: targetID))
             }
         }
 
-        let maxLayer = snapshot.nodeLevels.max() ?? 0
+        let maxLayer = max(snapshot.maxLevel, 0)
         let layerBuckets = (0...maxLayer).map { level in
-            IndexLayerBucket(level: level, count: snapshot.nodeLevels.filter { $0 == level }.count)
+            IndexLayerBucket(level: level, count: snapshot.nodes.filter { $0.level == level }.count)
         }
-        let averageDegree = degrees.isEmpty
+        let degreeTotal = snapshot.nodes.reduce(0) { $0 + $1.layer0NeighborIDs.count }
+        let averageDegree = snapshot.nodes.isEmpty
             ? 0
-            : Double(degrees.reduce(0, +)) / Double(degrees.count)
+            : Double(degreeTotal) / Double(snapshot.nodes.count)
 
         return IndexInspectorGraph(
             nodes: nodes,
