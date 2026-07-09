@@ -27,6 +27,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   because the demo Search index is append-only); it now calls the additive,
   non-mutating accessor added above.
 
+### Documentation
+- **RAG wrapper recipe — journaled-surface round 2 (consumer friction #2).**
+  [`docs/RAG-WRAPPER-RECIPE.md`](docs/RAG-WRAPPER-RECIPE.md) gains five
+  source-verified additions for consumers who adopted the raw journaled surface
+  (`HNSWIndex.open` / WAL add-remove / `syncJournal()` / `needsCheckpoint` /
+  `checkpoint`) for incremental folder indexing. (1) **First open** — `open`
+  requires the base `.pxkt` to already exist and throws Foundation's
+  `NSFileReadNoSuchFileError` (not a typed `PersistenceError`) on a missing one,
+  so a first launch must `checkpoint` once to establish the base; the recipe now
+  shows the open-if-present-else-establish shape. (2) **Remove durability** —
+  `remove(id:)` is non-throwing, so a failed WAL append is deferred into the
+  journal and surfaced only by the next `add` / `syncJournal()` / `checkpoint()`;
+  remove-driven replacement should `syncJournal()` after removals before trusting
+  the delete. (3) **Testing against the WAL** — because `checkpoint` writes a
+  16 KiB-page-padded v3 base, the default `walBytesFractionOfBase: 0.10` arm
+  trips within a handful of 384d adds, so a test that watches WAL growth must
+  pass a custom policy with the byte arm disabled (`.infinity`);
+  `journalRecordCount` / `journalByteCount` are documented as the observability
+  hooks. (4) **Incremental-vs-rebuild order caveat** — a WAL-grown graph and a
+  from-scratch rebuild agree on the top hit and result set but can differ at
+  secondary ranks, so equivalence gates should assert top-result + set, not
+  byte-order. (5) **Optional-cost note** — a per-add `O(liveEntries)` dedup scan
+  is largely redundant when open-time `liveEntries()` validation already forces a
+  rebuild on any manifest divergence. Four additive `CustomRAGWrapperRecipeTests`
+  pin items 1–3 (`testOpenJournaledWithoutBaseFileThrowsFoundationFileNotFound`,
+  `testFirstOpenEstablishesBaseViaCheckpointThenReopens`,
+  `testRemoveThenSyncJournalIsCleanAndRemovalSurvivesReopen`,
+  `testCustomPolicyDisablingByteFractionExposesWALRecordGrowth`), and the
+  `RecipeRAGIndex` template gains additive `remove` / `syncJournal` /
+  `journalRecordCount` / `journalByteCount` / `needsCheckpoint` passthroughs.
+  Existing tests unchanged.
+
 ---
 
 ## [1.8.0] — 2026-07-04

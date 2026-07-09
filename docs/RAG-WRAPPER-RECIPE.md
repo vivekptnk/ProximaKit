@@ -6,7 +6,7 @@ ProximaKit ships two layers you can build RAG on. `VectorStore` / `HybridVectorS
 
 The mechanism is proven in this repository twice over: it is the same per-vector-metadata pattern ProximaKit's own store layer is built on (see the derivation design in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)), and the full wrapper lifecycle — including crash recovery of chunk records through the WAL — is CI-verified by the recipe's companion test ([`CustomRAGWrapperRecipeTests`](../Tests/ProximaKitTests/CustomRAGWrapperRecipeTests.swift)). It is also shipping in practice: tinybrain — the agent-memory consumer [ADR-015](adr/ADR-015-agent-memory-integration.md) was designed around — persists its RAG index exactly this way (in-index chunk metadata, fingerprint-keyed cache acceptance) on its main branch.
 
-Every snippet below is extracted or adapted from a compiled, CI-verified template: [`Tests/ProximaKitTests/CustomRAGWrapperRecipeTests.swift`](../Tests/ProximaKitTests/CustomRAGWrapperRecipeTests.swift) — the `RecipeRAGIndex` actor and its four tests (snapshot round-trip, journaled WAL recovery, checkpoint-then-reopen, torn-WAL-tail prefix recovery). If a line here compiles in your head but not on your machine, the test file is the source of truth.
+Every snippet below is extracted or adapted from a compiled, CI-verified template: [`Tests/ProximaKitTests/CustomRAGWrapperRecipeTests.swift`](../Tests/ProximaKitTests/CustomRAGWrapperRecipeTests.swift) — the `RecipeRAGIndex` actor and its tests (snapshot round-trip, journaled WAL recovery, checkpoint-then-reopen, torn-WAL-tail prefix recovery, first-open-establishes-base, missing-base error, remove durability, and WAL-growth observability under a custom checkpoint policy). If a line here compiles in your head but not on your machine, the test file is the source of truth.
 
 ---
 
@@ -172,6 +172,23 @@ static func openJournaled(baseURL: URL, walURL: URL,
 
 `open` loads the base, replays the WAL to its longest valid prefix, and attaches the journal for future appends. (It cross-checks the sidecar against the base — generation, dimension, and metric — and throws `PersistenceError.walGenerationMismatch` / `.walDimensionMismatch` / `.walMetricMismatch` on a stale or mispaired WAL before replaying a single record.) The CI test `testJournaledRecoveryReplaysChunkMetadataFromWAL` adds chunks *after* a checkpoint, then reopens and asserts every chunk record comes back from WAL replay — proving the metadata survived in the log, not just in a snapshot.
 
+**First open — there is no base yet.** `open` (and `openJournaled` over it) *requires the base `.pxkt` to already exist* — it loads the base with `Data(contentsOf:)` before it touches the WAL, so a first launch with no base on disk does not create one. It throws Foundation's file-not-found (`NSCocoaErrorDomain` / `NSFileReadNoSuchFileError`), **not** a typed `PersistenceError` you can pattern-match. The supported way to create the base is a single `checkpoint`: it is the one call that both *establishes* a journaled base on a fresh index and later *folds* an accumulated WAL back into it. So the first-launch shape is open-if-present-else-establish:
+
+```swift
+let rag: RecipeRAGIndex
+if FileManager.default.fileExists(atPath: baseURL.path) {
+    rag = try await RecipeRAGIndex.openJournaled(baseURL: baseURL, walURL: walURL, durability: durability)
+} else {
+    // First launch: no base on disk. Bind the journal paths to a fresh
+    // in-memory index, then checkpoint ONCE to write the generation-1 base
+    // (plus a fresh empty WAL) so every later launch can open it.
+    rag = RecipeRAGIndex(dimension: dimension, baseURL: baseURL, walURL: walURL, durability: durability)
+    try await rag.checkpoint()
+}
+```
+
+The `else` branch is exactly what the journaled CI tests do before adding a single chunk (`RecipeRAGIndex(...baseURL:walURL:...)` then `checkpoint()`). Two tests pin this end to end: `testFirstOpenEstablishesBaseViaCheckpointThenReopens` walks the create-checkpoint-add-reopen path and asserts every chunk returns, and `testOpenJournaledWithoutBaseFileThrowsFoundationFileNotFound` pins that a raw open of a missing base throws the Foundation file error, not a `PersistenceError` — so don't reach for a typed catch to detect "no base yet"; check `fileExists` (or the Cocoa error) instead.
+
 **Folding the WAL — checkpoint.** The WAL grows with every mutation; periodically fold it back into a fresh base with `checkpoint`, which compacts pending tombstones, writes a new generation-bumped base, `F_FULLFSYNC`s it, and resets the WAL to empty. Ask `needsCheckpoint()` when to do it rather than guessing:
 
 ```swift
@@ -183,11 +200,34 @@ if await index.needsCheckpoint() {                       // policy-driven, see b
 
 The default policy is `WALCheckpointPolicy(walBytesFractionOfBase: 0.10, maxOps: 10_000)` — either bound being exceeded trips a checkpoint; both are configurable. (The store layer exposes this as an opt-in `checkpointAutomatically:` that folds inside the mutation chain; at the raw-index level you drive it yourself, exactly as above.)
 
+**Testing against the WAL.** If a consumer test wants to assert "the WAL grew by exactly one record per add," it must pass a **custom policy with the byte-fraction arm disabled**, because the default 0.10 arm fires far sooner than a naive reading suggests. `checkpoint` writes a page-padded v3 base (its vector section aligned to a 16 KiB boundary so it can be mapped — see [When to graduate](#when-to-graduate)), so `baseByteCount` starts near 16 KiB even for a near-empty corpus; the 10% arm then trips once the WAL passes ~1.6 KiB. At the recipe's 384d add cost (~1.6 KB per record, from level 2 above) that is only a handful of adds — correct production behavior (fold early while the base is small), but it means a byte-arm-driven checkpoint can land in the middle of the growth you were trying to observe. Set `walBytesFractionOfBase: .infinity` to isolate the op-count arm:
+
+```swift
+// Byte-fraction arm off; op arm left high so it doesn't trip during the test.
+let policy = WALCheckpointPolicy(walBytesFractionOfBase: .infinity, maxOps: 10_000)
+XCTAssertEqual(await index.journalRecordCount, addedCount)     // WAL grew by exactly N records
+XCTAssertFalse(await index.needsCheckpoint(policy: policy))    // custom policy tolerates the growth
+```
+
+`journalRecordCount` and `journalByteCount` are the observability hooks (both `public`, both actor-isolated so both take `await`): `journalRecordCount` is records appended since the last checkpoint, `journalByteCount` is header + record bytes since the last checkpoint — `checkpoint` resets both to 0. `testCustomPolicyDisablingByteFractionExposesWALRecordGrowth` uses exactly this policy to prove the count advances one-per-add, and checks that lowering `maxOps` below the record count still trips `needsCheckpoint` — so the custom policy disabled only the byte arm, not checkpointing itself.
+
 **The do-not-retry contract — quote it, restate it, obey it.** Verbatim from the store layer, which builds on this same mechanism (`VectorStore.open`'s doc-comment, mirrored in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)):
 
 > A failed automatic fold is rethrown by the mutation call that triggered it, but the triggering mutation has already been applied and made durable — to the extent of the active `WALDurability` dial (see the `checkpointAutomatically` parameter for the `.manual` caveat). Do not retry that mutation: `addChunks` assigns fresh UUIDs, so retrying would duplicate chunks. The store remains consistent, and the next mutation, `save()`, or `checkpoint()` re-attempts the fold.
 
 Restated at the raw-index level (from the test file's own header): if a journaled `add` or a checkpoint throws, **do not blindly retry it.** At the index level the vector may already be present in memory or durable in the WAL; retrying with a fresh `UUID` can duplicate the chunk. There is no failure latch — the index stays consistent and the next mutation or checkpoint re-attempts the fold. If you must retry, retry only under an idempotency policy *you* own (e.g. a stable, content-derived `id` you can dedupe on), or reopen and reconcile from the recovered metadata.
+
+**Remove is durable only after the next throwing op — `remove` returning `true` is not a durable delete.** `add` throws, so its WAL append surfaces any write error on the same call. `HNSWIndex.remove(id:)` is **non-throwing** (`@discardableResult ... -> Bool`), so it *can't* surface a failed append the same way: a failed `appendRemove` is **deferred** into the journal's pending error and re-raised by the **next throwing journaled op** — another `add`, an explicit `syncJournal()`, or a `checkpoint()`. So `remove` returning `true` means only "gone from the in-memory graph," not "durably journaled." If the process crashes before any throwing op runs, replay omits the removal on recovery and the "removed" vector reappears. (This durability asymmetry is stated verbatim in `HNSWIndex.remove`'s own doc-comment; the mechanism is `WALJournal.appendRemove` capturing the error and the next `surfacePending()` re-throwing it.)
+
+The practical rule for remove-driven replacement — delete a re-indexed file's old chunks, add the new ones — is to **call `syncJournal()` (or `checkpoint()`) after a batch of removals** to surface that deferred path before you treat the delete as committed:
+
+```swift
+for id in staleChunkIDs { await index.remove(id: id) }   // non-throwing; a WAL error would be deferred
+try await index.syncJournal()                            // surface any deferred WAL error now
+// …now add the replacement chunks.
+```
+
+`testRemoveThenSyncJournalIsCleanAndRemovalSurvivesReopen` pins the honestly-testable depth: removals followed by `syncJournal()` throw nothing on the clean path, and a reopen replays the removals — removed chunks gone, survivors present, `liveCount` matching. (Forcing the deferred *error* to fire needs a WAL write to actually fail, which isn't reachable hermetically without fault injection, so the test pins the clean contract and the removal's durability across a reopen rather than faking a write fault.)
 
 ### 3. Durability dial — Darwin honesty in one paragraph
 
@@ -200,6 +240,12 @@ The template wrapper defaults to `.everyRecord` (strictest per-append flush); th
 ### Crash recovery is prefix-tolerant, not silently lossy
 
 WAL records are CRC-framed. On reopen, the decoder stops at the first torn or bit-damaged record and returns the **longest intact prefix** — a tail torn off by a crash mid-append is *expected*, recovers cleanly, and never throws. Only a damaged WAL *header* (or a stale generation) throws a typed error. The CI test `testTornWALTailRecoversLongestValidChunkMetadataPrefix` proves both halves: it truncates the WAL mid-record and asserts exactly the pre-truncation chunks recover; then it truncates below the header and asserts a typed `PersistenceError.fileTooSmall` — never a trap, never silent corruption. Your recovery code should expect "some suffix of my most recent chunks may be gone" and never "the file is unreadable so I lost everything".
+
+### Recovered ranking equals a rebuild's top hit and set, not its exact order
+
+WAL replay is deterministic: it re-inserts each node with the *journaled* level (not a fresh RNG draw), so a reopened index is the same graph, node-for-node, as the one that wrote the log — `WALRecoveryTests` asserts exactly that through a full structural fingerprint (adjacency, levels, entry point, tombstones, vectors, metadata). What a recovered index does **not** equal is a *from-scratch rebuild* of the same vectors. A journaled index is grown incrementally — a checkpoint compacts and renumbers its live nodes into the base, then later adds append on top — and HNSW topology is a function of that insertion history. A single from-scratch build inserts the same vectors in a different order, so it builds a *different but equally valid* graph.
+
+Two different-but-valid HNSW graphs agree on the nearest neighbour and, for well-separated data, on the top-`k` result *set* — but the exact ordering of near-ties at ranks 2..k can differ between them. So a consumer that validates a recovered or incrementally-grown index by rebuilding from source and diffing the two should assert **top-result and result-set equivalence, not positional or byte order.** That is the shape of every assertion in this recipe's tests: `results.first` for the top hit, `Set(results.map(\.0))` for membership — never a full ordered-array compare. (Those two, in turn, are recall properties of ANN over your data's separation, not hard guarantees — gate on the equivalence your corpus actually earns.)
 
 ### Cache acceptance: validating a loaded index
 
@@ -235,6 +281,8 @@ func loadOrRebuild(url: URL, dimension: Int, count: Int,
 Delete-and-rebuild is a **safe, total fallback for every failure mode**, not only the three checks above — because, as established under [Crash recovery is prefix-tolerant, not silently lossy](#crash-recovery-is-prefix-tolerant-not-silently-lossy), a corrupt or truncated load throws a typed `PersistenceError` rather than trapping or returning a half-decoded index. The `try?` on `load` folds that throw into the same *miss → rebuild* path as a failed check, so no failure mode slips past both the checks and the throw: whatever is wrong with the cache, you delete it and rebuild.
 
 *A pattern one consumer integration uses:* name the cache file after a hash of everything that would invalidate it — embedder identity, dimension, chunking config, corpus identity — e.g. `"\(fingerprint).pxkt"` where `fingerprint` is a hash over those four inputs. Any change to those inputs becomes a *different filename*, so a stale cache is never opened at all; the acceptance checks above then only have to catch corruption of a cache that already claims to match. It is a cheap first filter, not a full answer to cache naming and versioning.
+
+*Optional optimization — skip the per-add dedup scan when open-time validation already covers it.* If your open path already runs check (c) — enumerate `liveEntries()` and force a full rebuild on *any* divergence from your manifest — then, once open returns, the index's live ids provably equal your manifest. A further `O(liveEntries)` scan of `liveEntries()` before each `add` to guard against re-adding an already-indexed file is then largely redundant: it re-checks an invariant open already established. Keep it as cheap insurance if you like, but it is not a correctness requirement, and either way it is dwarfed by the embedding call each add already pays — so it is never the first thing to optimize. (This only applies to consumers who validate against a manifest on open; without that open-time guarantee, keep whatever dedup you rely on.)
 
 ---
 

@@ -122,6 +122,34 @@ actor RecipeRAGIndex {
         }
         try await index.checkpoint(baseURL: baseURL, walURL: walURL, durability: durability)
     }
+
+    // ── Removal + WAL observability passthroughs ──────────────────────────
+    //
+    // A real consumer wrapper surfaces these so it can drive its own removal
+    // and checkpoint cadence — and so tests can prove the durability contract
+    // and WAL growth. All are thin delegations to the raw index.
+
+    /// Non-throwing, mirroring `HNSWIndex.remove(id:)`: a deferred WAL-append
+    /// error is surfaced by the next throwing journaled op (`syncJournal`,
+    /// `addChunk`, `checkpoint`), not here.
+    @discardableResult
+    func remove(id: UUID) async -> Bool {
+        await index.remove(id: id)
+    }
+
+    /// Flushes the WAL, surfacing any error deferred by a prior non-throwing
+    /// `remove`. Call after remove-driven replacement before trusting the delete.
+    func syncJournal() async throws {
+        try await index.syncJournal()
+    }
+
+    func journalRecordCount() async -> Int { await index.journalRecordCount }
+    func journalByteCount() async -> Int { await index.journalByteCount }
+    func liveCount() async -> Int { await index.liveCount }
+
+    func needsCheckpoint(policy: WALCheckpointPolicy) async -> Bool {
+        await index.needsCheckpoint(policy: policy)
+    }
 }
 
 private enum RecipeRAGIndexError: Error, Equatable {
@@ -292,6 +320,166 @@ final class CustomRAGWrapperRecipeTests: XCTestCase {
         } catch {
             XCTFail("expected typed PersistenceError.fileTooSmall, got \(error)")
         }
+    }
+
+    // MARK: - Consumer friction #2
+
+    /// Item 1 (failure half): the raw journaled `open` requires the base file to
+    /// already exist. A first launch with no base on disk surfaces Foundation's
+    /// file-not-found (`NSCocoaErrorDomain` / `NSFileReadNoSuchFileError`), NOT a
+    /// typed `PersistenceError` a consumer could pattern-match — `open` reads the
+    /// base with `Data(contentsOf:)`. Pinning the actual error keeps the recipe's
+    /// "first open" guidance honest.
+    func testOpenJournaledWithoutBaseFileThrowsFoundationFileNotFound() async throws {
+        let dir = tempDir()
+        defer { cleanup(dir) }
+        let base = dir.appendingPathComponent("rag.pxkt")   // deliberately never created
+        let wal = dir.appendingPathComponent("rag.pxwal")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: base.path))
+
+        do {
+            _ = try await RecipeRAGIndex.openJournaled(
+                baseURL: base, walURL: wal, durability: .everyRecord
+            )
+            XCTFail("open of a missing base must throw")
+        } catch let error as PersistenceError {
+            XCTFail("missing base is a Foundation file error, not a typed PersistenceError; got \(error)")
+        } catch {
+            let nsError = error as NSError
+            XCTAssertEqual(nsError.domain, NSCocoaErrorDomain)
+            XCTAssertEqual(nsError.code, NSFileReadNoSuchFileError)
+        }
+    }
+
+    /// Item 1 (success half): the documented first-open pattern. On first launch
+    /// there is no base, so construct a fresh in-memory wrapper bound to the
+    /// journal paths and `checkpoint()` once to establish the base; a later
+    /// launch then `openJournaled`s it and returns every chunk. Proves both
+    /// branches of the open-if-present-else-establish shape end to end.
+    func testFirstOpenEstablishesBaseViaCheckpointThenReopens() async throws {
+        let dir = tempDir()
+        defer { cleanup(dir) }
+        let base = dir.appendingPathComponent("rag.pxkt")
+        let wal = dir.appendingPathComponent("rag.pxwal")
+        let chunks = makeChunks(count: 5)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: base.path))
+        do {
+            // First launch: no base yet. Bind the paths, checkpoint once to
+            // write the generation-1 base (+ a fresh empty WAL), then add.
+            let rag = RecipeRAGIndex(
+                dimension: dimension,
+                config: seededConfig(),
+                baseURL: base,
+                walURL: wal,
+                durability: .everyRecord
+            )
+            try await rag.checkpoint()
+            try await add(chunks, to: rag)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: base.path))
+
+        // Later launch: the base exists, so the raw open path works.
+        let reopened = try await RecipeRAGIndex.openJournaled(
+            baseURL: base, walURL: wal, durability: .everyRecord
+        )
+        let results = try await reopened.search(query: chunks[0].embedding, k: chunks.count)
+        XCTAssertEqual(results.first?.0, chunks[0].record)
+        XCTAssertEqual(Set(results.map(\.0)), Set(chunks.map(\.record)))
+    }
+
+    /// Item 2: remove durability. `remove` is non-throwing, so a WAL-append
+    /// failure is deferred into the journal and surfaced by the next throwing
+    /// op — `remove` returning `true` means "gone from the in-memory graph", not
+    /// "durably journaled". Remove-driven replacement should call `syncJournal()`
+    /// after removals to surface that path. This pins the honestly-testable
+    /// depth: the clean `remove` → `syncJournal()` path throws nothing, and the
+    /// removals are durable across a reopen (removed chunks gone, survivors
+    /// remain). Triggering the deferred *error* itself needs a WAL-write fault
+    /// not reachable hermetically without fault injection.
+    func testRemoveThenSyncJournalIsCleanAndRemovalSurvivesReopen() async throws {
+        let dir = tempDir()
+        defer { cleanup(dir) }
+        let base = dir.appendingPathComponent("rag.pxkt")
+        let wal = dir.appendingPathComponent("rag.pxwal")
+        let chunks = makeChunks(count: 6)
+
+        let survivorRecords: Set<RecipeRAGIndex.ChunkRecord>
+        do {
+            let rag = RecipeRAGIndex(
+                dimension: dimension,
+                config: seededConfig(),
+                baseURL: base,
+                walURL: wal,
+                durability: .everyRecord
+            )
+            try await rag.checkpoint()
+            try await add(chunks, to: rag)
+
+            for chunk in chunks.prefix(2) {
+                let removed = await rag.remove(id: chunk.id)   // non-throwing
+                XCTAssertTrue(removed)
+            }
+            try await rag.syncJournal()                        // surfaces the deferred-error path
+
+            survivorRecords = Set(chunks.dropFirst(2).map(\.record))
+        }
+
+        let reopened = try await RecipeRAGIndex.openJournaled(
+            baseURL: base, walURL: wal, durability: .everyRecord
+        )
+        let results = try await reopened.search(query: chunks[0].embedding, k: chunks.count)
+        XCTAssertEqual(Set(results.map(\.0)), survivorRecords)
+        let liveCount = await reopened.liveCount()
+        XCTAssertEqual(liveCount, survivorRecords.count)
+    }
+
+    /// Item 3: testing against the WAL. A consumer test that wants to assert
+    /// "the WAL grew by exactly one record per add" must disable the default
+    /// policy's byte-fraction arm (`walBytesFractionOfBase: 0.10`), because
+    /// `checkpoint` writes a page-padded v3 base (its vector section aligned to a
+    /// 16 KiB boundary), so `baseByteCount` starts near 16 KiB even for a small
+    /// corpus and the 10% arm trips once the WAL passes ~1.6 KiB — which at the
+    /// recipe's 384d add cost (~1.6 KB per record) is only a handful of adds.
+    /// Passing a policy with `walBytesFractionOfBase: .infinity` isolates the
+    /// op-count behavior so `journalRecordCount` can be observed advancing
+    /// one-per-add. (This fixture is 8d, so its records are far smaller than
+    /// 10% of the padded base and the default arm would not trip here either —
+    /// the custom policy is what makes the assertion dimension-independent.)
+    func testCustomPolicyDisablingByteFractionExposesWALRecordGrowth() async throws {
+        let dir = tempDir()
+        defer { cleanup(dir) }
+        let base = dir.appendingPathComponent("rag.pxkt")
+        let wal = dir.appendingPathComponent("rag.pxwal")
+        let chunks = makeChunks(count: 6)
+
+        let rag = RecipeRAGIndex(
+            dimension: dimension,
+            config: seededConfig(),
+            baseURL: base,
+            walURL: wal,
+            durability: .everyRecord
+        )
+        try await rag.checkpoint()   // base generation 1; WAL reset to empty
+        let countAfterCheckpoint = await rag.journalRecordCount()
+        XCTAssertEqual(countAfterCheckpoint, 0)
+
+        try await add(chunks, to: rag)
+
+        // Byte-fraction arm off; op arm left at its default so it never trips first.
+        let testingPolicy = WALCheckpointPolicy(walBytesFractionOfBase: .infinity, maxOps: 10_000)
+        let grownCount = await rag.journalRecordCount()
+        XCTAssertEqual(grownCount, chunks.count)                 // WAL grew by exactly N records
+        let byteCount = await rag.journalByteCount()
+        XCTAssertGreaterThan(byteCount, 0)
+        let tolerated = await rag.needsCheckpoint(policy: testingPolicy)
+        XCTAssertFalse(tolerated)                                // custom policy tolerates the growth
+
+        // Sanity: the op arm still fires when maxOps is set below the record count,
+        // proving the custom policy disabled only the byte arm, not checkpointing.
+        let opArmPolicy = WALCheckpointPolicy(walBytesFractionOfBase: .infinity, maxOps: chunks.count - 1)
+        let opArmTrips = await rag.needsCheckpoint(policy: opArmPolicy)
+        XCTAssertTrue(opArmTrips)
     }
 
     private struct FixtureChunk {
