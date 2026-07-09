@@ -42,7 +42,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   remove-driven replacement should `syncJournal()` after removals before trusting
   the delete. (3) **Testing against the WAL** — because `checkpoint` writes a
   16 KiB-page-padded v3 base, the default `walBytesFractionOfBase: 0.10` arm
-  trips within a handful of 384d adds, so a test that watches WAL growth must
+  trips within one or two 384d adds, so a test that watches WAL growth must
   pass a custom policy with the byte arm disabled (`.infinity`);
   `journalRecordCount` / `journalByteCount` are documented as the observability
   hooks. (4) **Incremental-vs-rebuild order caveat** — a WAL-grown graph and a
