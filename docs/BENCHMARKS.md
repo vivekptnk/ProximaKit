@@ -2,6 +2,11 @@
 
 This document describes how ProximaKit's performance numbers are measured, what they mean, and how to reproduce them.
 
+> **Looking for concrete, reproducible numbers?** See the
+> [**Benchmark Card**](BENCHMARK-CARD.md): HNSW build / latency / recall /
+> memory / disk / cold-open measured at 10K and 100K × 384d in release mode on
+> a named machine and commit, with exact seeds and commands for every row.
+
 ---
 
 ## Test Environment
@@ -165,7 +170,7 @@ DistanceMetric: CosineDistance
 |---------|-----------|----------------|
 | 1K vectors | 384d | ~104ms (debug-build XCTest harness incl. actor hop — NOT release latency; release-mode p50/p95 come from the nightly cross-library harness) |
 
-**Cold start (mmap load):** ~50ms for a persisted 10K-vector index.
+**Cold start (load from disk):** measured 24.3 ms for a persisted 10K × 384d index and 408.4 ms for 100K × 384d (fresh process, median of 3 runs, release mode — [Benchmark Card](BENCHMARK-CARD.md)). The load fully decodes the file into resident memory, so cold-start time scales with file size.
 
 **Run the latency benchmark:**
 
@@ -227,7 +232,7 @@ The `PersistenceEngine` uses a compact binary format with bulk single-read loadi
 |-----------|---------------|
 | Format | Custom binary (header + Float32 vectors + adjacency lists + JSON metadata) |
 | Save | Sequential write, ~O(n) |
-| Load (mmap) | ~50ms cold start regardless of index size |
+| Load | Full decode into resident memory — **O(file size)**, not constant. Measured cold-open: 24.3 ms at 10K × 384d (16.3 MB file), 408.4 ms at 100K × 384d (162.9 MB file) — fresh process, median of 3 ([Benchmark Card](BENCHMARK-CARD.md)) |
 | Roundtrip | Exact binary match (save → load → save produces identical bytes) |
 
 ### Format Details
@@ -236,8 +241,8 @@ See [ADR-003: Binary Persistence](adr/ADR-003-binary-persistence.md) for the for
 
 | Format | File Size (10K, 384d) | Load Time |
 |--------|----------------------|-----------|
-| JSON (rejected) | ~60 MB | ~3s |
-| Custom binary | ~58 MB | ~50ms (mmap) |
+| JSON (rejected) | ~60 MB (estimate from ADR-003; never shipped) | ~3s (estimate) |
+| Custom binary | 16.3 MB (measured — [Benchmark Card](BENCHMARK-CARD.md)) | 24.3 ms (measured, median of 3) |
 
 ### Incremental Saves (WAL, opt-in) — ADR-013 Stage 1
 
