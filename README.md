@@ -17,113 +17,25 @@ ProximaKit finds **similar content by understanding what it means** — not by m
 
 Everything runs **on-device**. No server, no API key, no internet. Just your app and Apple Silicon.
 
-> *HNSW implemented from scratch in Swift. Zero dependencies. Zero C++ wrappers.*
+> *HNSW implemented from scratch in Swift. Zero third-party runtime dependencies. Zero C++ wrappers.*
 
 <p align="center">
   <img src="docs/assets/demo-terminal.svg" alt="ProximaDemo live session: semantic search returns Food results for 'something spicy for dinner' and Nature results for 'cozy rainy day reading' in under 3 ms" width="760" />
 </p>
 <p align="center"><sub>Animated replay of a <a href="#demo">real <code>ProximaDemo</code> session</a> — try it: <code>swift run ProximaDemo</code></sub></p>
 
+## Use ProximaKit to build
 
-## What's Inside
+- **Private notes & document search** — index a user's own text and retrieve by meaning, entirely on-device.
+- **On-device RAG** — retrieve context for an on-device LLM to answer from, offline. Runnable example: [`Examples/OnDeviceRAG/`](Examples/OnDeviceRAG/).
+- **Photo & image similarity** — embed images with Apple's Vision framework and surface visual near-duplicates.
+- **Agent memory** — a durable, crash-safe vector store an on-device agent can write to and recall from ([ADR-015](docs/adr/ADR-015-agent-memory-integration.md)).
 
-| Capability | Details |
-|------------|---------|
-| **HNSW graph search** | From-scratch multi-layer implementation — heuristic neighbour selection, tombstone deletes, auto-compaction, reproducible builds via `levelSeed` |
-| **Hybrid retrieval** | BM25 + dense fusion (`HybridIndex`, `HybridVectorStore`) with Reciprocal Rank Fusion or weighted sum |
-| **Product quantization** | 32× vector compression with asymmetric distance computation, plus opt-in exact reranking — retain the originals and `search` re-scores the top ADC candidates at full precision; *(new)* paged originals restore the full 32× story even with reranking on (`load(from:mode: .paged)` maps originals from disk instead of residenting them), and existing bases self-upgrade in place with `upgradeToV3(at:)` / `ProximaBench migrate` (`QuantizedHNSWIndex`, [ADR-011](docs/adr/ADR-011-pq-codec.md), [ADR-012](docs/adr/ADR-012-pq-reranking.md), [ADR-014](docs/adr/ADR-014-paged-originals.md)) |
-| **INT8 scalar quantization** | ~4× less vector memory, **works with any metric**, no training phase (`ScalarQuantizedHNSWIndex`, [ADR-007](docs/adr/ADR-007-int8-scalar-quantization.md)) |
-| **Filtered search** | `@Sendable` predicate on every index and store; graph-aware on `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` — the layer-0 beam applies the filter during traversal with adaptive widening, so selective filters still fill `k` (`SparseIndex` keeps post-filter — no beam to route through) ([ADR-008](docs/adr/ADR-008-filtered-search.md)) |
-| **GPU batch distance (v1)** | `MetalBatchDistance` — standalone one-query-to-N squared-L2/cosine utility with automatic vDSP fallback. Measured **NO-GO** on wiring it into `HNSWIndex` build/search — vDSP (AMX) wins at every tested scale, no crossover ([ADR-009 addendum](docs/adr/ADR-009-metal-backend.md)) |
-| **9 distance metrics** | Cosine, Euclidean, dot product, Manhattan, Hamming, Chebyshev, Bray-Curtis, Mahalanobis, Jensen-Shannon — all vDSP-accelerated where it pays |
-| **Persistence** | Versioned binary format, fast bulk loads, corruption-hardened loaders ([ADR-003](docs/adr/ADR-003-binary-persistence.md), [ADR-010](docs/adr/ADR-010-format-evolution.md)); opt-in WAL incremental saves + paged vector region make index mutations O(change) instead of O(corpus), *(new)* now wired all the way to `VectorStore`/`HybridVectorStore.open(...)` with derivation-based crash consistency ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) |
-| **Embedding providers** | Apple NaturalLanguage, Vision, and bring-your-own CoreML (BERT/MiniLM via WordPiece tokenizer) |
-| **Concurrency** | Every index is a Swift `actor`; `Sendable` API surface, built with `StrictConcurrency` |
-| **Proof** | ~600 tests, recall floors enforced in CI, cross-library benchmark harness vs FAISS/ScaNN running nightly |
+Everything stays local: no server, no API key, no vectors leaving the device.
 
-<table>
-<tr>
-<td align="center" width="33%">
+## Install
 
-```
-  ┌─────────────┐
-  │      ◆      │
-  │    ╱   ╲    │
-  │   ◆─────◆   │
-  │  ON-DEVICE   │
-  └─────────────┘
-```
-
-**No Cloud Required**<br/>
-Runs entirely on Apple Silicon.<br/>
-No server, no API key, no internet.
-
-</td>
-<td align="center" width="33%">
-
-```
-  ┌─────────────┐
-  │    ┌───┐    │
-  │    │ 0 │    │
-  │    └───┘    │
-  │  ZERO DEPS  │
-  └─────────────┘
-```
-
-**Pure Swift**<br/>
-Foundation + Accelerate only.<br/>
-No C++ wrappers. No bridging.
-
-</td>
-<td align="center" width="33%">
-
-```
-  ┌─────────────┐
-  │   L2: ·──·  │
-  │   L1: ·─·─· │
-  │   L0: ····· │
-  │  HNSW BUILT │
-  └─────────────┘
-```
-
-**From Scratch**<br/>
-Full HNSW implementation.<br/>
-Not a wrapper. Not a port.
-
-</td>
-</tr>
-</table>
-
-
-## Overview
-
-ProximaKit is a pure-Swift approximate nearest-neighbour library built from scratch on Apple's Accelerate framework. It provides HNSW-based semantic search — plus hybrid BM25+dense retrieval and two quantization tiers — that runs entirely on-device. No server, no API key, no C++ wrapper required.
-
-The package exposes two libraries: `ProximaKit` (indices, distance metrics, quantization, stores, persistence — Foundation + Accelerate only) and `ProximaEmbeddings` (text/image → vector converters using Apple's NaturalLanguage, Vision, and CoreML frameworks). A CLI demo (`ProximaDemo`) and a macOS SwiftUI demo app (`Examples/ProximaDemoApp`) ship in the same repo.
-
-ProximaKit is the foundation of the Chakravyuha stack and is used by TinyBrain (inference) and Lumen (knowledge retrieval) as their vector-search layer.
-
-## Why ProximaKit?
-
-| | ProximaKit | FAISS (C++) | Pinecone (Cloud) |
-|---|---|---|---|
-| **Language** | Pure Swift | C++ wrapper | REST API |
-| **On-device** | Yes | Needs bridging | No (cloud only) |
-| **Dependencies** | Zero | libfaiss, numpy | API key + internet |
-| **Thread safety** | Swift actors (compile-time) | Manual locks | N/A |
-| **iOS/macOS native** | Yes | No | No |
-| **Setup time** | 30 seconds | Hours | Minutes + billing |
-
-How does it actually stack up on speed and recall? We measure instead of claiming — see [Benchmarks](#performance).
-
-
-## Requirements
-
-- iOS 17+ / macOS 14+ / visionOS 1+ (Accelerate's modern vDSP API requires these)
-- Xcode 15+ / Swift 5.9+
-- Apple Silicon recommended — the SIMD paths are Apple Silicon–optimised
-
-## Installation
+Add ProximaKit with the Swift Package Manager:
 
 ```swift
 // Package.swift
@@ -142,33 +54,34 @@ dependencies: [
 )
 ```
 
-## Quick Start
+Requires iOS 17+ / macOS 14+ / visionOS 1+ and Swift 5.9+ (Xcode 15+). Apple Silicon is recommended — the SIMD paths are tuned for it.
 
-### Add a Vector, Search It
+## Quick start
 
-With ProximaKit added as a dependency (above), semantic search is three steps — embed, index, search:
+Embed text with Apple's on-device model, index it, and search by meaning — no downloads, no API key:
 
 ```swift
+import Foundation
 import ProximaKit
 import ProximaEmbeddings
 
 let embedder = try NLEmbeddingProvider(language: .english)
 let index = HNSWIndex(dimension: embedder.dimension, metric: CosineDistance())
 
-// Index a couple of sentences
+// Index a few sentences by meaning.
 for text in ["Dogs love playing fetch in the park",
-             "Fresh pasta tastes better than dried"] {
+             "Fresh pasta beats dried every time"] {
     try await index.add(embedder.embed(text), id: UUID())
 }
 
-// Search by meaning — no shared keywords required
+// Search by meaning — no shared keywords required.
 let query = try await embedder.embed("animals playing outside")
-let hits = await index.search(query: query, k: 3)   // → the dog sentence ranks first
+let hits = await index.search(query: query, k: 3)   // the dog sentence ranks first
 ```
 
-Apple's built-in language model does the embedding on-device — no downloads, no API key. Want metadata, per-user filtering, or the distances behind each hit? See [Search Text by Meaning](#search-text-by-meaning) below.
+Apple's built-in language model does the embedding on-device — no API key. Want metadata, per-user filtering, or the distance behind each hit? See [Search text by meaning](#search-text-by-meaning) below.
 
-### Run the Demo
+### Run the demo
 
 ```bash
 git clone https://github.com/vivekptnk/ProximaKit.git
@@ -178,7 +91,7 @@ swift run ProximaDemo
 
 Or open `Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj` in Xcode for the full GUI experience.
 
-### Build a RAG App
+### Build a RAG app
 
 Retrieval-augmented generation over your own notes — embed, index, retrieve, and let an on-device language model answer with citations. The whole pipeline is ~130 lines of Swift, works in airplane mode, and ships as a runnable target:
 
@@ -190,8 +103,53 @@ ProximaKit does the retrieval; Apple's FoundationModels on-device LLM answers wh
 
 New to vector search itself? The [interactive DocC tutorial](https://vivekptnk.github.io/ProximaKit/tutorials/meetproximakit) builds the core pipeline step by step.
 
+## Measured, not claimed
 
-## How It Works
+ProximaKit publishes numbers instead of adjectives. Recall floors are enforced in CI, and release-mode latency and QPS against FAISS and ScaNN are generated nightly by the cross-library harness and published as CI artifacts — never hand-copied into docs where they'd go stale.
+
+- **Benchmark card** (start here): [`docs/BENCHMARK-CARD.md`](docs/BENCHMARK-CARD.md)
+- **Full methodology and results:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
+
+Backed by ~600 tests across eight releases. Downstream, ProximaKit is the vector-search layer of the author's own Chakravyuha projects — most concretely tinybrain, an on-device agent-memory system whose ProximaKit adoption (WAL-journaled RAG index, in-index chunk metadata) is documented in the [RAG wrapper recipe](docs/RAG-WRAPPER-RECIPE.md) and [ADR-015](docs/adr/ADR-015-agent-memory-integration.md).
+
+## Why ProximaKit
+
+- **Pure Swift, from scratch.** The HNSW graph is implemented in Swift on Foundation and Accelerate — not a wrapper around a C++ library.
+- **Zero third-party runtime dependencies in the core library** — pure Swift on Foundation and Accelerate. (The one package dependency, swift-docc-plugin, is documentation tooling and never ships in your app.)
+- **No server, no cloud.** Everything runs on-device — no API key, no network, no data leaving the device.
+- **Hybrid search.** Dense semantic recall fused with BM25 keyword matching for exact terms, SKUs, and error codes ([`docs/HYBRID.md`](docs/HYBRID.md)).
+- **Two quantization tiers.** INT8 scalar (~4×, any metric, no training) and product quantization (32×), each with opt-in exact reranking.
+- **Crash-safe persistence.** Versioned binary format, an opt-in write-ahead log for O(change) saves, and memory-mapped paging — recovery proven with an out-of-process SIGKILL rig, not just asserted in-process.
+
+## How it compares
+
+A Swift developer's real shortlist is other on-device Swift libraries — not FAISS or Pinecone. Here is the honest lay of the land:
+
+| | ProximaKit | SimilaritySearchKit | VecturaKit | USearch |
+|---|---|---|---|---|
+| **Core** | Pure Swift | Pure Swift | Pure Swift | C++ core, Swift binding |
+| **Focus** | Search engine (+ optional embeddings) | Embeddings + search, batteries-included | On-device vector DB, pluggable embedders | Bare similarity-search engine |
+| **Search** | HNSW (from scratch) | Brute force (HNSW on the roadmap) | Vector + BM25 hybrid | HNSW |
+| **Platforms** | iOS 17 · macOS 14 · visionOS 1 | iOS · macOS | iOS · macOS · tvOS · visionOS · watchOS | Cross-platform (iOS, Android, servers, WASM) |
+
+- **Choose ProximaKit** when you want a pure-Swift, from-scratch HNSW engine for Apple platforms with quantization tiers, hybrid BM25+dense search, and crash-safe incremental persistence — no C++ bridge, no server.
+- **Choose SimilaritySearchKit** when you want the fastest path to on-device semantic search with embedding models bundled in, and a corpus small enough that brute-force search is fine.
+- **Choose VecturaKit** when you want a batteries-included on-device vector database with pluggable embedders (Apple NL, OpenAI-compatible, MLX) and the broadest Apple-platform reach, including watchOS and tvOS.
+- **Choose USearch** when you need a battle-tested, cross-platform HNSW engine — the same index across iOS, Android, servers, and the browser — and you are comfortable consuming a C++ core through its Swift binding.
+
+FAISS and Pinecone are a different category: FAISS is a C++ library aimed at server and desktop that needs bridging to run on Apple devices, and Pinecone is a hosted cloud service where your vectors leave the device. Full side-by-side, with sources: [`docs/COMPARISON.md`](docs/COMPARISON.md).
+
+## What's inside
+
+HNSW graph search, hybrid BM25+dense retrieval, product (32×) and INT8 (~4×) quantization, graph-aware filtered search, nine distance metrics, crash-safe persistence with WAL and mmap paging, and Apple-framework embedding providers — every index a Swift `actor`. The full capability matrix, with a design-decision link on each row, lives in [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md).
+
+## Learn more
+
+- **Documentation:** [API reference (DocC)](https://vivekptnk.github.io/ProximaKit/) · [Architecture](docs/ARCHITECTURE.md) · [Hybrid search](docs/HYBRID.md) · [Benchmarks](docs/BENCHMARKS.md)
+- **Examples:** [On-device RAG](Examples/OnDeviceRAG/) · [Demo app — iOS / macOS / visionOS](Examples/ProximaDemoApp/)
+- **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
+
+## How it works
 
 <p align="center">
   <img src="docs/assets/hnsw-search.svg" alt="Animated HNSW search: greedy descent across sparse upper layers, then beam search on layer 0 to the nearest neighbor" width="760" />
@@ -261,7 +219,7 @@ The animated terminal at the top of this README replays a real `swift run Proxim
 Open in Xcode: `open Examples/ProximaDemoApp/ProximaDemoApp.xcodeproj`
 
 
-## Search Text by Meaning
+## Search text by meaning
 
 The simplest thing you can do. Uses Apple's built-in language model — no downloads, no setup.
 
@@ -307,7 +265,7 @@ let mine = await index.search(query: query, k: 3) { allowedIDs.contains($0) }
 On `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` the predicate is applied *during* graph traversal (with adaptive beam widening), so even highly selective filters return a full `k` results instead of under-filling. `SparseIndex` (BM25) keeps a post-filter — it has no `ef`-bounded beam to route through, so under-filling doesn't apply to it the same way ([ADR-008](docs/adr/ADR-008-filtered-search.md)).
 
 
-## Hybrid Search: Meaning + Keywords
+## Hybrid search: meaning + keywords
 
 Dense search wins at paraphrase; BM25 wins at exact terms ("error E42", SKUs, names). `HybridIndex` runs both legs concurrently and fuses the rankings:
 
@@ -319,7 +277,7 @@ let hits = await hybrid.search(queryText: "error E42", queryVector: queryVector,
 
 Fusion defaults to Reciprocal Rank Fusion (`.rrf(k: 60)`); `.weightedSum(alpha:)` is available when you've measured your corpus. Full design in [`docs/HYBRID.md`](docs/HYBRID.md).
 
-## Shrink the Index: INT8 Quantization
+## Shrink the index: INT8 quantization
 
 <p align="center">
   <img src="docs/assets/quantization.svg" alt="Animated comparison: a 384-dim vector at 1,536 bytes in Float32 shrinks to 388 bytes with INT8 scalar quantization and 48 bytes with product quantization" width="760" />
@@ -339,7 +297,7 @@ Need to go further? `QuantizedHNSWIndex` (product quantization) compresses 32× 
 
 If recall matters more than the memory win, build the PQ index with `retainOriginals: true`: search then re-scores the top quantized candidates with exact distances before returning, recovering recall@10 to a CI-asserted ≥ 0.90 floor — observed 0.99–1.00 on the seeded fixtures ([ADR-012](docs/adr/ADR-012-pq-reranking.md)). Be aware of the trade — retaining originals stores the Float32 vectors again, so you give up the compression story for accuracy.
 
-### Paged PQ Originals (mmap)
+### Paged PQ originals (mmap)
 
 Retaining originals normally gives that memory back up — the Float32 vectors sit resident again. Opening `.paged` restores the compression story by keeping them on disk instead, faulted in only for the rerank step:
 
@@ -357,7 +315,7 @@ try PersistenceEngine.upgradeToV3(at: fileURL)    // .pxkt: same shape, for HNSW
 Or from the command line: `ProximaBench migrate --path index.qhnsw` (family auto-detected from the file's magic bytes). Measured, Apple M4 Max, release: a 146.5 MB originals payload costs **8.0 MB** resident opened `.paged` — 18× less than the payload — versus **43.1 MB** opened `.resident` (5.4× more than paged), flat across warm reranks, with search results bit-identical either way. `.resident` stays the default. Design and measured numbers: [ADR-014](docs/adr/ADR-014-paged-originals.md).
 
 
-## Search Images
+## Search images
 
 ```swift
 let vision = VisionEmbeddingProvider()
@@ -370,7 +328,7 @@ let similar = await imageIndex.search(query: queryVector, k: 5)
 ```
 
 
-## Save and Load
+## Save and load
 
 Don't rebuild the index every time your app launches.
 
@@ -384,7 +342,7 @@ let loaded = try HNSWIndex.load(from: fileURL)
 
 The format carries a magic number and version field; loaders validate graph structure before trusting it and throw typed `PersistenceError`s on corrupt input instead of crashing. Evolution policy: [ADR-010](docs/adr/ADR-010-format-evolution.md).
 
-### Incremental Saves (WAL)
+### Incremental saves (WAL)
 
 Full re-saves cost O(corpus) — fine occasionally, expensive on every mutation. `HNSWIndex` has an opt-in write-ahead log that makes saves O(change) instead:
 
@@ -422,7 +380,7 @@ for note in notes {
 
 `HybridVectorStore.open(name:embedder:storageDirectory:metric:hnswConfig:bm25Config:tokenizer:fusion:durability:checkpointAutomatically:dense:)` takes the same shape. Under journaling, `save()` becomes an O(1) durability flush rather than a full rewrite; `checkpointAutomatically:` makes the store fold the WAL when the policy trips, so the common ingest loop stays at `addChunks` + `save`. Manual `needsCheckpoint(policy:)` / `checkpoint()` remains available when you want to schedule the O(corpus) fold yourself. The honest guarantee: after any crash, the next `open` rebuilds the document map — and, for hybrid, the entire WAL-less BM25 sparse leg — from the recovered dense index's own live entries, never from the sidecar files on disk, so a doc-map or sparse entry surviving without a live vector behind it is structurally impossible. The historical (non-`open`) initializers and their `save()` semantics are unchanged. Design and Stage 1 notes, plus the store-level journaling addendum: [ADR-013](docs/adr/ADR-013-streaming-persistence.md).
 
-### Paged Vectors (mmap)
+### Paged vectors (mmap)
 
 For corpora that don't comfortably fit in RAM, opening in `.paged` mode serves the vector section straight from a read-only file mapping instead of decoding it resident, keeping only the graph, ids, levels, metadata, and any post-snapshot adds in memory:
 
@@ -435,7 +393,7 @@ let index = try await HNSWIndex.open(
 Paging requires a padded v3 base — any `checkpoint(...)` call writes one; a Stage-1, unpadded v3 base still loads fine, just resident, until one more `checkpoint` pads it. `.resident` stays the default and is byte-identical to before. One contract worth knowing: the mapping is read-only and ProximaKit never truncates its own files, but truncating a mapped base from outside the library is out of contract and raises an uncatchable SIGBUS.
 
 
-## Use a Custom AI Model (CoreML)
+## Use a custom AI model (CoreML)
 
 For higher quality search, bring a real sentence-transformer model:
 
@@ -536,7 +494,7 @@ Deep dive: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
 ## Performance
 
-Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full methodology; the highlights:
+Measured numbers live in [`docs/BENCHMARK-CARD.md`](docs/BENCHMARK-CARD.md) (summary card) and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) (full methodology); the highlights:
 
 ```
  ╔══════════════════════════════════════════════════════╗
@@ -546,14 +504,14 @@ Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full me
  ║  ⚡ Release-mode p50/p95 latency + QPS: published   ║
  ║     nightly from the FAISS/ScaNN harness (CI        ║
  ║     artifacts — never hand-copied, never stale)     ║
- ║  ⚡ Cold start   ~50 ms load (10K-vector index)     ║
+ ║  ⚡ Cold start   24.3 ms @ 10K · 408.4 ms @ 100K    ║
+ ║      vectors — load is O(file size), fully resident ║
  ║                                                      ║
- ║  ◎ Recall@10, real embeddings (512d):               ║
+ ║  ◎ Recall@10, real NLEmbedding sentences (512d):   ║
  ║      100% measured  ·  >95% enforced in CI          ║
- ║  ◎ Recall@10 floors:                                ║
- ║      ≥95% INT8-quantized (euclidean) — CI-enforced  ║
- ║      >90% @ 1K · >82% @ 10K (random vectors,        ║
- ║      asserted in the benchmark suite*)              ║
+ ║  ◎ Recall@10 floors (CI / test-suite enforced):    ║
+ ║      ≥95% INT8 (clustered 64d, euclidean)           ║
+ ║      >90% @ 1K · >82% @ 10K (random vectors*)       ║
  ║                                                      ║
  ║  ✓ Save/load roundtrip: exact binary match           ║
  ║  ✓ vDSP batch ops beat naive loops (CI-asserted)     ║
@@ -566,7 +524,7 @@ Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full me
 **Cross-library comparison (FAISS, ScaNN):** numbers are generated nightly by [`benchmark.yml`](.github/workflows/benchmark.yml) on SIFT1M-100K against shared brute-force ground truth (MS MARCO-50K is available in the harness for manual runs), and published as CI artifacts — never hand-copied into docs where they'd go stale. Harness + methodology: [`Benchmarks/`](Benchmarks/README.md), [ADR-005](docs/adr/ADR-005-benchmark-methodology.md). Results are reported honestly, including when ProximaKit loses.
 
 
-## Which Index Should I Use?
+## Which index should I use?
 
 | Index | When | Memory |
 |-------|------|--------|
@@ -580,7 +538,7 @@ Measured numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) with full me
 `HNSWIndex` and `BruteForceIndex` share the same `VectorIndex` API — swap them without changing any other code.
 
 
-## Which Distance Metric?
+## Which distance metric?
 
 | Metric | When | Plain English |
 |--------|------|---------------|
@@ -617,7 +575,7 @@ let config = HNSWConfiguration(
 | Flaky recall in tests | Set `levelSeed` for deterministic graph topology |
 
 
-## Thread Safety
+## Thread safety
 
 ProximaKit is fully thread-safe. Every index and store is a Swift `actor`, the public surface is `Sendable`, and the package builds with `StrictConcurrency` enabled — the compiler enforces it at build time.
 
@@ -628,7 +586,7 @@ try await index.add(newVector, id: UUID())
 ```
 
 
-## API Reference
+## API reference
 
 ### ProximaKit (core)
 
@@ -668,7 +626,7 @@ try await index.add(newVector, id: UUID())
 - **Interactive tutorial:** [Build On-Device Semantic Search](https://vivekptnk.github.io/ProximaKit/tutorials/meetproximakit) — a step-by-step DocC tutorial: create an index, embed text with NLEmbedding, search by meaning, persist to disk
 - **Guides:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/HYBRID.md`](docs/HYBRID.md) · [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) · [`docs/RAG-TUTORIAL.md`](docs/RAG-TUTORIAL.md) · [`docs/RAG-WRAPPER-RECIPE.md`](docs/RAG-WRAPPER-RECIPE.md)
 
-## Design Decisions
+## Design decisions
 
 See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-001](docs/adr/ADR-001-accelerate-for-math.md): Why Accelerate/vDSP for all vector math
@@ -688,7 +646,7 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-016](docs/adr/ADR-016-dynamic-m.md): Dynamic-`M` HNSW schedules — **Deferred, measurement-gated, leaning NO-GO**; a declared recall-uplift + Pareto-vs-uniform-`m` gate would reopen it
 
 
-## Building & Testing
+## Building & testing
 
 ```bash
 # Build
@@ -736,3 +694,4 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
 MIT — use it for anything.
 
 **Author:** [Vivek Pattanaik](https://github.com/vivekptnk)
+
