@@ -1,0 +1,108 @@
+name: Bug report
+description: Report a problem with ProximaKit
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. The more precise the repro, the faster it gets fixed.
+
+  - type: input
+    id: version
+    attributes:
+      label: ProximaKit version
+      description: The tag/commit you're on, or the value of `ProximaKit.version`.
+      placeholder: "1.8.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - iOS
+        - iPadOS
+        - visionOS
+        - tvOS
+        - watchOS
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      description: The specific OS version you reproduced this on.
+      placeholder: "macOS 15.1, iOS 18.1, etc."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: index-type
+    attributes:
+      label: Index / store type
+      description: Which ProximaKit type is involved?
+      options:
+        - HNSWIndex
+        - QuantizedHNSWIndex
+        - ScalarQuantizedHNSWIndex
+        - HybridIndex
+        - SparseIndex
+        - VectorStore
+        - HybridVectorStore
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: dimension
+    attributes:
+      label: Vector dimension
+      placeholder: "384"
+    validations:
+      required: true
+
+  - type: input
+    id: corpus-size
+    attributes:
+      label: Approximate corpus size
+      description: Roughly how many vectors were indexed when you hit this?
+      placeholder: "~10,000 vectors"
+    validations:
+      required: false
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal repro
+      description: The smallest Swift snippet that reproduces the issue. Synthetic vectors are fine — we don't need your real data.
+      render: swift
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the exact error, crash trace, or incorrect output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else — related ADRs, whether this reproduces on `main`, etc.
+    validations:
+      required: false

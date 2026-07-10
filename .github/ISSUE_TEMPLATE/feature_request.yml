@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose a new capability or API for ProximaKit
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use case first, API sketch second — it's much easier to review a proposal when we understand the problem before the shape of the solution.
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What are you trying to build? What's missing or awkward about ProximaKit today that makes it hard?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-api
+    attributes:
+      label: Proposed API
+      description: Optional. A rough Swift sketch of the API you have in mind — signatures over prose.
+      render: swift
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you're using today, or other designs you considered.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: adr-area
+    attributes:
+      label: Does this touch Quantization, GPU, or Filtered-Search?
+      description: >-
+        Per CONTRIBUTING.md, these three areas require an accepted ADR
+        (docs/adr/) before a PR is opened. Flagging it here helps route the
+        discussion correctly.
+      options:
+        - "No"
+        - "Yes"
+        - "Not sure"
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+    validations:
+      required: false

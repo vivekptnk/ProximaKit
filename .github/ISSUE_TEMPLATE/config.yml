@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions & help
+    url: https://github.com/vivekptnk/ProximaKit/discussions
+    about: Ask usage questions or start an open-ended discussion — not for bug reports or feature proposals.
