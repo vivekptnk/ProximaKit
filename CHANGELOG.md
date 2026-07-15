@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [1.9.0] — 2026-07-15
+
 ### Added
 - **`HNSWGraphSnapshot` + `HNSWIndex.liveGraphSnapshot()`: read-only
   live-graph inspection.** A read-only, value-typed view of the live HNSW
@@ -16,8 +20,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`nodesPerLayer`). Unlike `persistenceSnapshot()`, it never compacts and
   never materializes vectors, reading the layer arrays directly and applying
   the same liveness/tombstone filter search and compaction use — keeping
-  inspection side-effect-free and O(live graph) instead of a save-path
-  operation.
+  inspection side-effect-free. Runtime is linear in stored slots (including
+  tombstones), represented-layer accounting, and the inspected live layer-0
+  adjacency; it is not described as O(live graph).
+- **Public persistence file-extension constants.**
+  `ProximaKit.FileExtension.index`, `.writeAheadLog`, and `.sparseIndex` expose
+  the canonical `pxkt`, `pxwal`, and `pxbm` suffixes so consumer wrappers do
+  not duplicate persistence filenames as string literals.
+- **Canonical index layout names, with source-compatible deprecations
+  ([ADR-015](docs/adr/ADR-015-agent-memory-integration.md), Stage C).**
+  `IndexSaveLayout` (`.resident` / `.pagedV3`) is now the canonical quantized
+  save-layout type alongside `IndexResidency` (`.resident` / `.paged`).
+  `HNSWOpenMode`, `PQHWOpenMode`, and `PQHWSaveLayout` remain deprecated
+  typealiases, so existing source keeps compiling and persisted files require
+  no migration.
 
 ### Changed
 - **Demo Index Inspector now reads through `liveGraphSnapshot()`
@@ -26,8 +42,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `persistenceSnapshot()` save/compaction path (safe at the time
   because the demo Search index is append-only); it now calls the additive,
   non-mutating accessor added above.
+- **PQ benchmark-class tests are explicitly acceptance/release validation, not
+  normal PR functional CI.** `PQBenchmarkTests` remains opt-in through
+  `PROXIMA_PQ_BENCH=1` and is run as an acceptance/release gate; normal PR CI
+  continues to skip both long benchmark classes. Core-index PRs retain the
+  separate SIFT smoke regression gate.
 
 ### Documentation
+- **Agent Memory DocC guide.** New
+  [`AgentMemory.md`](Sources/ProximaKit/Documentation.docc/AgentMemory.md)
+  documents the recommended one journaled `HybridVectorStore` (or dense-only
+  `VectorStore`) with automatic checkpointing and `.paged` residency, hybrid
+  recall, UUID-to-domain metadata filtering, raw-HNSW first-base bootstrap,
+  the optional consumer-composed hot/cold architecture, and the explicit
+  mechanism/policy boundary: consumers own summarization, salience,
+  forgetting, promotion, tier cadence, and distillation. It links to the raw
+  wrapper recipe rather than duplicating that implementation.
+- **RAG wrapper recipe — initial consumer guide.** New
+  [`docs/RAG-WRAPPER-RECIPE.md`](docs/RAG-WRAPPER-RECIPE.md) documents the
+  first-class raw-`HNSWIndex` wrapper path: in-index chunk records, WAL-backed
+  crash recovery, checkpoint lifecycle, cache acceptance, and sidecar
+  reconciliation from `liveEntries()`, with a compiled companion test as the
+  source of truth. The guide now bridges to the Agent Memory DocC article for
+  store-level and policy guidance.
+- **Benchmark card, capability/competition pages, and README conversion
+  rewrite.** Added the reproducible 10K/100K release-mode benchmark card,
+  corrected cold-open scaling to O(file size), refreshed the capability matrix
+  and Swift-ecosystem comparison, and rewrote the README's landing flow,
+  measured-performance summary, API references, and roadmap links without
+  changing benchmark methodology or values.
+- **Community surface.** Added issue and pull-request templates,
+  `SECURITY.md`, and `CODE_OF_CONDUCT.md` so bug reports, security disclosures,
+  and contributions have explicit public paths.
 - **Engineering-process page + release-notes editorial pass.** New
   [`docs/ENGINEERING-PROCESS.md`](docs/ENGINEERING-PROCESS.md) documents how
   ProximaKit is designed, built, and verified — the measure-before-optimize

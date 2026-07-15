@@ -12,7 +12,7 @@ In your `Package.swift`, add ProximaKit as a dependency:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.0.0")
+    .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.9.0")
 ]
 ```
 

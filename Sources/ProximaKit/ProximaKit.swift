@@ -13,7 +13,7 @@
 /// The ProximaKit namespace. Version constant for runtime checks.
 public enum ProximaKit {
     /// The current library version.
-    public static let version = "1.8.0"
+    public static let version = "1.9.0"
 
     /// Public file-extension constants for ProximaKit persistence artifacts.
     public enum FileExtension {
