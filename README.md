@@ -29,7 +29,7 @@ Everything runs **on-device**. No server, no API key, no internet. Just your app
 - **Private notes & document search** — index a user's own text and retrieve by meaning, entirely on-device.
 - **On-device RAG** — retrieve context for an on-device LLM to answer from, offline. Runnable example: [`Examples/OnDeviceRAG/`](Examples/OnDeviceRAG/).
 - **Photo & image similarity** — embed images with Apple's Vision framework and surface visual near-duplicates.
-- **Agent memory** — a durable, crash-safe vector store an on-device agent can write to and recall from ([ADR-015](docs/adr/ADR-015-agent-memory-integration.md)).
+- **Agent memory** — a durable, crash-safe vector store an on-device agent can write to and recall from ([Agent Memory guide](Sources/ProximaKit/Documentation.docc/AgentMemory.md) · [ADR-015](docs/adr/ADR-015-agent-memory-integration.md)).
 
 Everything stays local: no server, no API key, no vectors leaving the device.
 
@@ -40,7 +40,7 @@ Add ProximaKit with the Swift Package Manager:
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.8.0")
+    .package(url: "https://github.com/vivekptnk/ProximaKit.git", from: "1.9.0")
 ]
 ```
 
@@ -105,12 +105,12 @@ New to vector search itself? The [interactive DocC tutorial](https://vivekptnk.g
 
 ## Measured, not claimed
 
-ProximaKit publishes numbers instead of adjectives. Recall floors are enforced in CI, and release-mode latency and QPS against FAISS and ScaNN are generated nightly by the cross-library harness and published as CI artifacts — never hand-copied into docs where they'd go stale.
+ProximaKit publishes numbers instead of adjectives. Functional tests run on normal PR CI; long Recall/PQ acceptance suites are opt-in and release-gated, while the SIFT smoke regression gate covers core-index PRs. Release-mode latency and QPS against FAISS and ScaNN are generated nightly by the cross-library harness and published as CI artifacts — never hand-copied into docs where they'd go stale.
 
 - **Benchmark card** (start here): [`docs/BENCHMARK-CARD.md`](docs/BENCHMARK-CARD.md)
 - **Full methodology and results:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
 
-Backed by ~600 tests across eight releases. Downstream, ProximaKit is the vector-search layer of the author's own Chakravyuha projects — most concretely tinybrain, an on-device agent-memory system whose ProximaKit adoption (WAL-journaled RAG index, in-index chunk metadata) is documented in the [RAG wrapper recipe](docs/RAG-WRAPPER-RECIPE.md) and [ADR-015](docs/adr/ADR-015-agent-memory-integration.md).
+Backed by ~600 tests across nine releases. Downstream, ProximaKit is the vector-search layer of the author's own Chakravyuha projects — most concretely tinybrain, an on-device agent-memory system whose ProximaKit adoption is documented in the [Agent Memory guide](Sources/ProximaKit/Documentation.docc/AgentMemory.md), the [RAG wrapper recipe](docs/RAG-WRAPPER-RECIPE.md), and [ADR-015](docs/adr/ADR-015-agent-memory-integration.md).
 
 ## Why ProximaKit
 
@@ -305,7 +305,7 @@ Retaining originals normally gives that memory back up — the Float32 vectors s
 let index = try QuantizedHNSWIndex.load(from: fileURL, mode: .paged)
 ```
 
-`.paged` requires a v3 base that retains originals — write one with `try index.save(to: fileURL, layout: .pagedV3)`, or self-upgrade an existing base in place without a rebuild:
+`.paged` is `IndexResidency.paged` and requires a v3 base that retains originals — write one with canonical `IndexSaveLayout.pagedV3` (`try index.save(to: fileURL, layout: .pagedV3)`), or self-upgrade an existing base in place without a rebuild:
 
 ```swift
 try QuantizedHNSWIndex.upgradeToV3(at: fileURL)   // PQHW: section-copy, checksum-verified, atomic replace
@@ -609,6 +609,9 @@ try await index.add(newVector, id: UUID())
 | `BM25Configuration` | Tuning: `k1`, `b`, `autoCompactionThreshold`. |
 | `PersistenceEngine` | Versioned binary save/load with memory mapping; `upgradeToV3(at:)` self-upgrades a `.pxkt` base to the paging-capable v3 format in place. |
 | `WALDurability` / `WALCheckpointPolicy` | Opt-in journaling: fsync dial and checkpoint-trigger policy for `HNSWIndex.open`/`.checkpoint` and `VectorStore`/`HybridVectorStore.open`/`.checkpoint`. |
+| `IndexResidency` / `IndexSaveLayout` | Canonical resident/paged open policy and resident/paged-v3 quantized save layout. Deprecated aliases remain source-compatible; persisted files need no migration. |
+| `HNSWGraphSnapshot` / `HNSWIndex.liveGraphSnapshot()` | Non-mutating live graph inspection without vector materialization or save-path compaction. |
+| `ProximaKit.FileExtension` | Public `index`, `writeAheadLog`, and `sparseIndex` persistence suffix constants. |
 
 ### ProximaEmbeddings (content to vectors)
 
@@ -624,7 +627,7 @@ try await index.add(newVector, id: UUID())
 
 - **API reference (DocC):** <https://vivekptnk.github.io/ProximaKit/> — rebuilt and published from `main` on every push
 - **Interactive tutorial:** [Build On-Device Semantic Search](https://vivekptnk.github.io/ProximaKit/tutorials/meetproximakit) — a step-by-step DocC tutorial: create an index, embed text with NLEmbedding, search by meaning, persist to disk
-- **Guides:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/HYBRID.md`](docs/HYBRID.md) · [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) · [`docs/RAG-TUTORIAL.md`](docs/RAG-TUTORIAL.md) · [`docs/RAG-WRAPPER-RECIPE.md`](docs/RAG-WRAPPER-RECIPE.md)
+- **Guides:** [Agent Memory](Sources/ProximaKit/Documentation.docc/AgentMemory.md) · [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/HYBRID.md`](docs/HYBRID.md) · [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) · [`docs/RAG-TUTORIAL.md`](docs/RAG-TUTORIAL.md) · [`docs/RAG-WRAPPER-RECIPE.md`](docs/RAG-WRAPPER-RECIPE.md)
 
 ## Design decisions
 
@@ -642,7 +645,7 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 - [ADR-012](docs/adr/ADR-012-pq-reranking.md): Full-precision reranking for quantized HNSW
 - [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — Stage 1 (WAL incremental saves) **shipped**; Stage 2 (paged vectors) **shipped**; store-level journaling (`VectorStore`/`HybridVectorStore.open(...)`, derivation-based crash consistency) **shipped**
 - [ADR-014](docs/adr/ADR-014-paged-originals.md): Paged originals for quantized reranking — PQHW v3 format + migration (Stage 1) **shipped**; paged read path (Stage 2) **shipped**
-- [ADR-015](docs/adr/ADR-015-agent-memory-integration.md): Agent-memory integration for on-device agents — store-level auto-checkpoint, `HNSWIndex.load(from:mode:)` mirror, paged dense-leg store residency, and the unified `IndexResidency` naming foundation (Stages A+B **shipped**); the `PQHWSaveLayout` → `IndexSaveLayout` rename and the two-tier hot/cold pattern as consumer-composed docs (Stage C) remain **Proposed**
+- [ADR-015](docs/adr/ADR-015-agent-memory-integration.md): Agent-memory integration for on-device agents — **Accepted; Stages A+B+C implemented for v1.9**: automatic checkpointing, paged store residency, `HNSWIndex.load(from:mode:)`, canonical `IndexResidency` / `IndexSaveLayout`, deprecated source-compatible aliases, and the documented one-store plus optional consumer-composed hot/cold patterns
 - [ADR-016](docs/adr/ADR-016-dynamic-m.md): Dynamic-`M` HNSW schedules — **Deferred, measurement-gated, leaning NO-GO**; a declared recall-uplift + Pareto-vs-uniform-`m` gate would reopen it
 
 
@@ -652,22 +655,21 @@ See [`docs/adr/`](docs/adr/) for Architecture Decision Records:
 # Build
 swift build
 
-# CI-equivalent functional suite — ~600 tests, no recall benchmarks.
-# Not a quick check: ~20-30 min locally on Apple Silicon, measured
-# 33-38 min on CI's shared macos-15 runner (this is what CI actually runs).
-swift test --skip RecallBenchmarkTests
+# CI-equivalent functional suite — excludes the long recall/PQ acceptance sweeps.
+swift test --skip RecallBenchmarkTests --skip PQBenchmarkTests
 
 # Fast inner loop while iterating — one test class runs in seconds
 swift test --filter VectorStoreTests
 
-# Full recall benchmarks (slow, needs Release mode)
-swift test -c release --filter RecallBenchmarkTests
+# Opt-in acceptance benchmarks (slow; use Release mode)
+PROXIMA_RECALL_BENCH=1 swift test -c release --filter RecallBenchmarkTests
+PROXIMA_PQ_BENCH=1 swift test -c release --filter PQBenchmarkTests
 
 # Generate DocC documentation
 swift package generate-documentation --target ProximaKit
 ```
 
-CI runs the full functional suite (~600 tests; benchmark classes run separately), SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR — plus a benchmark smoke-slice regression gate on PRs that touch the core index.
+CI runs the functional suite with the long Recall and PQ acceptance classes excluded, plus SwiftLint, an iOS Simulator build, DocC generation, and a release-consistency check on every PR. Recall/PQ acceptance runs in scheduled or release validation, while core-index PRs also receive the benchmark smoke-slice regression gate.
 
 
 ## Roadmap
@@ -679,13 +681,14 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the detailed plan. Highlights:
 | Graph-aware filtered search — higher recall under selective filters | **Shipped** for `HNSWIndex`, `QuantizedHNSWIndex`, and `ScalarQuantizedHNSWIndex` ([ADR-008 addenda](docs/adr/ADR-008-filtered-search.md)); `SparseIndex` stays post-filter (no beam to route through) |
 | GPU acceleration | v1 shipped: `MetalBatchDistance` batch utility ([ADR-009](docs/adr/ADR-009-metal-backend.md)). Index build/search integration measured and decided **NO-GO** — vDSP (AMX) wins at every tested scale, no crossover |
 | Streaming persistence — incremental saves (WAL) + paged vectors | **Shipped** ([ADR-013](docs/adr/ADR-013-streaming-persistence.md)) — index-level WAL + opt-in paged vector region, plus store-level journaling on `VectorStore`/`HybridVectorStore` |
-| Agent-memory ergonomics — store-level auto-checkpoint, `HNSWIndex.load(from:mode:)` mirror, paged dense-leg store option, unified `IndexResidency` | **Shipped**, Stages A+B ([ADR-015](docs/adr/ADR-015-agent-memory-integration.md), design status Proposed) — the `PQHWSaveLayout` rename and the two-tier hot/cold pattern as consumer docs (Stage C) remain open |
+| Agent-memory ergonomics — automatic checkpointing, paged store residency, canonical index naming, and documented composition patterns | **Shipped**, Stages A+B+C for v1.9 ([Agent Memory guide](Sources/ProximaKit/Documentation.docc/AgentMemory.md), [ADR-015](docs/adr/ADR-015-agent-memory-integration.md)); deprecated aliases require no persistence migration |
 | Paged PQ originals — restore 32× compression with exact reranking | **Shipped** ([ADR-014](docs/adr/ADR-014-paged-originals.md)) — PQHW v3 format, v2→v3 migration rewriter (both families, plus `ProximaBench migrate`), and the paged originals read path |
 | Jensen-Shannon divergence metric | **Shipped** — `JensenShannonDistance()`, serializable (`DistanceMetricType` raw value 7) |
 | Background HNSW compaction policy | Planned |
 | Hierarchical NSW variant with dynamic `M` | **Deferred, measurement-gated** ([ADR-016](docs/adr/ADR-016-dynamic-m.md)) — leaning NO-GO; a declared recall/Pareto gate would reopen it |
 | Demo app — Benchmark tab (in-app seeded `efSearch` sweep 16–256, recall@10-vs-latency SwiftUI Charts) | **Shipped** |
 | Demo app — Index Inspector, custom corpus import, results export (CSV / JSON) | **Shipped** |
+| CoreML model installation instructions | **Shipped** — verified `CoreMLEmbeddingProvider(modelAt:vocabURL:)` setup in this README |
 | Demo app — CoreML model download UI | Planned |
 
 

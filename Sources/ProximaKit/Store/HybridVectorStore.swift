@@ -306,8 +306,9 @@ public actor HybridVectorStore {
     /// durable — to the extent of the active ``WALDurability`` dial (see the
     /// `checkpointAutomatically` parameter for the `.manual` caveat). Do not
     /// retry that mutation: `addChunks` assigns fresh UUIDs, so
-    /// retrying would duplicate chunks. The store remains consistent, and the
-    /// next mutation, ``save()``, or ``checkpoint()`` re-attempts the fold.
+    /// retrying would duplicate chunks. The store remains consistent; the next
+    /// mutation re-attempts the automatic fold, or ``checkpoint()`` retries it
+    /// explicitly. ``save()`` only flushes the journaled WAL.
     ///
     /// - Parameter durability: dense-leg WAL flush policy (default `.everyBatch`).
     /// - Parameter checkpointAutomatically: Optional policy for folding the

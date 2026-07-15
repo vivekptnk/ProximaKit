@@ -25,20 +25,19 @@ swift build
 ### Run Tests
 
 ```bash
-# CI-equivalent functional suite — mirrors CI's Run Tests step exactly
-# (includes SIMDBenchmarkTests). ~590 tests, no recall benchmarks:
-# ~20-30 min locally on Apple Silicon, measured 33-38 min on CI's shared macos-15 runner.
-swift test --skip RecallBenchmarkTests
+# CI-equivalent functional suite — mirrors CI's Run Tests step exactly.
+swift test --skip RecallBenchmarkTests --skip PQBenchmarkTests
 
 # Fast inner loop while iterating — one test class runs in seconds
 swift test --filter VectorStoreTests
 
-# Bare `swift test` runs the same ~590 functional tests and is safe: RecallBenchmarkTests
-# self-skips unless PROXIMA_RECALL_BENCH=1 is set, so it won't hang on the 20+-minute sweeps.
+# Bare `swift test` is safe: both long acceptance classes self-skip unless
+# their strict opt-in environment variable is set.
 swift test
 
-# To include the recall benchmarks (each 10K sweep takes 20+ min; use Release mode):
-PROXIMA_RECALL_BENCH=1 swift test -c release
+# Opt-in acceptance benchmarks (slow; use Release mode):
+PROXIMA_RECALL_BENCH=1 swift test -c release --filter RecallBenchmarkTests
+PROXIMA_PQ_BENCH=1 swift test -c release --filter PQBenchmarkTests
 ```
 
 ### Run Lint
@@ -164,12 +163,11 @@ func testBenchmarkBatchL2_1K_384d()
 
 | Category | Filter | Purpose |
 |----------|--------|---------|
-| Unit tests | `swift test --skip RecallBenchmarkTests --skip SIMDBenchmarkTests` | Core correctness |
-| Recall benchmarks | `--filter RecallBenchmarkTests` | HNSW accuracy vs brute force |
+| CI-equivalent tests | `swift test --skip RecallBenchmarkTests --skip PQBenchmarkTests` | Functional correctness, including SIMD tests |
+| Recall acceptance | `PROXIMA_RECALL_BENCH=1 swift test -c release --filter RecallBenchmarkTests` | HNSW accuracy vs brute force |
+| PQ acceptance | `PROXIMA_PQ_BENCH=1 swift test -c release --filter PQBenchmarkTests` | PQ recall, compression, persistence, and throughput |
 | SIMD benchmarks | `--filter SIMDBenchmarkTests` | vDSP vs naive loop speedup |
 | Embedding tests | `--filter ProximaEmbeddingsTests` | NL, Vision, CoreML providers |
-
-> The **Unit tests** filter above additionally skips `SIMDBenchmarkTests` for a narrower, faster local-only correctness subset. It is *not* the same as the suite in [Run Tests](#run-tests) — `swift test --skip RecallBenchmarkTests`, which mirrors CI exactly and *does* run `SIMDBenchmarkTests`.
 
 ### Coverage Expectations
 
@@ -245,7 +243,7 @@ What becomes easier/harder?
 
 For these three areas specifically, an ADR with an **accepted** decision is a prerequisite for a PR — open the ADR (or point to an existing accepted one that already covers your change) before writing code, per [`docs/ROADMAP.md`](docs/ROADMAP.md#contributing). Other areas don't require an ADR up front, but still get one for any decision that would be expensive to reverse later.
 
-Current ADRs (13 — see `docs/adr/` for full text):
+Current ADRs (16 — see `docs/adr/` for full text):
 - [ADR-001](docs/adr/ADR-001-accelerate-for-math.md): Accelerate/vDSP for all vector math
 - [ADR-002](docs/adr/ADR-002-actor-isolation.md): Actor isolation for thread safety
 - [ADR-003](docs/adr/ADR-003-binary-persistence.md): Custom binary persistence format
@@ -258,7 +256,10 @@ Current ADRs (13 — see `docs/adr/` for full text):
 - [ADR-010](docs/adr/ADR-010-format-evolution.md): Serialization format evolution policy
 - [ADR-011](docs/adr/ADR-011-pq-codec.md): Product quantization codec format
 - [ADR-012](docs/adr/ADR-012-pq-reranking.md): Full-precision reranking for quantized HNSW
-- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — WAL incremental saves (Stage 1 accepted and shipped); on-demand paged vectors (Stage 2) remains design-only
+- [ADR-013](docs/adr/ADR-013-streaming-persistence.md): Streaming persistence — WAL incremental saves, on-demand paged vectors, and store-level journaling (Accepted; shipped)
+- [ADR-014](docs/adr/ADR-014-paged-originals.md): Paged originals for quantized reranking (Accepted; both stages shipped)
+- [ADR-015](docs/adr/ADR-015-agent-memory-integration.md): Agent-memory integration (Accepted; Stages A+B+C implemented for v1.9)
+- [ADR-016](docs/adr/ADR-016-dynamic-m.md): Dynamic-`M` HNSW schedules (Proposed; deferred and measurement-gated, leaning NO-GO)
 
 ---
 
@@ -285,10 +286,11 @@ docs: add ADR for memory-mapped persistence
 
 ### PR Checklist
 
-Before submitting, verify:
+Before submitting, verify the following. Maintainers preparing a tag should also
+follow the [release checklist](docs/RELEASE-CHECKLIST.md).
 
 - [ ] `swift build` succeeds with no warnings
-- [ ] `swift test --skip RecallBenchmarkTests` passes
+- [ ] `swift test --skip RecallBenchmarkTests --skip PQBenchmarkTests` passes
 - [ ] `swiftlint lint --strict` passes (pinned to 0.63.2, matching CI — see [Run Lint](#run-lint))
 - [ ] New public APIs have `///` documentation
 - [ ] New features have corresponding tests

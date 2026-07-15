@@ -97,8 +97,9 @@ a green check and a build you can run yourself. On every push and pull request
 ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)):
 
 - `swift build -Xswiftc -warnings-as-errors` (Debug) and `swift build -c release`
-- `swift test --skip RecallBenchmarkTests` (the long recall sweeps are opt-in
-  locally via `PROXIMA_RECALL_BENCH=1`)
+- `swift test --skip RecallBenchmarkTests --skip PQBenchmarkTests` (the long
+  Recall and PQ acceptance suites are opt-in in Release mode via
+  `PROXIMA_RECALL_BENCH=1` and `PROXIMA_PQ_BENCH=1`)
 - the demo app and the DocC documentation both build
 - a version / changelog consistency check
 - SwiftLint `--strict` (pinned) plus an import-policy guard
@@ -106,16 +107,20 @@ a green check and a build you can run yourself. On every push and pull request
 - a separate iOS-SDK compile, since a macOS `swift build` only exercises the
   macOS SDK
 
-Releases ([`.github/workflows/release.yml`](../.github/workflows/release.yml))
-verify that the `ProximaKit.version` constant matches the tag and publish notes
-extracted verbatim from [`CHANGELOG.md`](../CHANGELOG.md) — so the public release
-notes and this repository's changelog are, by construction, the same text.
+Scheduled/full benchmark runs execute the opt-in PQ acceptance suite in Release
+mode. Releases ([`.github/workflows/release.yml`](../.github/workflows/release.yml))
+rerun that suite on macOS before publication, verify that the
+`ProximaKit.version` constant matches the tag, and publish notes extracted
+verbatim from [`CHANGELOG.md`](../CHANGELOG.md) — so the public release notes and
+this repository's changelog are, by construction, the same text. The
+[release checklist](RELEASE-CHECKLIST.md) pins those gates to one exact `main`
+SHA and requires explicit version-and-SHA authorization before a tag is pushed.
 
 ## By the numbers
 
 Verified against the repository at the time of writing:
 
-- **8 tagged releases** (v1.0.0 → v1.8.0)
-- **621 test functions** across **67 XCTestCase suites** (62 test files)
+- **9 tagged releases** (v1.0.0 → v1.9.0)
+- **621 test functions** across **68 XCTestCase suites** (63 test files)
 - **16 Architecture Decision Records** (ADR-001 → ADR-016) recording the
   designs, the trade-offs, and the decisions that were deferred or declined

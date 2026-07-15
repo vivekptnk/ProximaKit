@@ -53,6 +53,7 @@ let results = await index.search(query: queryVector, k: 10)
 - ``VectorIndex``
 - ``HNSWConfiguration``
 - ``HNSWGraphSnapshot``
+- ``HNSWIndex/liveGraphSnapshot()``
 - ``IndexError``
 
 ### Hybrid & Keyword Search
@@ -80,10 +81,18 @@ let results = await index.search(query: queryVector, k: 10)
 - ``QuantizedHNSWIndex/load(from:mode:)``
 - ``QuantizedHNSWIndex/save(to:layout:)``
 - ``QuantizedHNSWIndex/upgradeToV3(at:)``
-- ``PQHWOpenMode``
-- ``PQHWSaveLayout``
+- ``IndexResidency``
+- ``IndexSaveLayout``
 - ``QuantizedHNSWIndex/originalsArePaged``
 - ``QuantizedHNSWIndex/mappedOriginalStorageBytes``
+
+### Agent Memory
+
+- <doc:AgentMemory>
+- ``HybridVectorStore``
+- ``VectorStore``
+- ``IndexResidency``
+- ``IndexSaveLayout``
 
 ### Document Stores
 

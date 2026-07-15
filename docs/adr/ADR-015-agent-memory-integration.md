@@ -2,16 +2,13 @@
 
 ## Status
 
-**Accepted (Stages A+B implemented; Stage C proposed).** Stage A (the opt-in
-`checkpointAutomatically:` auto-fold hook on `VectorStore.open` /
-`HybridVectorStore.open`) and Stage B (the paged dense leg plus the
-`HNSWIndex.load(from:mode:)` mirror, over the canonical `IndexResidency` enum)
-have both been implemented since this design was written; see the
-**Implementation notes (Stages A+B)** addendum at the end of this document for
-what was built and where it deviated from this design. Stage C (the
-`PQHWSaveLayout` -> `IndexSaveLayout` save-layout rename and the broader
-agent-memory / pattern documentation) remains proposed and is not yet
-implemented.
+**Accepted (Stages A+B+C implemented for v1.9).** The original design and its
+historical API names are preserved below. Stage A shipped the opt-in
+`checkpointAutomatically:` hook; Stage B shipped paged store residency and
+`HNSWIndex.load(from:mode:)`; Stage C completed the neutral naming and
+documentation work with canonical `IndexResidency` / `IndexSaveLayout`,
+deprecated source-compatible aliases, and the Agent Memory guide. See the
+implementation addenda at the end of this document.
 **Date:** 2026-07-04
 **Author:** Designer — ProximaKit
 **HEAD:** `aaaab80` (v1.7.0). Every `file:line` citation below is at this commit and was read, not inferred.
@@ -501,3 +498,27 @@ Still pending:
 - **Stage C docs/pattern work** beyond the shared residency naming foundation:
   broader agent-memory documentation, metadata-filter pattern docs, and any future
   staged deprecation annotations for old residency spellings.
+
+## Implementation addendum (Stage C, v1.9)
+
+Stage C subsequently shipped without changing the persistence formats described
+by ADR-013 and ADR-014:
+
+- `IndexSaveLayout` is the canonical save-layout type with `.resident` and
+  `.pagedV3` cases.
+- `IndexResidency` remains the canonical open-residency type with `.resident`
+  and `.paged` cases.
+- `HNSWOpenMode` and `PQHWOpenMode` are deprecated typealiases of
+  `IndexResidency`; `PQHWSaveLayout` is a deprecated typealias of
+  `IndexSaveLayout`. Existing source continues to compile with deprecation
+  diagnostics, and persisted files require no migration.
+- The DocC <doc:AgentMemory> guide documents the recommended single journaled
+  store, automatic-checkpoint failure semantics, paged residency, hybrid
+  recall, UUID-filter metadata mapping, raw-index bootstrap requirement, the
+  optional consumer-composed hot/cold pattern, and the mechanism/policy
+  boundary. The raw wrapper lifecycle remains in
+  [`docs/RAG-WRAPPER-RECIPE.md`](../RAG-WRAPPER-RECIPE.md).
+
+This addendum supersedes the earlier implementation note's “Still pending”
+list. The historical design body intentionally retains the names and staged
+recommendations that were current when it was written.
