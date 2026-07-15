@@ -60,13 +60,12 @@ jobs:
         run: swift build -c release
 
       - name: Run Tests
-        run: swift test --skip RecallBenchmarkTests
-        # RecallBenchmarkTests skipped in CI (take 2+ minutes, need large
-        # datasets) and is benchmarks-only: the fast functional tests that
-        # used to live there (testLiveCountAfterRemovals, testCompaction,
-        # testAutoCompaction*, testNonisolated*) moved to CompactionTests
-        # (CHA-201), which this unskipped run executes on every PR. Keep new
-        # functional tests out of RecallBenchmarkTests or CI won't run them.
+        run: swift test --skip RecallBenchmarkTests --skip PQBenchmarkTests
+        # RecallBenchmarkTests and PQBenchmarkTests are long-running acceptance
+        # suites. They retain local environment gates and run in Release mode in
+        # scheduled/release validation; all functional compaction, persistence,
+        # quantization, and store tests remain in this per-push suite. Keep new
+        # functional tests out of either benchmark class or CI will not run them.
 
       - name: Build Demo App
         run: swift build --target ProximaDemo
@@ -93,8 +92,8 @@ jobs:
   # Acceptance criterion for later proposing the swap: the 4 shards' Executed
   # counts must sum to the monolithic `Run Tests` total. The four --filter
   # regexes partition the suite exactly when combined with the same
-  # --skip RecallBenchmarkTests (RecallBenchmarkTests starts with R, which
-  # falls inside the QRSTVW chunk, so that shard skips it explicitly). Each
+  # benchmark skips: PQBenchmarkTests falls inside MNP and RecallBenchmarkTests
+  # falls inside QRSTVW, so those shards skip their benchmark class explicitly. Each
   # shard prints its "Executed N tests" line so the 4 counts can be summed and
   # compared against the monolithic run's total.
   test-sharded-experimental:
@@ -115,7 +114,7 @@ jobs:
             skip: ''
           - name: chunk-MNP
             filter: '^ProximaKitTests\.(M|N|P)'
-            skip: ''
+            skip: 'PQBenchmarkTests'
           - name: chunk-QRSTVW
             filter: '^ProximaKitTests\.(Q|R|S|T|V|W)'
             skip: 'RecallBenchmarkTests'
@@ -150,8 +149,9 @@ jobs:
         run: swift build -c release
 
       - name: Run Tests (shard ${{ matrix.name }})
-        # Shard the monolithic `swift test --skip RecallBenchmarkTests` into one
-        # matrix.filter regex per shard. `set +e` disables the runner's default
+        # Shard the monolithic functional suite into one matrix.filter regex per
+        # shard, applying the matching benchmark skip in MNP/QRSTVW. `set +e`
+        # disables the runner's default
         # `-e` so a failing shard still reaches the reconciliation output; the
         # swift test exit status is captured from PIPESTATUS[0] (unaffected by
         # the `tee`) and re-exited at the end to keep this step's own reported
@@ -167,7 +167,7 @@ jobs:
             status=${PIPESTATUS[0]}
           fi
           echo "::group::Executed count — shard ${{ matrix.name }}"
-          grep -E 'Executed [0-9]+ tests?, with' "$LOG" \
+          grep -E 'Executed [0-9]+ tests?, with' "$LOG" | tail -n 1 \
             || echo "(no 'Executed N tests' summary line found in $LOG)"
           echo "::endgroup::"
           exit "$status"

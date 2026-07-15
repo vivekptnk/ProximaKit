@@ -17,7 +17,8 @@ import XCTest
 /// We test with Euclidean distance and progressively larger datasets.
 ///
 /// This class is intentionally benchmarks-only and is skipped in CI
-/// (`swift test --skip RecallBenchmarkTests` — the sweeps take minutes).
+/// (CI's Run Tests step passes `--skip RecallBenchmarkTests` — the sweeps
+/// take minutes).
 /// Fast functional compaction / auto-compaction / nonisolated-property tests
 /// were moved to `CompactionTests` (CHA-201) so CI runs them; do not add
 /// functional tests here.

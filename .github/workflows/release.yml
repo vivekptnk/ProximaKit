@@ -5,12 +5,41 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  XCODE_VERSION: "16.2"
 
 jobs:
+  pq-validation:
+    name: Validate PQ Acceptance Benchmarks
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+
+      - name: Cache Swift build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Tests/**/*.swift') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-
+
+      - name: Run PQ acceptance benchmarks
+        run: PROXIMA_PQ_BENCH=1 swift test -c release --filter PQBenchmarkTests
+
   release:
     name: Validate & Publish Release
-    # grep/gh only — no Swift toolchain needed, so use the cheap runner.
+    needs: pq-validation
+    permissions:
+      contents: write
+    # Publication uses grep/gh only, so keep it on the inexpensive runner.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

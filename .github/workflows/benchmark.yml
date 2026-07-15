@@ -23,6 +23,9 @@ concurrency:
   group: benchmark-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  XCODE_VERSION: "16.2"
+
 # The smoke and full slices share one job body, factored into the reusable
 # benchmark-core.yml (workflow_call) — only the inputs below differ. This
 # resolves the old TODO(audit/ci) about the two ~100-line copy-pasted jobs.
@@ -55,3 +58,27 @@ jobs:
       # Nightly/full runs are informational — no recall gate, so a noisy
       # scheduled run cannot page anyone. The PR smoke job is the gate.
       gate: false
+
+  pq-acceptance:
+    name: PQ Acceptance (Release)
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.slice == 'full')
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+
+      - name: Cache Swift build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-${{ hashFiles('Package.swift', 'Sources/**/*.swift', 'Tests/**/*.swift') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-
+
+      - name: Run PQ acceptance benchmarks
+        run: PROXIMA_PQ_BENCH=1 swift test -c release --filter PQBenchmarkTests

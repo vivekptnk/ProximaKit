@@ -4,8 +4,9 @@
 // ADR-013 Stage 2, acceptance criterion 3 (paged-mode memory). Benchmark-class
 // and CI-excluded: like RecallBenchmarkTests it does real work (builds a
 // ≥100K×384d fixture), so it is gated behind PROXIMA_PAGED_BENCH=1 and is a
-// no-op otherwise — it never runs in the `swift test --skip RecallBenchmarkTests`
-// PR gate unless the env var is explicitly set.
+// no-op otherwise — it never runs in the CI-equivalent
+// `swift test --skip RecallBenchmarkTests --skip PQBenchmarkTests` PR gate
+// unless the env var is explicitly set.
 //
 // It proves the raw Float32 vector payload (4·d·n bytes) is NOT resident in
 // `.paged` mode by measuring `phys_footprint` (task_vm_info) deltas: opening the

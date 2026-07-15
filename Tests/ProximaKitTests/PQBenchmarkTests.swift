@@ -7,11 +7,25 @@
 // These tests validate the CHA-91 acceptance criteria:
 // - 4x memory reduction
 // - <5% recall loss (PQ asymmetric search vs exact brute force)
+//
+// The suite is intentionally opt-in because its 10K-scale acceptance checks
+// take minutes. Run it in Release mode with:
+//
+//   PROXIMA_PQ_BENCH=1 swift test -c release --filter PQBenchmarkTests
 
 import XCTest
 @testable import ProximaKit
 
 final class PQBenchmarkTests: XCTestCase {
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipIf(
+            ProcessInfo.processInfo.environment["PROXIMA_PQ_BENCH"] != "1",
+            "PQ acceptance benchmarks are opt-in; set PROXIMA_PQ_BENCH=1 "
+            + "and run in Release mode"
+        )
+    }
 
     // ── Helpers ──────────────────────────────────────────────────────
 

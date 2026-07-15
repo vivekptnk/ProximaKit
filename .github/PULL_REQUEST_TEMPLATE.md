@@ -7,7 +7,7 @@
 <!--
 Command(s) run and the specific test names/classes exercised, e.g.:
   swift test --filter VectorStoreTests
-  swift test --skip RecallBenchmarkTests
+  swift test --skip RecallBenchmarkTests --skip PQBenchmarkTests
 -->
 
 ## Checklist
@@ -15,7 +15,7 @@ Command(s) run and the specific test names/classes exercised, e.g.:
 Per [CONTRIBUTING.md](../CONTRIBUTING.md):
 
 - [ ] `swift build` succeeds with no warnings
-- [ ] `swift test --skip RecallBenchmarkTests` passes
+- [ ] `swift test --skip RecallBenchmarkTests --skip PQBenchmarkTests` passes
 - [ ] `swiftlint lint --strict` passes (pinned to 0.63.2, matching CI — see [Run Lint](../CONTRIBUTING.md#run-lint))
 - [ ] New public APIs have `///` documentation
 - [ ] New features have corresponding tests
