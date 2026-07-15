@@ -87,7 +87,7 @@ private let qhOriginalsSectionIndex = 6
 private let qhOriginalsAlignment = 16_384
 
 /// On-disk layout chosen by the additive `save(to:layout:)` writer (ADR-014).
-public enum PQHWSaveLayout: Sendable {
+public enum IndexSaveLayout: Sendable {
     /// The historical resident format — byte-identical to `save(to:)` (v2).
     case resident
     /// The paged-capable v3 format: when originals are retained, the originals
@@ -97,7 +97,12 @@ public enum PQHWSaveLayout: Sendable {
     case pagedV3
 }
 
+/// Backward-compatible spelling for ``IndexSaveLayout``.
+@available(*, deprecated, renamed: "IndexSaveLayout")
+public typealias PQHWSaveLayout = IndexSaveLayout
+
 /// Backward-compatible spelling for ``IndexResidency`` on PQHW load APIs.
+@available(*, deprecated, renamed: "IndexResidency")
 public typealias PQHWOpenMode = IndexResidency
 
 extension QuantizedHNSWIndex {
@@ -200,7 +205,7 @@ extension QuantizedHNSWIndex {
     ///   no error or signal at the call site; check the written file's version
     ///   byte, or reopen and check `originalsArePaged` / `retainsOriginals`, if
     ///   the distinction matters to your caller.
-    public func save(to url: URL, layout: PQHWSaveLayout) throws {
+    public func save(to url: URL, layout: IndexSaveLayout) throws {
         switch layout {
         case .resident:
             try save(to: url)

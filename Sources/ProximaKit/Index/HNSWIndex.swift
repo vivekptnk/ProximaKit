@@ -95,6 +95,7 @@ struct SplitMix64: RandomNumberGenerator {
 }
 
 /// Backward-compatible spelling for ``IndexResidency`` on full-precision HNSW APIs.
+@available(*, deprecated, renamed: "IndexResidency")
 public typealias HNSWOpenMode = IndexResidency
 
 /// A read-only, value-typed view of the live HNSW graph.
@@ -1004,9 +1005,10 @@ public actor HNSWIndex: VectorIndex {
     ///
     /// Unlike ``persistenceSnapshot()``, this accessor never compacts and never
     /// materializes vectors. It reads the layer arrays directly and returns
-    /// UUIDs, levels, layer-0 neighbors, and metadata only, keeping inspection
-    /// side-effect-free and O(live graph) instead of a save-path operation. It
-    /// does not touch the reverse-adjacency cache.
+    /// UUIDs, levels, layer-0 neighbors, and metadata only. Runtime is linear in
+    /// stored slots (including tombstones) plus the layer-0 adjacency scanned for
+    /// live source slots; output is proportional to returned live nodes and edges.
+    /// It does not touch the reverse-adjacency cache.
     ///
     /// The snapshot includes only live nodes. Layer-0 neighbors are filtered
     /// with the same identity liveness test (`uuidToNode[uuid] == node`) used

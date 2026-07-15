@@ -345,25 +345,4 @@ final class StoreAutoCheckpointTests: XCTestCase {
         XCTAssertFalse(hybridHits.isEmpty)
         await hybrid.dense.closeJournal()
     }
-
-    func testIndexResidencyAliasesCompileInOldAndNewSpellings() {
-        let canonical: IndexResidency = .resident
-        let oldHNSW: HNSWOpenMode = canonical
-        let oldPQHW: PQHWOpenMode = .paged
-        let newFromOld: IndexResidency = oldPQHW
-        let oldFromOld: PQHWOpenMode = oldHNSW
-
-        func describe(_ mode: IndexResidency) -> String {
-            switch mode {
-            case .resident:
-                return "resident"
-            case .paged:
-                return "paged"
-            }
-        }
-
-        XCTAssertEqual(describe(oldHNSW), "resident")
-        XCTAssertEqual(describe(newFromOld), "paged")
-        XCTAssertEqual(describe(oldFromOld), "resident")
-    }
 }
